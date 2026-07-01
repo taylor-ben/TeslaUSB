@@ -613,7 +613,7 @@ mod tests {
             );
         }
         let shape = select_shape_keys(&census, &attempts, 0);
-        assert_eq!(shape.len(), 8);
+        assert_eq!(shape.len(), scannerd::produce::MAX_FRONT_SHAPES_PER_BATCH);
         assert!(shape.iter().any(|k| k.contains("2026-06-01_20-10-00")));
         assert!(shape.iter().any(|k| k.contains("2026-06-01_20-10-01")));
     }

@@ -75,7 +75,13 @@ const MAX_CLIP_BYTES: u64 = 256 * 1024 * 1024;
 /// next pass (`complete=false`), and the consumer drains the backlog over
 /// several fast batches. Non-front angles are cheap (filename only) and are
 /// not capped.
-pub const MAX_FRONT_SHAPES_PER_BATCH: usize = 8;
+///
+/// Set conservatively to 2 (not 8) pending the hardware-watchdog spike: at ~3–6 s
+/// per front read on the ~25 MB/s microSD, two back-to-back reads stay well under
+/// the 15 s watchdog window even worst-case, while 2/pass still drains a long
+/// drive's backlog (~60 fronts) far inside the ~1 h RecentClips window. Raise
+/// toward 8 only if the spike proves the larger burst is watchdog-safe.
+pub const MAX_FRONT_SHAPES_PER_BATCH: usize = 2;
 
 /// Tesla event sidecar filename.
 const EVENT_JSON_NAME: &str = "event.json";
