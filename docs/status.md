@@ -1,5 +1,92 @@
 # TeslaUSB B-1 — Build Status (vs. `Requirements.md`)
 
+> ## ⏯️ RESUME HERE (2026-06-30 PM) — scanner re-parse storm ROOT-CAUSED IN CODE; durable fix DESIGNED (awaiting review + approval, NOT built)
+>
+> **Two operator symptoms this session:** (1) a spontaneous **hardware-watchdog
+> reboot loop**; (2) today's **drive route missing from the Map** ("only sentry
+> events show, no trip"). **These are ONE bug** — a scanner front-clip re-read storm
+> on the single microSD — confirmed in code across all four daemons (read-only; no
+> repo code changed). Full analysis: **`files/durable-fix-design-2026-06-30.md`**
+> (code-grounded) + **`files/hw-rebootloop-2026-06-30.md`** (facts + I/O budget §8a).
+>
+> ### Root cause — CONFIRMED IN CODE (one bug, not inferred)
+> - `scannerd`'s `StabilityTracker` is **ephemeral in-memory only** (`serve.rs:193`,
+>   `stability.rs:67-71`) — never persisted, **never reconciled against the durable
+>   DB**. Every scannerd (re)start → empty tracker → after the 60 s settle window
+>   **every** stable front clip becomes eligible → each is **read in full and
+>   SEI-walked** (`shape_front`, `produce.rs:455`). ~923-clip backlog.
+> - `indexd` amplifies it: sends `resync=true` (full replay) on **every connect**
+>   (`main.rs:240-241`) and after **every** apply failure (`main.rs:317`) → re-arms
+>   ALL emitted (`stability.rs:145-149`). It can't ask for less (scannerd owns no DB).
+> - **Oldest-first ordering** (`produce.rs:653`) + the reboot loop interrupting every
+>   few minutes ⇒ the re-walk **never reaches today's RecentClips** ⇒ today's drive
+>   gets **0 waypoints** ⇒ no trip/route. "Only sentry events" = they had cached
+>   waypoints from before. Sustained microSD reads starve the **15 s `RuntimeWatchdogUSec`**
+>   (PID 1) → reboot → empty tracker → storm. Self-amplifying.
+> - **The v4 `front_parse_attempts` table exists but its skip-consumer was never
+>   wired** (`ingest.rs` has `upsert_/load_front_parse_attempt`; nothing consults it
+>   to skip). That missing consumer is the whole fix.
+>
+> ### KEY FACT — measured I/O budget (this governs the fix; operator directive)
+> ONE microSD (`mmcblk0`, 78% full) shared by OS + recording + archive. Negotiated
+> bus 50 MHz×4-bit SD-HS. **Latency, not average bandwidth, is the binding constraint**
+> (15 s watchdog is unforgiving).
+> - Bus ceiling **25 MB/s**; sustained write ceiling **≈12.5 MB/s**; **mixed R/W
+>   effective ≈6–9 MB/s** (FTL thrash on a near-full card).
+> - Recording load: **3.0 MB/s avg (24% util)**, bursts to **6.3 MB/s (50% util)**
+>   with nothing else running.
+> - Archive is a same-card copy = ~2 MB device I/O per MB (1 read+1 write, mixed).
+>   Real-time keep-up ≈ **9 MB/s mixed → over the ceiling → stalls** (this is exactly
+>   what triggered the incident).
+> - **Feasibility: YES — but only as paced / deferred / selective background I/O,
+>   never real-time flat-out.** Idle periods (parked+asleep = 0 MB/s recording) give
+>   the catch-up headroom; the rolling buffer gives archiving slack; and the incident
+>   was pure re-parse overhead that selective-skip removes entirely.
+>
+> ### The durable fix — DESIGNED, 3 parts (NOT yet built)
+> 1. **Selective-skip (structural — kills the storm):** indexd seeds scannerd a
+>    fingerprint skip-set from the v4 table over the socket (new `Seed` proto msg);
+>    the producer computes the cheap dir-entry `fingerprint` (**no file read**) and
+>    **skips `shape_front`** when `(key,fp)` matches a terminal parsed row. After each
+>    clip is walked once, restart/resync re-walks only genuinely new/changed clips.
+>    (First drain: v4 backfilled NULL fingerprints, so day-1 walks the backlog **once**
+>    to populate them, then quiet forever — Parts 2–3 make that one drain survivable.)
+> 2. **Prioritized, paced drain:** newest-first by filename timestamp (no read) +
+>    brand-new clips ahead of legacy backlog ⇒ today's route appears fast; keep the
+>    small per-pass cap; modest cadence.
+> 3. **I/O discipline (the efficiency mandate):** recording-activity gate (file-storage
+>    kthread `/proc/<pid>/io` wchar delta), iowait circuit breaker (`/proc/stat` —
+>    **PSI is absent** on this kernel), ionice-idle + per-pass byte/time budget,
+>    optional watchdog widening 15→30–45 s (config-only).
+>
+> ### Already correct — DO NOT rebuild (verified this session)
+> Front-only SEI read; sparse sampling (`sample_rate=30`); archive-before-1hr
+> (retentiond non-destructive copy); space-governor cleanup; **location tracking on
+> RecentClips→Archive move** (`register_archived_clip`); **map rendering is
+> location-independent** (routes derive from `trips`/`trip_points`/`events`, zero JOIN
+> to file location); playback resolves current location via `angles.view_kind`.
+> Migration v4 needs no change. ⇒ Requirements #3/#4/#6 need no work; this is purely
+> scanner starvation.
+>
+> ### Device state (leave as-is until the fix ships)
+> Stable, `running`, 0 failed units. **`scannerd` + `indexd` + `retentiond` are
+> `inactive+disabled` and MUST STAY disabled** — re-enabling any of them re-triggers
+> the storm. `gadgetd`/`gadgetd-control`/`webd`/`schedulerd` active; **recording
+> alive**. No dead-man armed. Branch `mhackermsft/b1-clean`. On-device recovery
+> snapshot kept: `/home/pi/index.pre-v4-20260630-154735.sqlite3`.
+>
+> ### Next session (in order)
+> 1. **Re-run the GPT-5.5 Tier-3 adversarial review** on `durable-fix-design-2026-06-30.md`
+>    (it was in-flight and lost to compaction — must precede any build). Reconcile,
+>    then get operator approval BEFORE building.
+> 2. Build **Part 1 → 2 → 3**: gpt-5.3-codex lanes (scannerd proto+producer; indexd
+>    seed-query+send; retentiond/scanner pacing) → GPT-5.5 review-until-clean → podman
+>    `cargo test -p scannerd -p indexd -p retentiond` + clippy → aarch64 cross-build →
+>    deploy under the hardware-test skill → **re-enable scannerd → indexd → retentiond
+>    ONE at a time**, watching the backlog drain within the I/O budget.
+> 3. **Validation:** an operator test drive must show **today's route on the Map**
+>    before ticking `fu-clip-parse-state`. **Do NOT tick it until then.**
+>
 > ## ⏯️ RESUME HERE (2026-06-29) — indexd parse-livelock FIXED + deployed; clip GPS-parse robustness is the next item
 >
 > **Symptom (operator):** a real home→McDonald's→home drive showed only *part* of
@@ -22,6 +109,11 @@
 >   healthy, recording undisturbed. Evidence: `files/hw-results.md`.
 >
 > - [ ] **`fu-clip-parse-state` — honest front parse-state + prompt-read robustness (NEXT, Tier-3).**
+>   **↑ SUPERSEDED by the 2026-06-30 PM block above** — the v4 parse-state schema
+>   shipped, but this session root-caused (in code) that the missing routes + the
+>   reboot loop are the SAME bug (scanner re-parse storm; the v4 skip-consumer was
+>   never wired). Full design in `files/durable-fix-design-2026-06-30.md`. Still `[ ]`:
+>   designed, not built, not validated. Original notes retained below for context.
 >   Removing the livelock exposed a **pre-existing** issue: the drive's RecentClips
 >   yielded **0 GPS waypoints**, so they never formed trips. Decisive evidence: the
 >   SavedClips segment at the stop (12:17–12:26) parsed with full GPS, but the pure

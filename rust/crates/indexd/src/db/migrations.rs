@@ -29,7 +29,7 @@ pub const SCHEMA_VERSION_NOTE: &str = "v1 (PROVISIONAL — pre-OP-3 freeze)";
 /// The highest schema version this binary knows how to produce. A DB
 /// reporting a higher version was written by a newer `indexd` and must
 /// not be opened read-write.
-pub const LATEST_VERSION: i64 = 3;
+pub const LATEST_VERSION: i64 = 4;
 
 /// The ordered migration ladder. Index order MUST match ascending
 /// `version`; [`MIGRATIONS`] is validated by a test.
@@ -48,6 +48,11 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 3,
         note: "v3 — clip_events (event.json sidecar)",
         sql: V3_SQL,
+    },
+    Migration {
+        version: 4,
+        note: "v4 — front_parse_attempts (durable front parse outcomes)",
+        sql: V4_SQL,
     },
 ];
 
@@ -89,6 +94,38 @@ CREATE TABLE clip_events (
     camera                TEXT,
     updated_at            INTEGER NOT NULL
 );
+";
+
+/// v4 DDL: durable per-clip front parse outcomes. This records every
+/// observed front parse result so failed/retried parses never silently
+/// erase provenance. Backfill is conservative: historical clips with any
+/// cached waypoints are marked `parsed_with_waypoints`; clips without
+/// waypoints are `legacy_unknown` (never inferred as terminal empty).
+const V4_SQL: &str = "
+CREATE TABLE front_parse_attempts (
+    canonical_key     TEXT PRIMARY KEY NOT NULL,
+    parse_state       TEXT    NOT NULL,
+    parse_fingerprint TEXT,
+    parser_version    INTEGER,
+    attempted_at      INTEGER NOT NULL,
+    updated_at        INTEGER NOT NULL
+);
+
+INSERT OR IGNORE INTO front_parse_attempts
+    (canonical_key, parse_state, parse_fingerprint, parser_version, attempted_at, updated_at)
+SELECT c.canonical_key,
+       CASE
+           WHEN EXISTS (SELECT 1 FROM clip_waypoints w WHERE w.clip_id = c.id)
+           THEN 'parsed_with_waypoints'
+           ELSE 'legacy_unknown'
+       END,
+       NULL,
+       NULL,
+       CAST(strftime('%s','now') AS INTEGER),
+       CAST(strftime('%s','now') AS INTEGER)
+  FROM clips c
+  JOIN angles a ON a.clip_id = c.id
+ WHERE lower(a.camera) = 'front';
 ";
 
 /// v1 DDL: contract D1's proposed schema, plus two internal additions
@@ -289,7 +326,11 @@ CREATE TABLE prefs (
 
 #[cfg(test)]
 mod tests {
-    use super::{LATEST_VERSION, MIGRATIONS};
+    #![allow(clippy::unwrap_used)]
+
+    use rusqlite::{Connection, params};
+
+    use super::{LATEST_VERSION, MIGRATIONS, V1_SQL, V2_SQL, V3_SQL, V4_SQL};
 
     #[test]
     fn ladder_is_monotonic_and_matches_latest() {
@@ -305,5 +346,71 @@ mod tests {
             prev, LATEST_VERSION,
             "LATEST_VERSION must equal the last migration version"
         );
+    }
+
+    #[test]
+    fn v4_backfills_front_parse_attempts_conservatively() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(V1_SQL).unwrap();
+        conn.execute_batch(V2_SQL).unwrap();
+        conn.execute_batch(V3_SQL).unwrap();
+        for version in 1_i64..=3 {
+            conn.execute(
+                "INSERT INTO schema_version(version, applied_at, note) VALUES(?1, 0, 'seed')",
+                params![version],
+            )
+            .unwrap();
+        }
+
+        let now = 1_700_000_000_i64;
+        conn.execute(
+            "INSERT INTO clips
+                (id, canonical_key, started_at, partition, folder_class, is_sentry, availability, created_at, updated_at)
+             VALUES
+                (1, 'k-has-waypoints', 1000, 'slot0', 'SavedClips', 0, 'present', ?1, ?1),
+                (2, 'k-no-waypoints', 2000, 'slot0', 'SavedClips', 0, 'present', ?1, ?1)",
+            params![now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO angles(clip_id, camera, file_ref, view_kind, offset_ms)
+             VALUES
+                (1, 'front', 'a-front.mp4', 'ro_usb', 0),
+                (2, 'front', 'b-front.mp4', 'ro_usb', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO clip_waypoints(clip_id, seq, frame_index, offset_ms, lat, lon)
+             VALUES(1, 0, 0, 0.0, 1.0, 2.0)",
+            [],
+        )
+        .unwrap();
+
+        let tx = conn.transaction().unwrap();
+        tx.execute_batch(V4_SQL).unwrap();
+        tx.execute(
+            "INSERT INTO schema_version(version, applied_at, note) VALUES(4, 0, 'v4')",
+            [],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let has: String = conn
+            .query_row(
+                "SELECT parse_state FROM front_parse_attempts WHERE canonical_key = 'k-has-waypoints'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let none: String = conn
+            .query_row(
+                "SELECT parse_state FROM front_parse_attempts WHERE canonical_key = 'k-no-waypoints'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has, "parsed_with_waypoints");
+        assert_eq!(none, "legacy_unknown");
     }
 }

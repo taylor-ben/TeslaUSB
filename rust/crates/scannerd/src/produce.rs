@@ -25,8 +25,9 @@
 //! (no `mvhd` GPS time and an out-of-range filename timestamp): nothing is
 //! emitted for it, but it is counted in [`ProducerStats::unplaceable_clips`]
 //! so the consumer can reconstruct the legacy `clips_upserted` diagnostic.
-//! Raw read/parse errors on a single clip are counted
-//! ([`ProducerStats::read_errors`]) and skipped, never aborting the batch
+//! Raw read/parse errors on a single clip are counted as front
+//! parse/read-walk outcomes (or non-front [`ProducerStats::read_errors`]),
+//! never aborting the batch
 //! — a structural error (MBR/boot/volume walk) still aborts the whole pass
 //! exactly as before.
 
@@ -42,10 +43,10 @@ use crate::reader::BlockReader;
 use crate::record::{
     autopilot_to_u32, gear_to_u32, AngleRecord, Bucket, ClipAngleRecord, ClipEventRecord,
     MediaFileRecord, ProducerStats, ScanBatch, WireWaypoint, MAX_CLIP_EVENT_RECORDS,
-    MAX_MEDIA_RECORDS, PROTOCOL_VERSION,
+    MAX_MEDIA_RECORDS, PARSER_VERSION, PROTOCOL_VERSION,
 };
 use crate::seiwalk::{walk_clip_waypoints, Waypoint};
-use crate::stability::StabilityTracker;
+use crate::stability::{fingerprint, StabilityTracker};
 use crate::timestamp::epoch_from_tesla_timestamp;
 use crate::volume::Volume;
 use crate::walk::{walk_volume, FileRecord};
@@ -393,47 +394,35 @@ fn angle_record(record: &FileRecord, ident: &ClipIdent) -> AngleRecord {
     }
 }
 
-/// Shape a front clip into a record: read its bytes, walk its SEI, resolve
-/// the recording instant (`mvhd`/GPS first, Tesla-filename fallback), and
-/// emit the clip + front angle + (possibly empty) waypoint stream.
-///
-/// Returns `Ok(None)` when the clip has no resolvable recording instant at
-/// all (cannot be placed in time) — mirroring the legacy `process_front`
-/// early return. Read failures surface as `Err` (counted, not fatal).
-fn shape_front<R: BlockReader + ?Sized>(
-    volume: &Volume<'_, R>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FrontParseState {
+    ParsedWithWaypoints,
+    NoWaypoints,
+    ParseError,
+    ReadError,
+}
+
+impl FrontParseState {
+    const fn as_wire(self) -> &'static str {
+        match self {
+            Self::ParsedWithWaypoints => "parsed_with_waypoints",
+            Self::NoWaypoints => "no_waypoints",
+            Self::ParseError => "parse_error",
+            Self::ReadError => "read_error",
+        }
+    }
+}
+
+fn front_record_with_parse_state(
     record: &FileRecord,
     ident: &ClipIdent,
-    sample_rate: u32,
-) -> Result<Option<ClipAngleRecord>, ScannerError> {
-    let bytes = read_full_file(volume, record)?;
-    // A truncated/garbled SEI stream yields `None`; the clip/angle is still
-    // recorded (with an empty waypoint stream, which clears a stale cache).
-    let walk = walk_clip_waypoints(&bytes, sample_rate).ok();
-
-    let started_at = walk
-        .as_ref()
-        .and_then(|w| w.clip_started_utc.and_then(systemtime_to_epoch))
-        .or_else(|| epoch_from_tesla_timestamp(&ident.timestamp));
-    let Some(started_at) = started_at else {
-        return Ok(None);
-    };
-
-    let waypoints: Vec<WireWaypoint> = walk.as_ref().map_or_else(Vec::new, |w| {
-        w.waypoints
-            .iter()
-            .map(|wp| wire_waypoint_from_walk(wp, started_at))
-            .collect()
-    });
-
-    let duration_s = walk
-        .as_ref()
-        .and_then(|w| w.waypoints.last())
-        .map(|wp| wp.timestamp_ms / 1000.0);
-    #[allow(clippy::cast_possible_truncation)]
-    let ended_at = duration_s.map(|secs| started_at + secs.round() as i64);
-
-    Ok(Some(ClipAngleRecord {
+    started_at: i64,
+    ended_at: Option<i64>,
+    duration_s: Option<f64>,
+    waypoints: Vec<WireWaypoint>,
+    parse_state: FrontParseState,
+) -> ClipAngleRecord {
+    ClipAngleRecord {
         canonical_key: ident.key.clone(),
         started_at,
         ended_at,
@@ -441,8 +430,84 @@ fn shape_front<R: BlockReader + ?Sized>(
         bucket: ident.bucket,
         duration_s,
         angle: angle_record(record, ident),
+        parse_state: Some(parse_state.as_wire().to_owned()),
+        parse_fingerprint: Some(format!("{:x}", fingerprint(record))),
+        parser_version: Some(PARSER_VERSION),
         waypoints,
-    }))
+    }
+}
+
+/// Shape a front clip into a record: read its bytes, walk its SEI, resolve
+/// the recording instant (`mvhd`/GPS first, Tesla-filename fallback), and
+/// emit the clip + front angle + (possibly empty) waypoint stream.
+///
+/// Returns `Ok(None)` when the clip has no resolvable recording instant at
+/// all (cannot be placed in time) — mirroring the legacy `process_front`
+/// early return.
+#[allow(clippy::unnecessary_wraps)]
+fn shape_front<R: BlockReader + ?Sized>(
+    volume: &Volume<'_, R>,
+    record: &FileRecord,
+    ident: &ClipIdent,
+    sample_rate: u32,
+) -> Result<Option<ClipAngleRecord>, ScannerError> {
+    let filename_started_at = epoch_from_tesla_timestamp(&ident.timestamp);
+    let Ok(bytes) = read_full_file(volume, record) else {
+        let Some(started_at) = filename_started_at else {
+            return Ok(None);
+        };
+        return Ok(Some(front_record_with_parse_state(
+            record,
+            ident,
+            started_at,
+            None,
+            None,
+            Vec::new(),
+            FrontParseState::ReadError,
+        )));
+    };
+
+    let Ok(walk) = walk_clip_waypoints(&bytes, sample_rate) else {
+        let Some(started_at) = filename_started_at else {
+            return Ok(None);
+        };
+        return Ok(Some(front_record_with_parse_state(
+            record,
+            ident,
+            started_at,
+            None,
+            None,
+            Vec::new(),
+            FrontParseState::ParseError,
+        )));
+    };
+
+    let started_at = walk
+        .clip_started_utc
+        .and_then(systemtime_to_epoch)
+        .or(filename_started_at);
+    let Some(started_at) = started_at else {
+        return Ok(None);
+    };
+
+    let waypoints: Vec<WireWaypoint> = walk
+        .waypoints
+        .iter()
+        .map(|wp| wire_waypoint_from_walk(wp, started_at))
+        .collect();
+
+    let duration_s = walk.waypoints.last().map(|wp| wp.timestamp_ms / 1000.0);
+    #[allow(clippy::cast_possible_truncation)]
+    let ended_at = duration_s.map(|secs| started_at + secs.round() as i64);
+    let parse_state = if waypoints.is_empty() {
+        FrontParseState::NoWaypoints
+    } else {
+        FrontParseState::ParsedWithWaypoints
+    };
+
+    Ok(Some(front_record_with_parse_state(
+        record, ident, started_at, ended_at, duration_s, waypoints, parse_state,
+    )))
 }
 
 /// Shape a non-front angle: anchor it to the filename-derived instant (no
@@ -468,6 +533,9 @@ fn shape_other(
         bucket: ident.bucket,
         duration_s: None,
         angle: angle_record(record, ident),
+        parse_state: None,
+        parse_fingerprint: None,
+        parser_version: None,
         waypoints: Vec::new(),
     }))
 }
@@ -539,8 +607,7 @@ impl<'a, R: BlockReader + ?Sized> ImageSource<'a, R> {
 /// Returns [`ScannerError`] if a structural raw-media step fails
 /// (`parse_mbr`, a boot sector, or a volume walk) on **any** source —
 /// exactly the cases that aborted the legacy in-process pass. Individual
-/// unreadable clips are skipped (counted in
-/// [`ProducerStats::read_errors`]), never fatal.
+/// clip read/parse failures are non-fatal and reflected in producer stats.
 pub fn produce<R: BlockReader + ?Sized>(
     sources: &[ImageSource<'_, R>],
     tracker: &mut StabilityTracker,
@@ -611,13 +678,17 @@ pub fn produce<R: BlockReader + ?Sized>(
                 continue;
             };
             front_shaped += 1;
-            match shape_front(volume, record, &ident, sample_rate) {
-                Ok(Some(rec)) => records.push(rec),
-                Ok(None) => {
-                    stats.unplaceable_clips += 1;
-                    stats.unplaceable_front += 1;
+            if let Some(rec) = shape_front(volume, record, &ident, sample_rate)? {
+                match rec.parse_state.as_deref() {
+                    Some("parse_error") => stats.parse_errors += 1,
+                    Some("read_error") => stats.read_walk_errors += 1,
+                    Some("no_waypoints") => stats.no_waypoints += 1,
+                    _ => {}
                 }
-                Err(_) => stats.read_errors += 1,
+                records.push(rec);
+            } else {
+                stats.unplaceable_clips += 1;
+                stats.unplaceable_front += 1;
             }
         } else {
             match shape_other(record, &ident) {
@@ -1041,7 +1112,11 @@ mod tests {
         (u64::from(start_lba + 2) * CLUSTER_SIZE as u64) + (cluster_index * CLUSTER_SIZE as u64)
     }
 
-    fn event_fixture_image(bucket_dir: &str, event_json: &[u8]) -> Vec<u8> {
+    fn event_fixture_image_with_front_cluster(
+        bucket_dir: &str,
+        event_json: &[u8],
+        front_cluster: u32,
+    ) -> Vec<u8> {
         let mut img = vec![0_u8; 8192];
 
         let mbr = 446;
@@ -1103,7 +1178,7 @@ mod tests {
         let front_entry = encode_entry_set(
             FRONT_FILE_NAME,
             false,
-            FRONT_FILE_CLUSTER,
+            front_cluster,
             8,
             8,
             true,
@@ -1143,9 +1218,15 @@ mod tests {
             EVENT_DIR_CLUSTER,
             &directory_cluster(&[front_entry, event_entry], CLUSTER_SIZE),
         );
-        write_cluster(&mut img, START_LBA, FRONT_FILE_CLUSTER, b"not-anmp");
+        if front_cluster == FRONT_FILE_CLUSTER {
+            write_cluster(&mut img, START_LBA, FRONT_FILE_CLUSTER, b"not-anmp");
+        }
         write_cluster(&mut img, START_LBA, EVENT_JSON_CLUSTER, event_json);
         img
+    }
+
+    fn event_fixture_image(bucket_dir: &str, event_json: &[u8]) -> Vec<u8> {
+        event_fixture_image_with_front_cluster(bucket_dir, event_json, FRONT_FILE_CLUSTER)
     }
 
     fn produce_stable_batch(reader: &SliceReader) -> crate::record::ScanBatch {
@@ -1363,6 +1444,44 @@ mod tests {
         assert_eq!(event.primary_canonical_key, canonical_key);
         assert_eq!(event.est_lat, Some(37.7749));
         assert_eq!(event.est_lon, Some(-122.4194));
+    }
+
+    #[test]
+    fn front_parse_failures_are_emitted_and_counted() {
+        let event_json =
+            br#"{"timestamp":"2026-06-01T20:10:35-07:00","est_lat":"37.7749","est_lon":"-122.4194"}"#;
+        let reader = SliceReader::new(event_fixture_image("SavedClips", event_json));
+        let batch = produce_stable_batch(&reader);
+        assert_eq!(batch.records.len(), 1);
+        let front = &batch.records[0];
+        assert_eq!(front.parse_state.as_deref(), Some("parse_error"));
+        assert!(front.waypoints.is_empty());
+        assert_eq!(front.ended_at, None);
+        assert_eq!(front.duration_s, None);
+        assert_eq!(batch.stats.parse_errors, 1);
+        assert_eq!(batch.stats.read_walk_errors, 0);
+        assert_eq!(batch.stats.no_waypoints, 0);
+    }
+
+    #[test]
+    fn front_read_failures_are_emitted_and_counted() {
+        let event_json =
+            br#"{"timestamp":"2026-06-01T20:10:35-07:00","est_lat":"37.7749","est_lon":"-122.4194"}"#;
+        let reader = SliceReader::new(event_fixture_image_with_front_cluster(
+            "SavedClips",
+            event_json,
+            9_999,
+        ));
+        let batch = produce_stable_batch(&reader);
+        assert_eq!(batch.records.len(), 1);
+        let front = &batch.records[0];
+        assert_eq!(front.parse_state.as_deref(), Some("read_error"));
+        assert!(front.waypoints.is_empty());
+        assert_eq!(front.ended_at, None);
+        assert_eq!(front.duration_s, None);
+        assert_eq!(batch.stats.parse_errors, 0);
+        assert_eq!(batch.stats.read_walk_errors, 1);
+        assert_eq!(batch.stats.no_waypoints, 0);
     }
 
     #[test]

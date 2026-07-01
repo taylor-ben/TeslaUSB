@@ -223,6 +223,7 @@ mod tests {
             "leases",
             "prefs",
             "media_entries",
+            "front_parse_attempts",
         ] {
             let found: i64 = conn
                 .query_row(

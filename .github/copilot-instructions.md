@@ -4,6 +4,43 @@ Binding working notes for any Copilot agent (CLI, cloud, code review) on this
 repo. The code-quality charter (`docs/03-CODE-QUALITY-CHARTER.md`) wins on any
 conflict; this file adds the operator directives below.
 
+## Core engineering principles (binding)
+
+These four disciplines govern every change; the charter still wins on any conflict.
+
+### 1. Think before coding
+
+**Don't assume. Don't hide confusion. Surface tradeoffs.** Before implementing:
+state your assumptions explicitly and ask when uncertain; if multiple
+interpretations exist, present them rather than silently picking one; if a simpler
+approach exists, say so and push back when warranted; if something is unclear, stop,
+name what's confusing, and ask.
+
+### 2. Simplicity first
+
+**Minimum code that solves the problem. Nothing speculative.** No features beyond
+what was asked; no abstractions for single-use code; no unrequested
+"flexibility"/configurability; no error handling for impossible scenarios. If you
+write 200 lines and it could be 50, rewrite it. The test: "would a senior engineer
+call this overcomplicated?" If yes, simplify.
+
+### 3. Surgical changes
+
+**Touch only what you must. Clean up only your own mess.** Don't "improve" adjacent
+code, comments, or formatting; don't refactor what isn't broken; match existing
+style even if you'd do it differently. Remove imports/variables/functions that YOUR
+change orphaned — but leave pre-existing dead code (mention it, don't delete it)
+unless asked. Every changed line should trace directly to the request.
+
+### 4. Goal-driven execution
+
+**Define success criteria. Loop until verified.** Turn tasks into verifiable goals
+("add validation" → "write tests for invalid inputs, then make them pass"; "fix the
+bug" → "write a failing test that reproduces it, then make it pass"; "refactor X" →
+"ensure tests pass before and after"). For multi-step work, state a brief plan with
+a verify check per step. Strong success criteria let you loop independently; weak
+ones ("make it work") force constant clarification.
+
 ## Rust + TS only — no Python, ever (binding)
 
 B-1 is **Rust** (daemons: `gadgetd`, `scannerd`, `indexd`, `webd`, `retentiond`,

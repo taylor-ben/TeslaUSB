@@ -24,7 +24,11 @@ use teslausb_core::sei::tesla::{AutopilotState, Gear};
 
 /// Wire-format version stamped into every [`ScanBatch`]. Bump on any
 /// breaking change to the record shape.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// Front-clip parser version stamped on front records. Bump only when
+/// front parse semantics change.
+pub const PARSER_VERSION: i64 = 1;
 
 /// Hard cap on the present-key set a single batch may carry. A full
 /// `TeslaCam` card is thousands of clips; 200k keys (~tens of MiB of short
@@ -208,7 +212,18 @@ pub struct ClipAngleRecord {
     pub duration_s: Option<f64>,
     /// This file's angle facts.
     pub angle: AngleRecord,
-    /// SEI waypoints (front only; may be empty to clear a stale cache).
+    /// Front parse outcome (`parsed_with_waypoints` / `no_waypoints` /
+    /// `parse_error` / `read_error`). `None` for non-front records.
+    #[serde(default)]
+    pub parse_state: Option<String>,
+    /// Fingerprint of the front file entry fields that participate in
+    /// stability tracking, hex-encoded. `None` for non-front records.
+    #[serde(default)]
+    pub parse_fingerprint: Option<String>,
+    /// Parser version for front parse outcomes. `None` for non-front records.
+    #[serde(default)]
+    pub parser_version: Option<i64>,
+    /// SEI waypoints (front only).
     pub waypoints: Vec<WireWaypoint>,
 }
 
@@ -238,6 +253,15 @@ pub struct ProducerStats {
     pub eligible: usize,
     /// Eligible files that errored during raw read/parse and were skipped.
     pub read_errors: usize,
+    /// Front clips whose SEI walk failed after bytes were read.
+    #[serde(default)]
+    pub parse_errors: usize,
+    /// Front clips whose bytes could not be read for walking.
+    #[serde(default)]
+    pub read_walk_errors: usize,
+    /// Front clips that parsed successfully but had no waypoints.
+    #[serde(default)]
+    pub no_waypoints: usize,
     /// Eligible files with no resolvable recording instant (no `mvhd` and
     /// an out-of-range filename timestamp): nothing is written, but the
     /// legacy in-process pass still counted them as "upserted".
@@ -540,6 +564,12 @@ impl ClipAngleRecord {
         string_len("partition", &self.partition)?;
         string_len("camera", &self.angle.camera)?;
         string_len("file_ref", &self.angle.file_ref)?;
+        if let Some(state) = &self.parse_state {
+            string_len("parse_state", state)?;
+        }
+        if let Some(fingerprint) = &self.parse_fingerprint {
+            string_len("parse_fingerprint", fingerprint)?;
+        }
         cap("waypoints", self.waypoints.len(), MAX_WAYPOINTS_PER_RECORD)?;
         if !self.is_front() && !self.waypoints.is_empty() {
             return Err(BatchError::NonFrontWaypoints {
@@ -577,7 +607,8 @@ mod tests {
 
     use super::{
         AngleRecord, Bucket, ClipAngleRecord, ClipEventRecord, MAX_CLIP_EVENT_RECORDS,
-        MAX_MEDIA_RECORDS, MAX_STRING_LEN, MediaFileRecord, PROTOCOL_VERSION, ProducerStats,
+        MAX_MEDIA_RECORDS, MAX_STRING_LEN, MediaFileRecord, PARSER_VERSION, PROTOCOL_VERSION,
+        ProducerStats,
         ScanBatch, WireWaypoint, autopilot_to_u32, gear_to_u32,
     };
     use teslausb_core::sei::tesla::{AutopilotState, Gear};
@@ -610,6 +641,9 @@ mod tests {
                 files_seen: 4,
                 eligible: 1,
                 read_errors: 0,
+                parse_errors: 0,
+                read_walk_errors: 0,
+                no_waypoints: 0,
                 unplaceable_clips: 0,
                 unplaceable_front: 0,
             },
@@ -628,6 +662,9 @@ mod tests {
                     duration_s: None,
                     size_bytes: Some(1024),
                 },
+                parse_state: Some("parsed_with_waypoints".to_owned()),
+                parse_fingerprint: Some("deadbeef".to_owned()),
+                parser_version: Some(PARSER_VERSION),
                 waypoints: vec![sample_waypoint()],
             }],
             media: Vec::new(),
@@ -673,7 +710,7 @@ mod tests {
         // serde defaults must read back as an empty, NON-inventory batch so
         // the consumer never prunes the media catalog from it.
         let json = r#"{
-            "version": 1, "generation": 3, "complete": true,
+            "version": 2, "generation": 3, "complete": true,
             "stats": {"partitions":1,"files_seen":0,"eligible":0,
                       "read_errors":0,"unplaceable_clips":0,"unplaceable_front":0},
             "present_keys": [], "records": []

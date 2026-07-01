@@ -440,6 +440,39 @@ pub fn replace_clip_waypoints(
     Ok(())
 }
 
+/// Upsert durable front-parse outcome metadata keyed by `canonical_key`.
+///
+/// # Errors
+///
+/// Returns [`DbError`] if the statement fails.
+pub fn upsert_front_parse_attempt(
+    conn: &Connection,
+    canonical_key: &str,
+    parse_state: &str,
+    fingerprint: Option<&str>,
+    parser_version: Option<i64>,
+) -> Result<(), DbError> {
+    let now = now_epoch_s();
+    conn.execute(
+        "INSERT INTO front_parse_attempts
+             (canonical_key, parse_state, parse_fingerprint, parser_version, attempted_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+         ON CONFLICT(canonical_key) DO UPDATE SET
+             parse_state       = excluded.parse_state,
+             parse_fingerprint = excluded.parse_fingerprint,
+             parser_version    = excluded.parser_version,
+             updated_at        = excluded.updated_at",
+        params![
+            canonical_key,
+            parse_state,
+            fingerprint,
+            parser_version,
+            now,
+        ],
+    )?;
+    Ok(())
+}
+
 /// Remove derived rows for clips whose `canonical_key` is absent from
 /// `present_keys`. Returns the number of clips pruned. Durable
 /// `archive_items` are preserved (their `clip_id` back-reference is
@@ -468,6 +501,26 @@ pub fn prune_missing_clips<S: std::hash::BuildHasher>(
         conn.execute("DELETE FROM clips WHERE id = ?1", params![id])?;
     }
     Ok(stale.len())
+}
+
+/// Remove front-parse-attempt rows orphaned by clip pruning: an attempt is
+/// deleted only when its `canonical_key` no longer has a matching `clips`
+/// row. This mirrors [`prune_missing_clips`] (which PRESERVES archive-backed
+/// clips even when absent from `present_keys`), so an archived clip that has
+/// left the USB keeps BOTH its clip row and its parse-attempt provenance.
+/// MUST be called AFTER [`prune_missing_clips`] within the same
+/// complete-pass gate.
+///
+/// # Errors
+///
+/// Returns [`DbError`] if a statement fails.
+pub fn prune_orphan_front_parse_attempts(conn: &Connection) -> Result<usize, DbError> {
+    let pruned = conn.execute(
+        "DELETE FROM front_parse_attempts
+         WHERE canonical_key NOT IN (SELECT canonical_key FROM clips)",
+        [],
+    )?;
+    Ok(pruned)
 }
 
 fn has_archive_backing(conn: &Connection, clip_id: i64) -> Result<bool, DbError> {
@@ -760,6 +813,33 @@ pub fn load_clip_events(conn: &Connection) -> Result<Vec<ClipEventInput>, DbErro
     Ok(out)
 }
 
+/// One front-parse-attempt row payload loaded by key:
+/// `(parse_state, parse_fingerprint, parser_version)`.
+pub type FrontParseAttemptRow = (String, Option<String>, Option<i64>);
+
+/// Load one front-parse attempt row for tests.
+///
+/// # Errors
+///
+/// Returns [`DbError`] if the query fails.
+pub fn load_front_parse_attempt(
+    conn: &Connection,
+    canonical_key: &str,
+) -> Result<Option<FrontParseAttemptRow>, DbError> {
+    let row = conn.query_row(
+        "SELECT parse_state, parse_fingerprint, parser_version
+           FROM front_parse_attempts
+          WHERE canonical_key = ?1",
+        params![canonical_key],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    );
+    match row {
+        Ok(found) => Ok(Some(found)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(err) => Err(DbError::from(err)),
+    }
+}
+
 /// Load one clip's cached waypoints in `seq` order.
 fn load_waypoints(conn: &Connection, clip_id: i64) -> Result<Vec<DeriveWaypoint>, DbError> {
     let mut stmt = conn.prepare(
@@ -943,14 +1023,18 @@ mod tests {
 
     use std::collections::HashSet;
 
+    use scannerd::record::{AngleRecord, Bucket, ClipAngleRecord, PROTOCOL_VERSION, PARSER_VERSION, ProducerStats, ScanBatch};
     use teslausb_core::sei::tesla::{AutopilotState, Gear};
 
+    use crate::apply::apply;
     use super::{
         AngleFacts, ArchiveAngleRegistration, ArchiveRegistration, ArchiveUnitRegistration,
         ClipEventFacts, ClipFacts, load_clip_events, load_derive_clips, prune_missing_clips,
+        prune_orphan_front_parse_attempts, load_front_parse_attempt,
         rebuild_all_from_db, register_archived_clip, register_quarantined_clip,
         replace_clip_waypoints, upsert_angle_force_archive, upsert_angle_scan_preserving,
         upsert_clip, upsert_clip_event,
+        upsert_front_parse_attempt,
     };
     use crate::db::open_in_memory;
     use crate::derive::DeriveConfig;
@@ -1553,6 +1637,59 @@ mod tests {
     }
 
     #[test]
+    fn front_parse_attempt_roundtrips_and_updates() {
+        let conn = open_in_memory().unwrap();
+        upsert_front_parse_attempt(
+            &conn,
+            "k1",
+            "parse_error",
+            Some("abc123"),
+            Some(1),
+        )
+        .unwrap();
+        let first = load_front_parse_attempt(&conn, "k1").unwrap();
+        assert_eq!(
+            first,
+            Some(("parse_error".to_owned(), Some("abc123".to_owned()), Some(1)))
+        );
+
+        upsert_front_parse_attempt(
+            &conn,
+            "k1",
+            "parsed_with_waypoints",
+            Some("def456"),
+            Some(2),
+        )
+        .unwrap();
+        let second = load_front_parse_attempt(&conn, "k1").unwrap();
+        assert_eq!(
+            second,
+            Some((
+                "parsed_with_waypoints".to_owned(),
+                Some("def456".to_owned()),
+                Some(2)
+            ))
+        );
+    }
+
+    #[test]
+    fn prune_orphan_front_parse_attempts_mirrors_surviving_clips() {
+        // An attempt is pruned ONLY when its clip row is gone. A clip that
+        // survives `prune_missing_clips` (e.g. an archive-backed clip absent
+        // from present_keys) keeps its clip row, so its attempt must survive
+        // too — the orphan-of-clips rule guarantees this transitively.
+        let conn = open_in_memory().unwrap();
+        // "keep" has a clip row; "gone" does not (its clip was pruned).
+        upsert_clip(&conn, &clip_facts("keep", 1000, FolderClass::SavedClips)).unwrap();
+        upsert_front_parse_attempt(&conn, "keep", "parsed_with_waypoints", None, None).unwrap();
+        upsert_front_parse_attempt(&conn, "gone", "parse_error", None, None).unwrap();
+        let pruned = prune_orphan_front_parse_attempts(&conn).unwrap();
+        assert_eq!(pruned, 1);
+        assert!(load_front_parse_attempt(&conn, "keep").unwrap().is_some());
+        assert!(load_front_parse_attempt(&conn, "gone").unwrap().is_none());
+    }
+
+    #[test]
     fn rebuild_derives_a_moving_trip_and_is_replaceable() {
         let mut conn = open_in_memory().unwrap();
         let id = upsert_clip(
@@ -1615,8 +1752,39 @@ mod tests {
         let d1 = rebuild_all_from_db(&mut conn, DeriveConfig::default()).unwrap();
         assert_eq!(d1.trips.len(), 1);
 
-        // Re-walk yields nothing -> cache cleared.
-        replace_clip_waypoints(&conn, id, &[]).unwrap();
+        // Re-walk yields terminal no-waypoints -> cache cleared through apply.
+        let clear_batch = ScanBatch {
+            version: PROTOCOL_VERSION,
+            generation: 1,
+            complete: true,
+            stats: ProducerStats::default(),
+            present_keys: vec!["k1".to_owned()],
+            records: vec![ClipAngleRecord {
+                canonical_key: "k1".to_owned(),
+                started_at: 1_700_000_000,
+                ended_at: Some(1_700_000_000),
+                partition: "slot0".to_owned(),
+                bucket: Bucket::SavedClips,
+                duration_s: Some(0.0),
+                angle: AngleRecord {
+                    camera: "front".to_owned(),
+                    file_ref: "TeslaCam/SavedClips/2026-06-01_20-10-04-front.mp4".to_owned(),
+                    offset_ms: 0,
+                    duration_s: None,
+                    size_bytes: Some(1024),
+                },
+                parse_state: Some("no_waypoints".to_owned()),
+                parse_fingerprint: Some("f00d".to_owned()),
+                parser_version: Some(PARSER_VERSION),
+                waypoints: Vec::new(),
+            }],
+            media: Vec::new(),
+            media_present_paths: Vec::new(),
+            media_inventory: false,
+            clip_events: Vec::new(),
+            clip_events_inventory: false,
+        };
+        apply(&mut conn, &clear_batch, DeriveConfig::default()).unwrap();
         let d2 = rebuild_all_from_db(&mut conn, DeriveConfig::default()).unwrap();
         assert_eq!(d2.trips.len(), 0);
         let trips: i64 = conn
@@ -1627,6 +1795,60 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM trip_points", [], |r| r.get(0))
             .unwrap();
         assert_eq!(points, 0);
+    }
+
+    #[test]
+    fn parse_error_keeps_prior_trip() {
+        let mut conn = open_in_memory().unwrap();
+        let id = upsert_clip(
+            &conn,
+            &clip_facts("k1", 1_700_000_000, FolderClass::SavedClips),
+        )
+        .unwrap();
+        let waypoints: Vec<DeriveWaypoint> = (0..6_i64)
+            .map(|i| {
+                let f = i as f64;
+                wp(i, f * 1000.0, 1.0 + f * 0.001, 2.0, 10.0)
+            })
+            .collect();
+        replace_clip_waypoints(&conn, id, &waypoints).unwrap();
+        let d1 = rebuild_all_from_db(&mut conn, DeriveConfig::default()).unwrap();
+        assert_eq!(d1.trips.len(), 1);
+
+        let parse_error_batch = ScanBatch {
+            version: PROTOCOL_VERSION,
+            generation: 1,
+            complete: true,
+            stats: ProducerStats::default(),
+            present_keys: vec!["k1".to_owned()],
+            records: vec![ClipAngleRecord {
+                canonical_key: "k1".to_owned(),
+                started_at: 1_700_000_000,
+                ended_at: None,
+                partition: "slot0".to_owned(),
+                bucket: Bucket::SavedClips,
+                duration_s: None,
+                angle: AngleRecord {
+                    camera: "front".to_owned(),
+                    file_ref: "TeslaCam/SavedClips/2026-06-01_20-10-04-front.mp4".to_owned(),
+                    offset_ms: 0,
+                    duration_s: None,
+                    size_bytes: Some(1024),
+                },
+                parse_state: Some("parse_error".to_owned()),
+                parse_fingerprint: Some("f00d".to_owned()),
+                parser_version: Some(PARSER_VERSION),
+                waypoints: Vec::new(),
+            }],
+            media: Vec::new(),
+            media_present_paths: Vec::new(),
+            media_inventory: false,
+            clip_events: Vec::new(),
+            clip_events_inventory: false,
+        };
+        apply(&mut conn, &parse_error_batch, DeriveConfig::default()).unwrap();
+        let d2 = rebuild_all_from_db(&mut conn, DeriveConfig::default()).unwrap();
+        assert_eq!(d2.trips.len(), 1);
     }
 
     #[test]

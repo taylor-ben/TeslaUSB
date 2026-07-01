@@ -7,7 +7,8 @@
 //!
 //! ```text
 //! validate batch → open tx → per record:
-//!     front  → upsert_clip + replace_clip_waypoints + upsert_angle
+//!     front  → parse-state-driven clip/waypoint apply + upsert_angle +
+//!              upsert_front_parse_attempt
 //!     other  → ensure_clip + upsert_angle
 //!   → prune vanished clips (only if `complete`) → derive → rebuild → commit
 //! ```
@@ -38,9 +39,9 @@ use teslausb_core::sei::tesla::{AutopilotState, Gear};
 use crate::db::DbError;
 use crate::db::ingest::{
     AngleFacts, ClipEventFacts, ClipFacts, MediaFacts, ensure_clip, load_clip_events,
-    load_derive_clips, prune_missing_clip_events, prune_missing_clips, prune_missing_media,
-    rebuild_derived, replace_clip_waypoints, upsert_angle_scan_preserving, upsert_clip,
-    upsert_clip_event, upsert_media,
+    load_derive_clips, prune_missing_clip_events, prune_missing_clips, prune_orphan_front_parse_attempts,
+    prune_missing_media, rebuild_derived, replace_clip_waypoints, upsert_angle_scan_preserving, upsert_clip,
+    upsert_clip_event, upsert_front_parse_attempt, upsert_media,
 };
 use crate::derive::{DeriveConfig, derive};
 use crate::model::{DeriveWaypoint, FolderClass};
@@ -61,6 +62,12 @@ pub struct ApplyReport {
     pub waypoints: usize,
     /// Records skipped: failed per-record validation or errored mid-write.
     pub record_errors: usize,
+    /// Front records applied in the `parse_error` state.
+    pub front_parse_errors: usize,
+    /// Front records applied in the `read_error` state.
+    pub front_read_errors: usize,
+    /// Front records applied in the `no_waypoints` state.
+    pub front_no_waypoints: usize,
     /// Clips pruned (present only when the batch was `complete`).
     pub pruned: usize,
     /// Media rows upserted this pass (p2 inventory).
@@ -77,6 +84,48 @@ pub struct ApplyReport {
     pub trips: usize,
     /// Events materialized after the rebuild (driving + sentry).
     pub events: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrontApplyState {
+    ParsedWithWaypoints,
+    NoWaypoints,
+    ParseError,
+    ReadError,
+}
+
+impl FrontApplyState {
+    /// Map the wire `parse_state` to an apply outcome. The four known states
+    /// map directly. Everything else — `None` (a pre-`parse_state` producer,
+    /// though the `PROTOCOL_VERSION` gate already rejects an older batch
+    /// wholesale, so this is defensive only) and any unrecognized/`legacy_unknown`
+    /// string — collapses to `ParsedWithWaypoints`. That is safe because the
+    /// apply path NEVER clears the waypoint cache for this state unless the
+    /// record carries a non-empty list (see the data-integrity invariant in
+    /// `apply_record`); an empty/unknown record is therefore non-destructive.
+    fn from_wire(parse_state: Option<&str>) -> Self {
+        match parse_state {
+            Some("no_waypoints") => Self::NoWaypoints,
+            Some("parse_error") => Self::ParseError,
+            Some("read_error") => Self::ReadError,
+            _ => Self::ParsedWithWaypoints,
+        }
+    }
+
+    const fn as_wire(self) -> &'static str {
+        match self {
+            Self::ParsedWithWaypoints => "parsed_with_waypoints",
+            Self::NoWaypoints => "no_waypoints",
+            Self::ParseError => "parse_error",
+            Self::ReadError => "read_error",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ApplyRecordOutcome {
+    waypoints_written: usize,
+    front_state: Option<FrontApplyState>,
 }
 
 /// D1 `view_kind` for a freshly scanned car-volume clip, recomputed from
@@ -142,11 +191,12 @@ fn angle_facts(record: &ClipAngleRecord, folder_class: FolderClass) -> AngleFact
     }
 }
 
-/// Ingest one validated record. Front angles upsert the clip, replace the
-/// waypoint cache (even when empty, to clear a stale version), and upsert
-/// the front angle; non-front angles only ensure the clip exists (never
-/// downgrading a front-resolved instant) and upsert the angle. Returns the
-/// number of waypoints written (front only; `0` otherwise).
+/// Ingest one validated record. Front angles are parse-state driven:
+/// `parsed_with_waypoints` / `no_waypoints` upsert+replace waypoints,
+/// `parse_error` / `read_error` ensure-only (non-destructive, no waypoint
+/// replacement), and all front paths upsert the parse-attempt row and
+/// angle. Non-front angles only ensure the clip exists (never downgrading
+/// a front-resolved instant) and upsert the angle.
 ///
 /// Errors are surfaced to the caller, which counts the record and moves on.
 /// There is **no per-record savepoint**: any earlier write for a record
@@ -158,20 +208,59 @@ fn apply_record(
     conn: &Connection,
     record: &ClipAngleRecord,
     is_front: bool,
-) -> Result<usize, DbError> {
+) -> Result<ApplyRecordOutcome, DbError> {
     let folder_class = FolderClass::from_db_str(record.bucket.as_db_str());
     let facts = clip_facts(record, folder_class);
     let angle = angle_facts(record, folder_class);
     if is_front {
-        let clip_id = upsert_clip(conn, &facts)?;
+        let front_state = FrontApplyState::from_wire(record.parse_state.as_deref());
         let derived: Vec<DeriveWaypoint> = record.waypoints.iter().map(map_waypoint).collect();
-        replace_clip_waypoints(conn, clip_id, &derived)?;
+        let clip_id = match front_state {
+            FrontApplyState::ParseError | FrontApplyState::ReadError => ensure_clip(conn, &facts)?,
+            FrontApplyState::ParsedWithWaypoints | FrontApplyState::NoWaypoints => {
+                upsert_clip(conn, &facts)?
+            }
+        };
+        // Data-integrity invariant: `replace_clip_waypoints` is a
+        // DELETE-then-insert, so a destructive clear of prior good GPS may
+        // ONLY happen for the explicit `no_waypoints` state. A
+        // `parsed_with_waypoints` (or unknown/legacy state that `from_wire`
+        // maps here) carrying an EMPTY list is incoherent — never let it
+        // wipe the cache; leave the prior waypoints intact.
+        let waypoints_written = match front_state {
+            FrontApplyState::ParsedWithWaypoints => {
+                if derived.is_empty() {
+                    0
+                } else {
+                    replace_clip_waypoints(conn, clip_id, &derived)?;
+                    derived.len()
+                }
+            }
+            FrontApplyState::NoWaypoints => {
+                replace_clip_waypoints(conn, clip_id, &[])?;
+                0
+            }
+            FrontApplyState::ParseError | FrontApplyState::ReadError => 0,
+        };
         upsert_angle_scan_preserving(conn, clip_id, &angle)?;
-        Ok(derived.len())
+        upsert_front_parse_attempt(
+            conn,
+            &record.canonical_key,
+            front_state.as_wire(),
+            record.parse_fingerprint.as_deref(),
+            record.parser_version,
+        )?;
+        Ok(ApplyRecordOutcome {
+            waypoints_written,
+            front_state: Some(front_state),
+        })
     } else {
         let clip_id = ensure_clip(conn, &facts)?;
         upsert_angle_scan_preserving(conn, clip_id, &angle)?;
-        Ok(0)
+        Ok(ApplyRecordOutcome {
+            waypoints_written: 0,
+            front_state: None,
+        })
     }
 }
 
@@ -191,6 +280,7 @@ fn apply_record(
 ///
 /// Returns [`ScanError::Batch`] if the batch fails batch-level validation,
 /// or [`ScanError::Db`] if a transaction/prune/derive/commit step fails.
+#[allow(clippy::too_many_lines)]
 pub fn apply(
     conn: &mut Connection,
     batch: &ScanBatch,
@@ -217,11 +307,17 @@ pub fn apply(
         }
         let is_front = record.is_front();
         match apply_record(&tx, record, is_front) {
-            Ok(waypoints) => {
+            Ok(outcome) => {
                 report.clips_written += 1;
                 if is_front {
                     report.front_walked += 1;
-                    report.waypoints += waypoints;
+                    report.waypoints += outcome.waypoints_written;
+                    match outcome.front_state {
+                        Some(FrontApplyState::ParseError) => report.front_parse_errors += 1,
+                        Some(FrontApplyState::ReadError) => report.front_read_errors += 1,
+                        Some(FrontApplyState::NoWaypoints) => report.front_no_waypoints += 1,
+                        _ => {}
+                    }
                 }
             }
             Err(_) => report.record_errors += 1,
@@ -231,6 +327,7 @@ pub fn apply(
     if batch.complete {
         let present_keys: HashSet<String> = batch.present_keys.iter().cloned().collect();
         report.pruned = prune_missing_clips(&tx, &present_keys)?;
+        let _ = prune_orphan_front_parse_attempts(&tx)?;
     }
 
     // MEDIA (p2) inventory. Only a media-aware producer touches the catalog:
@@ -337,7 +434,7 @@ mod tests {
     use scannerd::produce::wire_waypoint_from_walk;
     use scannerd::record::{
         AngleRecord, Bucket, ClipAngleRecord, ClipEventRecord, MediaFileRecord, PROTOCOL_VERSION,
-        ProducerStats, ScanBatch,
+        PARSER_VERSION, ProducerStats, ScanBatch,
     };
     use scannerd::seiwalk::Waypoint;
     use teslausb_core::sei::tesla::{AutopilotState, Gear, SeiMessage};
@@ -418,14 +515,37 @@ mod tests {
             wire_waypoint_from_walk(&waypoint(0, 0.0, 37.5, -122.3), started),
             wire_waypoint_from_walk(&waypoint(1, 1000.0, 37.5005, -122.3005), started),
         ];
+        front_record_with_state(
+            key,
+            dir,
+            started_at,
+            "parsed_with_waypoints",
+            waypoints,
+            Some(started + 1),
+            Some(1.0),
+        )
+    }
+
+    fn front_record_with_state(
+        key: &str,
+        dir: &str,
+        started_at: i64,
+        parse_state: &str,
+        waypoints: Vec<scannerd::record::WireWaypoint>,
+        ended_at: Option<i64>,
+        duration_s: Option<f64>,
+    ) -> ClipAngleRecord {
         ClipAngleRecord {
             canonical_key: key.to_owned(),
-            started_at: started,
-            ended_at: Some(started + 1),
+            started_at,
+            ended_at,
             partition: "slot0".to_owned(),
             bucket: Bucket::SavedClips,
-            duration_s: Some(1.0),
+            duration_s,
             angle: front_angle("front", dir),
+            parse_state: Some(parse_state.to_owned()),
+            parse_fingerprint: Some("f00d".to_owned()),
+            parser_version: Some(PARSER_VERSION),
             waypoints,
         }
     }
@@ -439,6 +559,9 @@ mod tests {
             bucket: Bucket::SavedClips,
             duration_s: None,
             angle: front_angle(camera, dir),
+            parse_state: None,
+            parse_fingerprint: None,
+            parser_version: None,
             waypoints: Vec::new(),
         }
     }
@@ -458,6 +581,27 @@ mod tests {
             clip_events: Vec::new(),
             clip_events_inventory: false,
         }
+    }
+
+    fn waypoint_count_for_key(conn: &Connection, key: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*)
+               FROM clip_waypoints w
+               JOIN clips c ON c.id = w.clip_id
+              WHERE c.canonical_key = ?1",
+            [key],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn front_attempt_state(conn: &Connection, key: &str) -> Option<String> {
+        conn.query_row(
+            "SELECT parse_state FROM front_parse_attempts WHERE canonical_key = ?1",
+            [key],
+            |r| r.get(0),
+        )
+        .ok()
     }
 
     #[test]
@@ -482,6 +626,250 @@ mod tests {
         assert_eq!(count(&conn, "clips"), 1);
         assert_eq!(count(&conn, "angles"), 2);
         assert_eq!(count(&conn, "clip_waypoints"), 2);
+    }
+
+    #[test]
+    fn legacy_front_record_without_parse_state_uses_replace_path() {
+        let mut conn = open_in_memory().unwrap();
+        let dir = "TeslaCam/SavedClips/2026-06-01_20-10-04";
+        let key = "0:TeslaCam/SavedClips/2026-06-01_20-10-04/2026-06-01_20-10-04";
+        let mut legacy = front_record(key, dir, 1_700_000_000);
+        legacy.parse_state = None;
+        legacy.parse_fingerprint = None;
+        legacy.parser_version = None;
+        apply(
+            &mut conn,
+            &batch(vec![legacy], true),
+            DeriveConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(waypoint_count_for_key(&conn, key), 2);
+        assert_eq!(
+            front_attempt_state(&conn, key).as_deref(),
+            Some("parsed_with_waypoints")
+        );
+    }
+
+    #[test]
+    fn parse_error_preserves_existing_waypoints() {
+        let mut conn = open_in_memory().unwrap();
+        let dir = "TeslaCam/SavedClips/2026-06-01_20-10-04";
+        let key = "0:TeslaCam/SavedClips/2026-06-01_20-10-04/2026-06-01_20-10-04";
+        apply(
+            &mut conn,
+            &batch(vec![front_record(key, dir, 1_700_000_000)], true),
+            DeriveConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(waypoint_count_for_key(&conn, key), 2);
+
+        let parse_error = front_record_with_state(
+            key,
+            dir,
+            1_700_000_000,
+            "parse_error",
+            Vec::new(),
+            None,
+            None,
+        );
+        let report = apply(&mut conn, &batch(vec![parse_error], true), DeriveConfig::default())
+            .unwrap();
+        assert_eq!(report.front_parse_errors, 1);
+        assert_eq!(waypoint_count_for_key(&conn, key), 2);
+        assert_eq!(front_attempt_state(&conn, key).as_deref(), Some("parse_error"));
+    }
+
+    #[test]
+    fn read_error_preserves_existing_waypoints() {
+        let mut conn = open_in_memory().unwrap();
+        let dir = "TeslaCam/SavedClips/2026-06-01_20-10-04";
+        let key = "0:TeslaCam/SavedClips/2026-06-01_20-10-04/2026-06-01_20-10-04";
+        apply(
+            &mut conn,
+            &batch(vec![front_record(key, dir, 1_700_000_000)], true),
+            DeriveConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(waypoint_count_for_key(&conn, key), 2);
+
+        let read_error = front_record_with_state(
+            key,
+            dir,
+            1_700_000_000,
+            "read_error",
+            Vec::new(),
+            None,
+            None,
+        );
+        let report = apply(&mut conn, &batch(vec![read_error], true), DeriveConfig::default())
+            .unwrap();
+        assert_eq!(report.front_read_errors, 1);
+        assert_eq!(waypoint_count_for_key(&conn, key), 2);
+        assert_eq!(front_attempt_state(&conn, key).as_deref(), Some("read_error"));
+    }
+
+    #[test]
+    fn unknown_parse_state_with_empty_waypoints_is_non_destructive() {
+        // Finding-1 regression: an unknown/`legacy_unknown` parse_state (which
+        // `from_wire` collapses to ParsedWithWaypoints) carrying an EMPTY
+        // waypoint list must NEVER delete prior good GPS. Only the explicit
+        // `no_waypoints` state may clear the cache.
+        let mut conn = open_in_memory().unwrap();
+        let dir = "TeslaCam/SavedClips/2026-06-01_20-10-04";
+        let key = "0:TeslaCam/SavedClips/2026-06-01_20-10-04/2026-06-01_20-10-04";
+        apply(
+            &mut conn,
+            &batch(vec![front_record(key, dir, 1_700_000_000)], true),
+            DeriveConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(waypoint_count_for_key(&conn, key), 2);
+
+        let unknown = front_record_with_state(
+            key,
+            dir,
+            1_700_000_000,
+            "legacy_unknown",
+            Vec::new(),
+            None,
+            None,
+        );
+        apply(&mut conn, &batch(vec![unknown], true), DeriveConfig::default()).unwrap();
+        // Prior GPS preserved; not wiped by the incoherent empty record.
+        assert_eq!(waypoint_count_for_key(&conn, key), 2);
+    }
+
+    #[test]
+    fn no_waypoints_clears_existing_waypoints_and_records_attempt() {
+        let mut conn = open_in_memory().unwrap();
+        let dir = "TeslaCam/SavedClips/2026-06-01_20-10-04";
+        let key = "0:TeslaCam/SavedClips/2026-06-01_20-10-04/2026-06-01_20-10-04";
+        apply(
+            &mut conn,
+            &batch(vec![front_record(key, dir, 1_700_000_000)], true),
+            DeriveConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(waypoint_count_for_key(&conn, key), 2);
+
+        let no_waypoints = front_record_with_state(
+            key,
+            dir,
+            1_700_000_000,
+            "no_waypoints",
+            Vec::new(),
+            Some(1_700_000_000),
+            Some(0.0),
+        );
+        let report = apply(&mut conn, &batch(vec![no_waypoints], true), DeriveConfig::default())
+            .unwrap();
+        assert_eq!(report.front_no_waypoints, 1);
+        assert_eq!(waypoint_count_for_key(&conn, key), 0);
+        assert_eq!(front_attempt_state(&conn, key).as_deref(), Some("no_waypoints"));
+    }
+
+    #[test]
+    fn no_waypoints_on_new_clip_records_attempt_with_empty_cache() {
+        let mut conn = open_in_memory().unwrap();
+        let dir = "TeslaCam/SavedClips/2026-06-01_20-10-04";
+        let key = "0:TeslaCam/SavedClips/new/2026-06-01_20-10-04";
+        let no_waypoints = front_record_with_state(
+            key,
+            dir,
+            1_700_000_000,
+            "no_waypoints",
+            Vec::new(),
+            Some(1_700_000_000),
+            Some(0.0),
+        );
+        apply(
+            &mut conn,
+            &batch(vec![no_waypoints], true),
+            DeriveConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(waypoint_count_for_key(&conn, key), 0);
+        assert_eq!(front_attempt_state(&conn, key).as_deref(), Some("no_waypoints"));
+    }
+
+    #[test]
+    fn front_error_states_are_distinctly_counted_in_report() {
+        let mut conn = open_in_memory().unwrap();
+        let dir = "TeslaCam/SavedClips/2026-06-01_20-10-04";
+        let parse_key = "0:TeslaCam/SavedClips/a/2026-06-01_20-10-04";
+        let read_key = "0:TeslaCam/SavedClips/b/2026-06-01_20-11-04";
+        let b = batch(
+            vec![
+                front_record_with_state(
+                    parse_key,
+                    dir,
+                    1_700_000_000,
+                    "parse_error",
+                    Vec::new(),
+                    None,
+                    None,
+                ),
+                front_record_with_state(
+                    read_key,
+                    dir,
+                    1_700_000_100,
+                    "read_error",
+                    Vec::new(),
+                    None,
+                    None,
+                ),
+            ],
+            true,
+        );
+        let report = apply(&mut conn, &b, DeriveConfig::default()).unwrap();
+        assert_eq!(report.front_walked, 2);
+        assert_eq!(report.front_parse_errors, 1);
+        assert_eq!(report.front_read_errors, 1);
+        assert_eq!(report.front_no_waypoints, 0);
+    }
+
+    #[test]
+    fn parse_error_does_not_downgrade_clip_ended_at_or_duration() {
+        let mut conn = open_in_memory().unwrap();
+        let dir = "TeslaCam/SavedClips/2026-06-01_20-10-04";
+        let key = "0:TeslaCam/SavedClips/2026-06-01_20-10-04/2026-06-01_20-10-04";
+        apply(
+            &mut conn,
+            &batch(vec![front_record(key, dir, 1_700_000_000)], true),
+            DeriveConfig::default(),
+        )
+        .unwrap();
+        let before: (Option<i64>, Option<f64>) = conn
+            .query_row(
+                "SELECT ended_at, duration_s FROM clips WHERE canonical_key = ?1",
+                [key],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+
+        let parse_error = front_record_with_state(
+            key,
+            dir,
+            1_700_000_000,
+            "parse_error",
+            Vec::new(),
+            None,
+            None,
+        );
+        apply(
+            &mut conn,
+            &batch(vec![parse_error], true),
+            DeriveConfig::default(),
+        )
+        .unwrap();
+        let after: (Option<i64>, Option<f64>) = conn
+            .query_row(
+                "SELECT ended_at, duration_s FROM clips WHERE canonical_key = ?1",
+                [key],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(after, before);
     }
 
     fn media_rec(rel_path: &str) -> MediaFileRecord {
@@ -708,6 +1096,37 @@ mod tests {
         let report = apply(&mut conn, &full, DeriveConfig::default()).unwrap();
         assert_eq!(report.pruned, 1);
         assert_eq!(count(&conn, "clips"), 1);
+    }
+
+    #[test]
+    fn front_parse_attempts_prune_only_on_complete_batches() {
+        let mut conn = open_in_memory().unwrap();
+        let dir = "TeslaCam/SavedClips/2026-06-01_20-10-04";
+        let key_a = "0:TeslaCam/SavedClips/a/2026-06-01_20-10-04";
+        let key_b = "0:TeslaCam/SavedClips/b/2026-06-01_20-11-04";
+
+        let seed = batch(
+            vec![
+                front_record(key_a, dir, 1_700_000_000),
+                front_record(key_b, dir, 1_700_000_100),
+            ],
+            true,
+        );
+        apply(&mut conn, &seed, DeriveConfig::default()).unwrap();
+        assert_eq!(count(&conn, "front_parse_attempts"), 2);
+
+        let incomplete = batch(vec![front_record(key_a, dir, 1_700_000_000)], false);
+        apply(&mut conn, &incomplete, DeriveConfig::default()).unwrap();
+        assert_eq!(count(&conn, "front_parse_attempts"), 2);
+
+        let complete = batch(vec![front_record(key_a, dir, 1_700_000_000)], true);
+        apply(&mut conn, &complete, DeriveConfig::default()).unwrap();
+        assert_eq!(count(&conn, "front_parse_attempts"), 1);
+        assert_eq!(
+            front_attempt_state(&conn, key_a).as_deref(),
+            Some("parsed_with_waypoints")
+        );
+        assert_eq!(front_attempt_state(&conn, key_b), None);
     }
 
     #[test]

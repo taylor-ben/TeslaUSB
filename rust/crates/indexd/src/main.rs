@@ -156,8 +156,7 @@ mod unix_app {
     pub fn run() -> Result<(), String> {
         let (db_path, scannerd_socket_path, indexd_socket_path) = resolve_paths();
         let health_file = std::env::var_os("INDEXD_HEALTH_FILE")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_HEALTH_FILE));
+            .map_or_else(|| PathBuf::from(DEFAULT_HEALTH_FILE), PathBuf::from);
         let db_display = db_path.display().to_string();
         let conn = open(&db_path).map_err(|e: DbError| format!("opening {db_display}: {e}"))?;
         let conn = Arc::new(Mutex::new(conn));
@@ -290,7 +289,8 @@ mod unix_app {
                 Ok(report) => {
                     println!(
                         "indexd: pass gen {want_generation} — {} clips, {} front, {} waypoints, \
-                         {} trips, {} events, {} pruned, {} errors",
+                         {} trips, {} events, {} pruned, {} errors, {} front-parse-errors, \
+                         {} front-read-errors, {} front-no-waypoints",
                         report.clips_written,
                         report.front_walked,
                         report.waypoints,
@@ -298,6 +298,9 @@ mod unix_app {
                         report.events,
                         report.pruned,
                         report.record_errors,
+                        report.front_parse_errors,
+                        report.front_read_errors,
+                        report.front_no_waypoints,
                     );
                     // Committed: the next pass only needs newly-eligible clips.
                     resync = false;

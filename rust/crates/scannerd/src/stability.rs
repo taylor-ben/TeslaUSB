@@ -182,7 +182,7 @@ fn is_eligible(
 
 /// Cheap fingerprint over the directory-entry fields that change as a
 /// file is written. Excludes the path/name (that is the identity key).
-fn fingerprint(record: &FileRecord) -> u64 {
+pub(crate) fn fingerprint(record: &FileRecord) -> u64 {
     let mut h = FNV_OFFSET;
     let mut fold = |bytes: &[u8]| {
         for &b in bytes {
