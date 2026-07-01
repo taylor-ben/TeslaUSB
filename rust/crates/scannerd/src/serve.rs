@@ -39,6 +39,7 @@
 //! read-only and never mounts, so serving can never disturb the car's
 //! write path (the #1 invariant).
 
+use std::collections::HashSet;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -87,8 +88,8 @@ pub fn run_serve(args: &[String]) -> ExitCode {
     };
     let media_path = arg_value(args, "--media");
     let socket = arg_value(args, "--socket").unwrap_or_else(|| DEFAULT_SOCKET.to_owned());
-    let read_socket =
-        arg_value(args, "--read-socket").unwrap_or_else(|| readserve::DEFAULT_READ_SOCKET.to_owned());
+    let read_socket = arg_value(args, "--read-socket")
+        .unwrap_or_else(|| readserve::DEFAULT_READ_SOCKET.to_owned());
     let sample_rate = arg_value(args, "--sample-rate")
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(DEFAULT_SEI_SAMPLE_RATE);
@@ -127,14 +128,14 @@ pub fn run_serve(args: &[String]) -> ExitCode {
         None => vec![ImageSource::native(teslacam_reader.as_ref())],
     };
 
-    let _read_thread =
-        match readserve::start(Arc::clone(&teslacam_reader), Path::new(&read_socket)) {
-            Ok(handle) => handle,
-            Err(e) => {
-                eprintln!("scannerd serve: cannot start read socket {read_socket}: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
+    let _read_thread = match readserve::start(Arc::clone(&teslacam_reader), Path::new(&read_socket))
+    {
+        Ok(handle) => handle,
+        Err(e) => {
+            eprintln!("scannerd serve: cannot start read socket {read_socket}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     match serve(&sources, Path::new(&socket), sample_rate) {
         Ok(()) => ExitCode::SUCCESS,
@@ -231,11 +232,9 @@ fn handle_conn(
             Err(e) => return Err(e),
         };
         match request {
-            Request::Scan { generation, resync } => {
-                if resync {
-                    tracker.arm_resync();
-                }
-                let mut batch = produce(sources, tracker, now_secs(), sample_rate)
+            Request::Scan { generation, shape } => {
+                let shape: HashSet<String> = shape.into_iter().collect();
+                let mut batch = produce(sources, tracker, now_secs(), &shape, sample_rate)
                     .map_err(|e| io::Error::other(format!("produce failed: {e}")))?;
                 batch.generation = generation;
                 write_batch(&mut stream, &batch)?;

@@ -29,7 +29,7 @@ pub const SCHEMA_VERSION_NOTE: &str = "v1 (PROVISIONAL — pre-OP-3 freeze)";
 /// The highest schema version this binary knows how to produce. A DB
 /// reporting a higher version was written by a newer `indexd` and must
 /// not be opened read-write.
-pub const LATEST_VERSION: i64 = 4;
+pub const LATEST_VERSION: i64 = 5;
 
 /// The ordered migration ladder. Index order MUST match ascending
 /// `version`; [`MIGRATIONS`] is validated by a test.
@@ -53,6 +53,11 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 4,
         note: "v4 — front_parse_attempts (durable front parse outcomes)",
         sql: V4_SQL,
+    },
+    Migration {
+        version: 5,
+        note: "v5 — front_parse_attempt retry/backoff columns",
+        sql: V5_SQL,
     },
 ];
 
@@ -126,6 +131,15 @@ SELECT c.canonical_key,
   FROM clips c
   JOIN angles a ON a.clip_id = c.id
  WHERE lower(a.camera) = 'front';
+";
+
+/// v5 DDL: add retry/backoff tracking columns for durable front parse
+/// attempts. Existing rows start at attempt_count=0 with no backoff.
+const V5_SQL: &str = "
+ALTER TABLE front_parse_attempts
+   ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE front_parse_attempts
+   ADD COLUMN next_retry_at INTEGER;
 ";
 
 /// v1 DDL: contract D1's proposed schema, plus two internal additions
@@ -330,7 +344,7 @@ mod tests {
 
     use rusqlite::{Connection, params};
 
-    use super::{LATEST_VERSION, MIGRATIONS, V1_SQL, V2_SQL, V3_SQL, V4_SQL};
+    use super::{LATEST_VERSION, MIGRATIONS, V1_SQL, V2_SQL, V3_SQL, V4_SQL, V5_SQL};
 
     #[test]
     fn ladder_is_monotonic_and_matches_latest() {
@@ -412,5 +426,48 @@ mod tests {
             .unwrap();
         assert_eq!(has, "parsed_with_waypoints");
         assert_eq!(none, "legacy_unknown");
+    }
+
+    #[test]
+    fn v5_adds_retry_columns_with_defaults() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(V1_SQL).unwrap();
+        conn.execute_batch(V2_SQL).unwrap();
+        conn.execute_batch(V3_SQL).unwrap();
+        conn.execute_batch(V4_SQL).unwrap();
+        for version in 1_i64..=4 {
+            conn.execute(
+                "INSERT INTO schema_version(version, applied_at, note) VALUES(?1, 0, 'seed')",
+                params![version],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO front_parse_attempts
+                (canonical_key, parse_state, parse_fingerprint, parser_version, attempted_at, updated_at)
+             VALUES
+                ('k1', 'parse_error', 'f00d', 1, 1000, 1000)",
+            [],
+        )
+        .unwrap();
+
+        let tx = conn.transaction().unwrap();
+        tx.execute_batch(V5_SQL).unwrap();
+        tx.execute(
+            "INSERT INTO schema_version(version, applied_at, note) VALUES(5, 0, 'v5')",
+            [],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let row: (i64, Option<i64>) = conn
+            .query_row(
+                "SELECT attempt_count, next_retry_at FROM front_parse_attempts WHERE canonical_key='k1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, 0);
+        assert_eq!(row.1, None);
     }
 }

@@ -39,6 +39,13 @@ pub const MAX_PRESENT_KEYS: usize = 200_000;
 /// real per-pass burst, but bounds a malicious producer.
 pub const MAX_RECORDS_PER_BATCH: usize = 100_000;
 
+/// Hard cap on front-census entries per batch (one per clip with a front
+/// angle). Uses the same order of magnitude as `present_keys`.
+pub const MAX_FRONT_CENSUS: usize = 200_000;
+
+/// Hard cap on requested-but-unplaceable front outcomes per batch.
+pub const MAX_FRONT_UNPLACEABLE: usize = 200_000;
+
 /// Hard cap on waypoints carried for one clip. The indexer decimates SEI
 /// to ~1/sec; even an hour-long clip is a few thousand. Bounds a corrupt
 /// `mdat` from ballooning a single record.
@@ -299,6 +306,28 @@ pub struct ClipEventRecord {
     pub camera: Option<String>,
 }
 
+/// One front-angle census fact for this pass's clip set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrontCensusRecord {
+    /// Camera-independent clip key.
+    pub canonical_key: String,
+    /// Front angle metadata fingerprint from stability tracking fields.
+    pub front_fingerprint: u64,
+    /// Whether the front angle is currently stable.
+    pub front_stable: bool,
+}
+
+/// One requested front clip that could not be placed on the timeline.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FrontUnplaceableRecord {
+    /// Camera-independent clip key.
+    pub canonical_key: String,
+    /// Front angle metadata fingerprint from stability tracking fields.
+    pub front_fingerprint: u64,
+    /// Wire parse-state: `"read_error"` or `"parse_error"`.
+    pub reason: String,
+}
+
 /// A single scan pass's worth of facts: the full present-key set (for the
 /// consumer's prune step) plus the eligible records. `complete` is the
 /// prune-safety gate — it is `true` only when the volume walk fully
@@ -316,6 +345,14 @@ pub struct ScanBatch {
     /// Every clip currently present on the media (canonical keys), for
     /// the consumer's prune step. Trustworthy only when `complete`.
     pub present_keys: Vec<String>,
+    /// Per-clip front-angle census (entries only for clips that have a front
+    /// angle this pass), used by indexd's durable shaping selector.
+    #[serde(default)]
+    pub front_census: Vec<FrontCensusRecord>,
+    /// Requested front clips that were stable but could not be placed on the
+    /// timeline, so no clip row can be emitted.
+    #[serde(default)]
+    pub front_unplaceable: Vec<FrontUnplaceableRecord>,
     /// Eligible files (camera angles) to ingest this pass.
     pub records: Vec<ClipAngleRecord>,
     /// MEDIA-partition (p2) inventory facts for the read-only media screens
@@ -441,6 +478,12 @@ impl ScanBatch {
             });
         }
         cap("present_keys", self.present_keys.len(), MAX_PRESENT_KEYS)?;
+        cap("front_census", self.front_census.len(), MAX_FRONT_CENSUS)?;
+        cap(
+            "front_unplaceable",
+            self.front_unplaceable.len(),
+            MAX_FRONT_UNPLACEABLE,
+        )?;
         cap("records", self.records.len(), MAX_RECORDS_PER_BATCH)?;
         cap("media", self.media.len(), MAX_MEDIA_RECORDS)?;
         cap(
@@ -455,6 +498,16 @@ impl ScanBatch {
         )?;
         for key in &self.present_keys {
             string_len("present_key", key)?;
+        }
+        for front in &self.front_census {
+            string_len("front_census.canonical_key", &front.canonical_key)?;
+        }
+        for unplaceable in &self.front_unplaceable {
+            string_len(
+                "front_unplaceable.canonical_key",
+                &unplaceable.canonical_key,
+            )?;
+            string_len("front_unplaceable.reason", &unplaceable.reason)?;
         }
         for path in &self.media_present_paths {
             string_len("media_present_path", path)?;
@@ -607,9 +660,9 @@ mod tests {
 
     use super::{
         AngleRecord, Bucket, ClipAngleRecord, ClipEventRecord, MAX_CLIP_EVENT_RECORDS,
-        MAX_MEDIA_RECORDS, MAX_STRING_LEN, MediaFileRecord, PARSER_VERSION, PROTOCOL_VERSION,
-        ProducerStats,
-        ScanBatch, WireWaypoint, autopilot_to_u32, gear_to_u32,
+        MAX_FRONT_CENSUS, MAX_FRONT_UNPLACEABLE, MAX_MEDIA_RECORDS, MAX_STRING_LEN,
+        MediaFileRecord, PARSER_VERSION, PROTOCOL_VERSION, ProducerStats, ScanBatch, WireWaypoint,
+        autopilot_to_u32, gear_to_u32,
     };
     use teslausb_core::sei::tesla::{AutopilotState, Gear};
 
@@ -648,6 +701,8 @@ mod tests {
                 unplaceable_front: 0,
             },
             present_keys: vec!["0:TeslaCam/SavedClips/2026-06-01_20-10-04".to_owned()],
+            front_census: Vec::new(),
+            front_unplaceable: Vec::new(),
             records: vec![ClipAngleRecord {
                 canonical_key: "0:TeslaCam/SavedClips/2026-06-01_20-10-04".to_owned(),
                 started_at: 1_700_000_000,
@@ -716,6 +771,8 @@ mod tests {
             "present_keys": [], "records": []
         }"#;
         let batch: ScanBatch = serde_json::from_str(json).unwrap();
+        assert!(batch.front_census.is_empty());
+        assert!(batch.front_unplaceable.is_empty());
         assert!(batch.media.is_empty());
         assert!(batch.media_present_paths.is_empty());
         assert!(!batch.media_inventory);
@@ -743,6 +800,32 @@ mod tests {
     fn batch_rejects_media_over_cap() {
         let mut batch = sample_batch();
         batch.media_present_paths = (0..=MAX_MEDIA_RECORDS).map(|i| i.to_string()).collect();
+        assert!(batch.validate().is_err());
+    }
+
+    #[test]
+    fn batch_rejects_front_census_over_cap() {
+        let mut batch = sample_batch();
+        batch.front_census = (0..=MAX_FRONT_CENSUS)
+            .map(|i| super::FrontCensusRecord {
+                canonical_key: format!("slot:TeslaCam/SavedClips/clip-{i}"),
+                front_fingerprint: i as u64,
+                front_stable: false,
+            })
+            .collect();
+        assert!(batch.validate().is_err());
+    }
+
+    #[test]
+    fn batch_rejects_front_unplaceable_over_cap() {
+        let mut batch = sample_batch();
+        batch.front_unplaceable = (0..=MAX_FRONT_UNPLACEABLE)
+            .map(|i| super::FrontUnplaceableRecord {
+                canonical_key: format!("slot:TeslaCam/SavedClips/clip-{i}"),
+                front_fingerprint: i as u64,
+                reason: "parse_error".to_owned(),
+            })
+            .collect();
         assert!(batch.validate().is_err());
     }
 

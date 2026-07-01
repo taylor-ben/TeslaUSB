@@ -4,8 +4,8 @@ use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -408,8 +408,10 @@ fn percent_decode_once(path: &str) -> Result<String, String> {
             let Some(lo_raw) = iter.next() else {
                 return Err("path has invalid percent escape".to_owned());
             };
-            let hi = hex_value(hi_raw).ok_or_else(|| "path has invalid percent escape".to_owned())?;
-            let lo = hex_value(lo_raw).ok_or_else(|| "path has invalid percent escape".to_owned())?;
+            let hi =
+                hex_value(hi_raw).ok_or_else(|| "path has invalid percent escape".to_owned())?;
+            let lo =
+                hex_value(lo_raw).ok_or_else(|| "path has invalid percent escape".to_owned())?;
             out.push((hi << 4) | lo);
         } else {
             out.push(byte);
@@ -772,7 +774,9 @@ mod tests {
         let teslacam_dir = encode_entry_set("TeslaCam", true, 3, 512, 512, true, &upcase);
         let mut root_entries = vec![teslacam_dir];
         if config.add_broken_root_dir {
-            root_entries.push(encode_entry_set("Broken", true, 5, 512, 512, false, &upcase));
+            root_entries.push(encode_entry_set(
+                "Broken", true, 5, 512, 512, false, &upcase,
+            ));
         }
         let mut recent_dir = encode_entry_set("RecentClips", true, 4, 512, 512, true, &upcase);
         if config.corrupt_recent_checksum {
@@ -809,7 +813,12 @@ mod tests {
             4,
             &directory_cluster(&[file_entry], CLUSTER_SIZE),
         );
-        write_file_payload_clusters(&mut img, START_LBA, config.file_first_cluster, &config.file_bytes);
+        write_file_payload_clusters(
+            &mut img,
+            START_LBA,
+            config.file_first_cluster,
+            &config.file_bytes,
+        );
         img
     }
 
@@ -854,11 +863,17 @@ mod tests {
     }
 
     fn write_cluster(img: &mut [u8], start_lba: u32, cluster: u32, payload: &[u8]) {
-        let base = usize::try_from(cluster_offset(start_lba, cluster)).expect("cluster offset usize");
+        let base =
+            usize::try_from(cluster_offset(start_lba, cluster)).expect("cluster offset usize");
         img[base..base + payload.len()].copy_from_slice(payload);
     }
 
-    fn write_file_payload_clusters(img: &mut [u8], start_lba: u32, first_cluster: u32, payload: &[u8]) {
+    fn write_file_payload_clusters(
+        img: &mut [u8],
+        start_lba: u32,
+        first_cluster: u32,
+        payload: &[u8],
+    ) {
         for (idx, chunk) in payload.chunks(CLUSTER_SIZE).enumerate() {
             let cluster = first_cluster + u32::try_from(idx).expect("cluster index u32");
             write_cluster(img, start_lba, cluster, chunk);

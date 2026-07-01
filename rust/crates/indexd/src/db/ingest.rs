@@ -21,7 +21,7 @@
 //! after a *complete* successful scan (the caller passes the full present
 //! key set).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use rusqlite::{Connection, params};
 use teslausb_core::sei::tesla::{AutopilotState, Gear};
@@ -398,6 +398,7 @@ impl RegistrationDisposition {
 
 /// Replace the cached SEI telemetry for a clip (full delete + reinsert).
 /// This is pure derived state; the rows carry no control flags.
+/// Returns the number of rows deleted from the prior cache.
 ///
 /// # Errors
 ///
@@ -406,8 +407,8 @@ pub fn replace_clip_waypoints(
     conn: &Connection,
     clip_id: i64,
     waypoints: &[DeriveWaypoint],
-) -> Result<(), DbError> {
-    conn.execute(
+) -> Result<usize, DbError> {
+    let deleted = conn.execute(
         "DELETE FROM clip_waypoints WHERE clip_id = ?1",
         params![clip_id],
     )?;
@@ -437,7 +438,7 @@ pub fn replace_clip_waypoints(
             i64::from(wp.has_gps_fix),
         ])?;
     }
-    Ok(())
+    Ok(deleted)
 }
 
 /// Upsert durable front-parse outcome metadata keyed by `canonical_key`.
@@ -451,22 +452,30 @@ pub fn upsert_front_parse_attempt(
     parse_state: &str,
     fingerprint: Option<&str>,
     parser_version: Option<i64>,
+    attempt_count: i64,
+    next_retry_at: Option<i64>,
 ) -> Result<(), DbError> {
     let now = now_epoch_s();
     conn.execute(
         "INSERT INTO front_parse_attempts
-             (canonical_key, parse_state, parse_fingerprint, parser_version, attempted_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+             (canonical_key, parse_state, parse_fingerprint, parser_version,
+             attempt_count, next_retry_at, attempted_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
          ON CONFLICT(canonical_key) DO UPDATE SET
              parse_state       = excluded.parse_state,
              parse_fingerprint = excluded.parse_fingerprint,
              parser_version    = excluded.parser_version,
+             attempt_count     = excluded.attempt_count,
+             next_retry_at     = excluded.next_retry_at,
+             attempted_at      = excluded.attempted_at,
              updated_at        = excluded.updated_at",
         params![
             canonical_key,
             parse_state,
             fingerprint,
             parser_version,
+            attempt_count,
+            next_retry_at,
             now,
         ],
     )?;
@@ -503,24 +512,45 @@ pub fn prune_missing_clips<S: std::hash::BuildHasher>(
     Ok(stale.len())
 }
 
-/// Remove front-parse-attempt rows orphaned by clip pruning: an attempt is
-/// deleted only when its `canonical_key` no longer has a matching `clips`
-/// row. This mirrors [`prune_missing_clips`] (which PRESERVES archive-backed
-/// clips even when absent from `present_keys`), so an archived clip that has
-/// left the USB keeps BOTH its clip row and its parse-attempt provenance.
-/// MUST be called AFTER [`prune_missing_clips`] within the same
-/// complete-pass gate.
+/// Remove front-parse-attempt rows orphaned by clip pruning and not currently
+/// present on media.
+///
+/// A row is pruned only when its `canonical_key` has no matching `clips` row
+/// AND is absent from `present_keys`. This keeps durable attempts for
+/// requested-but-unplaceable fronts (which intentionally have no clip row) as
+/// long as the key is still present on USB, while still dropping stale rows
+/// once a clip disappears.
+///
+/// MUST be called AFTER [`prune_missing_clips`] within the same complete-pass
+/// gate.
 ///
 /// # Errors
 ///
 /// Returns [`DbError`] if a statement fails.
-pub fn prune_orphan_front_parse_attempts(conn: &Connection) -> Result<usize, DbError> {
-    let pruned = conn.execute(
-        "DELETE FROM front_parse_attempts
-         WHERE canonical_key NOT IN (SELECT canonical_key FROM clips)",
-        [],
+pub fn prune_orphan_front_parse_attempts<S: std::hash::BuildHasher>(
+    conn: &Connection,
+    present_keys: &HashSet<String, S>,
+) -> Result<usize, DbError> {
+    let mut stale: Vec<String> = Vec::new();
+    let mut stmt = conn.prepare(
+        "SELECT canonical_key
+           FROM front_parse_attempts
+          WHERE canonical_key NOT IN (SELECT canonical_key FROM clips)",
     )?;
-    Ok(pruned)
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    for row in rows {
+        let canonical_key = row?;
+        if !present_keys.contains(&canonical_key) {
+            stale.push(canonical_key);
+        }
+    }
+    for canonical_key in &stale {
+        conn.execute(
+            "DELETE FROM front_parse_attempts WHERE canonical_key = ?1",
+            params![canonical_key],
+        )?;
+    }
+    Ok(stale.len())
 }
 
 fn has_archive_backing(conn: &Connection, clip_id: i64) -> Result<bool, DbError> {
@@ -650,14 +680,15 @@ pub struct ClipEventFacts {
 }
 
 /// Upsert one clip-event sidecar row by `event_dir_key`. Raw scanner metadata
-/// (not derived state) — `updated_at` is refreshed every pass.
+/// (not derived state); returns the number of changed rows (`0` on a semantic
+/// no-op re-apply).
 ///
 /// # Errors
 ///
 /// Returns [`DbError`] if the statement fails.
-pub fn upsert_clip_event(conn: &Connection, facts: &ClipEventFacts) -> Result<(), DbError> {
+pub fn upsert_clip_event(conn: &Connection, facts: &ClipEventFacts) -> Result<usize, DbError> {
     let now = now_epoch_s();
-    conn.execute(
+    let changed = conn.execute(
         "INSERT INTO clip_events
             (event_dir_key, bucket, primary_canonical_key, timestamp_utc,
              timestamp_local_naive, timestamp_has_offset, est_lat, est_lon,
@@ -674,7 +705,17 @@ pub fn upsert_clip_event(conn: &Connection, facts: &ClipEventFacts) -> Result<()
             reason                = excluded.reason,
             city                  = excluded.city,
             camera                = excluded.camera,
-            updated_at            = excluded.updated_at",
+            updated_at            = excluded.updated_at
+         WHERE clip_events.bucket                IS NOT excluded.bucket
+            OR clip_events.primary_canonical_key IS NOT excluded.primary_canonical_key
+            OR clip_events.timestamp_utc         IS NOT excluded.timestamp_utc
+            OR clip_events.timestamp_local_naive IS NOT excluded.timestamp_local_naive
+            OR clip_events.timestamp_has_offset  IS NOT excluded.timestamp_has_offset
+            OR clip_events.est_lat               IS NOT excluded.est_lat
+            OR clip_events.est_lon               IS NOT excluded.est_lon
+            OR clip_events.reason                IS NOT excluded.reason
+            OR clip_events.city                  IS NOT excluded.city
+            OR clip_events.camera                IS NOT excluded.camera",
         params![
             facts.event_dir_key,
             facts.bucket,
@@ -690,7 +731,7 @@ pub fn upsert_clip_event(conn: &Connection, facts: &ClipEventFacts) -> Result<()
             now,
         ],
     )?;
-    Ok(())
+    Ok(changed)
 }
 
 /// Delete clip-event rows whose `event_dir_key` is not in `present_keys`. The
@@ -814,8 +855,41 @@ pub fn load_clip_events(conn: &Connection) -> Result<Vec<ClipEventInput>, DbErro
 }
 
 /// One front-parse-attempt row payload loaded by key:
-/// `(parse_state, parse_fingerprint, parser_version)`.
-pub type FrontParseAttemptRow = (String, Option<String>, Option<i64>);
+/// `(parse_state, parse_fingerprint, parser_version, attempt_count, next_retry_at)`.
+pub type FrontParseAttemptRow = (String, Option<String>, Option<i64>, i64, Option<i64>);
+
+/// Load all front-parse attempts keyed by `canonical_key`.
+///
+/// # Errors
+///
+/// Returns [`DbError`] if the query fails.
+pub fn load_front_parse_attempts(
+    conn: &Connection,
+) -> Result<HashMap<String, FrontParseAttemptRow>, DbError> {
+    let mut stmt = conn.prepare(
+        "SELECT canonical_key, parse_state, parse_fingerprint, parser_version,
+                attempt_count, next_retry_at
+           FROM front_parse_attempts",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            (
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, Option<i64>>(5)?,
+            ),
+        ))
+    })?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let (key, value) = row?;
+        out.insert(key, value);
+    }
+    Ok(out)
+}
 
 /// Load one front-parse attempt row for tests.
 ///
@@ -827,11 +901,11 @@ pub fn load_front_parse_attempt(
     canonical_key: &str,
 ) -> Result<Option<FrontParseAttemptRow>, DbError> {
     let row = conn.query_row(
-        "SELECT parse_state, parse_fingerprint, parser_version
+        "SELECT parse_state, parse_fingerprint, parser_version, attempt_count, next_retry_at
            FROM front_parse_attempts
           WHERE canonical_key = ?1",
         params![canonical_key],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
     );
     match row {
         Ok(found) => Ok(Some(found)),
@@ -1023,19 +1097,21 @@ mod tests {
 
     use std::collections::HashSet;
 
-    use scannerd::record::{AngleRecord, Bucket, ClipAngleRecord, PROTOCOL_VERSION, PARSER_VERSION, ProducerStats, ScanBatch};
+    use scannerd::record::{
+        AngleRecord, Bucket, ClipAngleRecord, PARSER_VERSION, PROTOCOL_VERSION, ProducerStats,
+        ScanBatch,
+    };
     use teslausb_core::sei::tesla::{AutopilotState, Gear};
 
-    use crate::apply::apply;
     use super::{
         AngleFacts, ArchiveAngleRegistration, ArchiveRegistration, ArchiveUnitRegistration,
-        ClipEventFacts, ClipFacts, load_clip_events, load_derive_clips, prune_missing_clips,
-        prune_orphan_front_parse_attempts, load_front_parse_attempt,
+        ClipEventFacts, ClipFacts, load_clip_events, load_derive_clips, load_front_parse_attempt,
+        load_front_parse_attempts, prune_missing_clips, prune_orphan_front_parse_attempts,
         rebuild_all_from_db, register_archived_clip, register_quarantined_clip,
         replace_clip_waypoints, upsert_angle_force_archive, upsert_angle_scan_preserving,
-        upsert_clip, upsert_clip_event,
-        upsert_front_parse_attempt,
+        upsert_clip, upsert_clip_event, upsert_front_parse_attempt,
     };
+    use crate::apply::apply;
     use crate::db::open_in_memory;
     use crate::derive::DeriveConfig;
     use crate::model::{DeriveWaypoint, FolderClass};
@@ -1144,13 +1220,15 @@ mod tests {
     fn replace_waypoints_overwrites() {
         let conn = open_in_memory().unwrap();
         let id = upsert_clip(&conn, &clip_facts("k1", 1000, FolderClass::SavedClips)).unwrap();
-        replace_clip_waypoints(
+        let deleted0 = replace_clip_waypoints(
             &conn,
             id,
             &[wp(0, 0.0, 1.0, 2.0, 5.0), wp(1, 33.0, 1.1, 2.1, 6.0)],
         )
         .unwrap();
-        replace_clip_waypoints(&conn, id, &[wp(0, 0.0, 1.0, 2.0, 5.0)]).unwrap();
+        assert_eq!(deleted0, 0);
+        let deleted1 = replace_clip_waypoints(&conn, id, &[wp(0, 0.0, 1.0, 2.0, 5.0)]).unwrap();
+        assert_eq!(deleted1, 2);
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM clip_waypoints WHERE clip_id = ?1",
@@ -1645,12 +1723,20 @@ mod tests {
             "parse_error",
             Some("abc123"),
             Some(1),
+            2,
+            Some(1234),
         )
         .unwrap();
         let first = load_front_parse_attempt(&conn, "k1").unwrap();
         assert_eq!(
             first,
-            Some(("parse_error".to_owned(), Some("abc123".to_owned()), Some(1)))
+            Some((
+                "parse_error".to_owned(),
+                Some("abc123".to_owned()),
+                Some(1),
+                2,
+                Some(1234)
+            ))
         );
 
         upsert_front_parse_attempt(
@@ -1659,6 +1745,8 @@ mod tests {
             "parsed_with_waypoints",
             Some("def456"),
             Some(2),
+            0,
+            None,
         )
         .unwrap();
         let second = load_front_parse_attempt(&conn, "k1").unwrap();
@@ -1667,9 +1755,39 @@ mod tests {
             Some((
                 "parsed_with_waypoints".to_owned(),
                 Some("def456".to_owned()),
-                Some(2)
+                Some(2),
+                0,
+                None
             ))
         );
+        let all = load_front_parse_attempts(&conn).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all["k1"].3, 0);
+        assert_eq!(all["k1"].4, None);
+    }
+
+    #[test]
+    fn upsert_clip_event_changes_only_when_content_differs() {
+        let conn = open_in_memory().unwrap();
+        let facts = ClipEventFacts {
+            event_dir_key: "slot0:TeslaCam/SavedClips/2026-06-01_20-10-04".to_owned(),
+            bucket: "SavedClips".to_owned(),
+            primary_canonical_key: "slot0:TeslaCam/SavedClips/clip".to_owned(),
+            timestamp_utc: 1_700_000_000,
+            timestamp_local_naive: 1_700_000_000,
+            timestamp_has_offset: false,
+            est_lat: Some(47.6),
+            est_lon: Some(-122.3),
+            reason: Some("sentry".to_owned()),
+            city: Some("Seattle".to_owned()),
+            camera: Some("front".to_owned()),
+        };
+        assert_eq!(upsert_clip_event(&conn, &facts).unwrap(), 1);
+        assert_eq!(upsert_clip_event(&conn, &facts).unwrap(), 0);
+
+        let mut changed = facts.clone();
+        changed.camera = Some("left_repeater".to_owned());
+        assert_eq!(upsert_clip_event(&conn, &changed).unwrap(), 1);
     }
 
     #[test]
@@ -1681,9 +1799,11 @@ mod tests {
         let conn = open_in_memory().unwrap();
         // "keep" has a clip row; "gone" does not (its clip was pruned).
         upsert_clip(&conn, &clip_facts("keep", 1000, FolderClass::SavedClips)).unwrap();
-        upsert_front_parse_attempt(&conn, "keep", "parsed_with_waypoints", None, None).unwrap();
-        upsert_front_parse_attempt(&conn, "gone", "parse_error", None, None).unwrap();
-        let pruned = prune_orphan_front_parse_attempts(&conn).unwrap();
+        upsert_front_parse_attempt(&conn, "keep", "parsed_with_waypoints", None, None, 0, None)
+            .unwrap();
+        upsert_front_parse_attempt(&conn, "gone", "parse_error", None, None, 1, Some(60)).unwrap();
+        let present: HashSet<String> = HashSet::new();
+        let pruned = prune_orphan_front_parse_attempts(&conn, &present).unwrap();
         assert_eq!(pruned, 1);
         assert!(load_front_parse_attempt(&conn, "keep").unwrap().is_some());
         assert!(load_front_parse_attempt(&conn, "gone").unwrap().is_none());
@@ -1759,6 +1879,8 @@ mod tests {
             complete: true,
             stats: ProducerStats::default(),
             present_keys: vec!["k1".to_owned()],
+            front_census: Vec::new(),
+            front_unplaceable: Vec::new(),
             records: vec![ClipAngleRecord {
                 canonical_key: "k1".to_owned(),
                 started_at: 1_700_000_000,
@@ -1821,6 +1943,8 @@ mod tests {
             complete: true,
             stats: ProducerStats::default(),
             present_keys: vec!["k1".to_owned()],
+            front_census: Vec::new(),
+            front_unplaceable: Vec::new(),
             records: vec![ClipAngleRecord {
                 canonical_key: "k1".to_owned(),
                 started_at: 1_700_000_000,

@@ -30,19 +30,20 @@
 //! counters (`unplaceable_*`) are merged back in `run_scan_pass` to
 //! reproduce the legacy [`ScanReport`](crate::scan::ScanReport) exactly.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use rusqlite::Connection;
-use scannerd::record::{ClipAngleRecord, ScanBatch, WireWaypoint};
+use scannerd::record::{ClipAngleRecord, FrontUnplaceableRecord, ScanBatch, WireWaypoint};
 use teslausb_core::sei::tesla::{AutopilotState, Gear};
 
-use crate::db::DbError;
 use crate::db::ingest::{
-    AngleFacts, ClipEventFacts, ClipFacts, MediaFacts, ensure_clip, load_clip_events,
-    load_derive_clips, prune_missing_clip_events, prune_missing_clips, prune_orphan_front_parse_attempts,
-    prune_missing_media, rebuild_derived, replace_clip_waypoints, upsert_angle_scan_preserving, upsert_clip,
-    upsert_clip_event, upsert_front_parse_attempt, upsert_media,
+    AngleFacts, ClipEventFacts, ClipFacts, FrontParseAttemptRow, MediaFacts, ensure_clip,
+    load_clip_events, load_derive_clips, load_front_parse_attempt, prune_missing_clip_events,
+    prune_missing_clips, prune_missing_media, prune_orphan_front_parse_attempts, rebuild_derived,
+    replace_clip_waypoints, upsert_angle_scan_preserving, upsert_clip, upsert_clip_event,
+    upsert_front_parse_attempt, upsert_media,
 };
+use crate::db::{DbError, now_epoch_s};
 use crate::derive::{DeriveConfig, derive};
 use crate::model::{DeriveWaypoint, FolderClass};
 use crate::scan::ScanError;
@@ -84,6 +85,10 @@ pub struct ApplyReport {
     pub trips: usize,
     /// Events materialized after the rebuild (driving + sentry).
     pub events: usize,
+    /// Whether this pass observed a derivation-input change.
+    pub derived_dirty: bool,
+    /// Whether `rebuild_derived` ran this pass.
+    pub rebuild_ran: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,7 +130,149 @@ impl FrontApplyState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ApplyRecordOutcome {
     waypoints_written: usize,
+    waypoints_deleted: usize,
     front_state: Option<FrontApplyState>,
+}
+
+fn parse_fingerprint_to_u64(value: Option<&str>) -> Option<u64> {
+    value.and_then(|v| u64::from_str_radix(v, 16).ok())
+}
+
+fn front_parse_backoff_secs(attempt_count: i64) -> i64 {
+    let mut delay = 60_i64;
+    let mut steps = attempt_count.saturating_sub(1);
+    while steps > 0 {
+        delay = delay.saturating_mul(4);
+        if delay >= 3_600 {
+            return 3_600;
+        }
+        steps -= 1;
+    }
+    delay.min(3_600)
+}
+
+fn front_attempt_update(
+    prior: Option<FrontParseAttemptRow>,
+    front_state: FrontApplyState,
+    new_fingerprint: Option<&str>,
+    now: i64,
+) -> (i64, Option<i64>) {
+    match front_state {
+        FrontApplyState::ParsedWithWaypoints | FrontApplyState::NoWaypoints => (0, None),
+        FrontApplyState::ParseError | FrontApplyState::ReadError => {
+            let (prior_fingerprint, prior_count) = match prior {
+                Some((_, parse_fingerprint, _, attempt_count, _)) => {
+                    (parse_fingerprint, attempt_count)
+                }
+                None => (None, 0),
+            };
+            let fingerprint_changed = prior_fingerprint.as_deref().is_some_and(|old| {
+                new_fingerprint.is_some_and(|new| {
+                    parse_fingerprint_to_u64(Some(old)) != parse_fingerprint_to_u64(Some(new))
+                })
+            });
+            let baseline = if fingerprint_changed { 0 } else { prior_count };
+            let next_count = baseline.saturating_add(1);
+            let next_retry_at = now.saturating_add(front_parse_backoff_secs(next_count));
+            (next_count, Some(next_retry_at))
+        }
+    }
+}
+
+fn count_materialized_rows(conn: &Connection, table: &str) -> Result<usize, DbError> {
+    let count: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
+    Ok(usize::try_from(count).unwrap_or(usize::MAX))
+}
+
+/// Accumulated result of applying one clip's angle records under a savepoint.
+#[derive(Default)]
+struct GroupOutcome {
+    failed: bool,
+    errors: usize,
+    clips_written: usize,
+    front_walked: usize,
+    waypoints_written: usize,
+    front_parse_errors: usize,
+    front_read_errors: usize,
+    front_no_waypoints: usize,
+    dirty: bool,
+    new_sentry: bool,
+}
+
+/// Apply every angle record for one canonical clip key. On the first
+/// malformed/absent/failing record it stops with `failed = true` so the
+/// caller rolls back the clip's savepoint and leaves its parse marker
+/// unadvanced; other clip groups are unaffected.
+fn apply_clip_group(
+    tx: &Connection,
+    group: &[&ClipAngleRecord],
+    batch_complete: bool,
+    present: &HashSet<&str>,
+    prior_keys: &HashSet<String>,
+) -> GroupOutcome {
+    let mut out = GroupOutcome::default();
+    for &record in group {
+        if record.validate().is_err()
+            || (batch_complete && !present.contains(record.canonical_key.as_str()))
+        {
+            out.errors += 1;
+            out.failed = true;
+            return out;
+        }
+        let is_front = record.is_front();
+        let Ok(outcome) = apply_record(tx, record, is_front) else {
+            out.errors += 1;
+            out.failed = true;
+            return out;
+        };
+        out.clips_written += 1;
+        if record.bucket.as_db_str() == "SentryClips"
+            && !prior_keys.contains(record.canonical_key.as_str())
+        {
+            out.new_sentry = true;
+        }
+        if is_front {
+            out.front_walked += 1;
+            out.waypoints_written += outcome.waypoints_written;
+            if outcome.waypoints_written > 0 || outcome.waypoints_deleted > 0 {
+                out.dirty = true;
+            }
+            match outcome.front_state {
+                Some(FrontApplyState::ParseError) => out.front_parse_errors += 1,
+                Some(FrontApplyState::ReadError) => out.front_read_errors += 1,
+                Some(FrontApplyState::NoWaypoints) => out.front_no_waypoints += 1,
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+fn apply_unplaceable_fronts(
+    conn: &Connection,
+    front_unplaceable: &[FrontUnplaceableRecord],
+) -> Result<(), DbError> {
+    for unplaceable in front_unplaceable {
+        let front_state = match unplaceable.reason.as_str() {
+            "read_error" => FrontApplyState::ReadError,
+            _ => FrontApplyState::ParseError,
+        };
+        let parse_fingerprint = format!("{:x}", unplaceable.front_fingerprint);
+        let prior = load_front_parse_attempt(conn, &unplaceable.canonical_key)?;
+        let now = now_epoch_s();
+        let (attempt_count, next_retry_at) =
+            front_attempt_update(prior, front_state, Some(parse_fingerprint.as_str()), now);
+        upsert_front_parse_attempt(
+            conn,
+            &unplaceable.canonical_key,
+            front_state.as_wire(),
+            Some(parse_fingerprint.as_str()),
+            None,
+            attempt_count,
+            next_retry_at,
+        )?;
+    }
+    Ok(())
 }
 
 /// D1 `view_kind` for a freshly scanned car-volume clip, recomputed from
@@ -198,12 +345,8 @@ fn angle_facts(record: &ClipAngleRecord, folder_class: FolderClass) -> AngleFact
 /// angle. Non-front angles only ensure the clip exists (never downgrading
 /// a front-resolved instant) and upsert the angle.
 ///
-/// Errors are surfaced to the caller, which counts the record and moves on.
-/// There is **no per-record savepoint**: any earlier write for a record
-/// that fails partway (e.g. a front `upsert_clip` + `replace_clip_waypoints`
-/// that succeed before `upsert_angle` fails) remains in the open
-/// transaction and commits with the rest — faithfully reproducing the
-/// legacy in-process pass's partial-write-then-continue behavior.
+/// Errors are surfaced to the caller; the caller owns per-clip savepoint
+/// semantics and decides whether to roll back the whole clip group.
 fn apply_record(
     conn: &Connection,
     record: &ClipAngleRecord,
@@ -227,21 +370,30 @@ fn apply_record(
         // `parsed_with_waypoints` (or unknown/legacy state that `from_wire`
         // maps here) carrying an EMPTY list is incoherent — never let it
         // wipe the cache; leave the prior waypoints intact.
+        let mut waypoints_deleted = 0;
         let waypoints_written = match front_state {
             FrontApplyState::ParsedWithWaypoints => {
                 if derived.is_empty() {
                     0
                 } else {
-                    replace_clip_waypoints(conn, clip_id, &derived)?;
+                    waypoints_deleted = replace_clip_waypoints(conn, clip_id, &derived)?;
                     derived.len()
                 }
             }
             FrontApplyState::NoWaypoints => {
-                replace_clip_waypoints(conn, clip_id, &[])?;
+                waypoints_deleted = replace_clip_waypoints(conn, clip_id, &[])?;
                 0
             }
             FrontApplyState::ParseError | FrontApplyState::ReadError => 0,
         };
+        let prior_attempt = load_front_parse_attempt(conn, &record.canonical_key)?;
+        let now = now_epoch_s();
+        let (attempt_count, next_retry_at) = front_attempt_update(
+            prior_attempt,
+            front_state,
+            record.parse_fingerprint.as_deref(),
+            now,
+        );
         upsert_angle_scan_preserving(conn, clip_id, &angle)?;
         upsert_front_parse_attempt(
             conn,
@@ -249,9 +401,12 @@ fn apply_record(
             front_state.as_wire(),
             record.parse_fingerprint.as_deref(),
             record.parser_version,
+            attempt_count,
+            next_retry_at,
         )?;
         Ok(ApplyRecordOutcome {
             waypoints_written,
+            waypoints_deleted,
             front_state: Some(front_state),
         })
     } else {
@@ -259,6 +414,7 @@ fn apply_record(
         upsert_angle_scan_preserving(conn, clip_id, &angle)?;
         Ok(ApplyRecordOutcome {
             waypoints_written: 0,
+            waypoints_deleted: 0,
             front_state: None,
         })
     }
@@ -268,13 +424,11 @@ fn apply_record(
 ///
 /// The batch is validated at the batch level first (protocol version +
 /// gross-size caps); a failure there is fatal (rejects the whole batch).
-/// Each record is then validated and applied individually: a record that
-/// fails validation, references a key absent from a `complete` batch's
-/// present set, or errors mid-write is skipped and counted in
-/// [`ApplyReport::record_errors`] — one bad record never aborts the batch
-/// (matching the legacy tolerate-bad-clip behavior). The prune step runs
-/// **only** when the batch is `complete` (the present set is trustworthy),
-/// then the derivation is rebuilt and the transaction commits atomically.
+/// Records are grouped by `canonical_key` and applied under per-clip
+/// savepoints; a malformed/failing record rolls back that clip group and
+/// leaves its parse marker unadvanced while other groups continue. Media and
+/// clip-event loops run outside those savepoints. The prune step runs when
+/// the batch is `complete`; derivation rebuild is gated by semantic dirtiness.
 ///
 /// # Errors
 ///
@@ -290,44 +444,65 @@ pub fn apply(
 
     let present: HashSet<&str> = batch.present_keys.iter().map(String::as_str).collect();
     let mut report = ApplyReport::default();
+    let mut derived_dirty = false;
 
     let tx = conn.transaction().map_err(DbError::from)?;
+    let prior_keys: HashSet<String> = {
+        let mut stmt = tx
+            .prepare("SELECT canonical_key FROM clips")
+            .map_err(DbError::from)?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(DbError::from)?;
+        let mut keys = HashSet::new();
+        for row in rows {
+            keys.insert(row.map_err(DbError::from)?);
+        }
+        keys
+    };
+
+    let mut grouped: BTreeMap<String, Vec<&ClipAngleRecord>> = BTreeMap::new();
     for record in &batch.records {
-        if record.validate().is_err() {
-            report.record_errors += 1;
+        grouped
+            .entry(record.canonical_key.clone())
+            .or_default()
+            .push(record);
+    }
+
+    for (_canonical_key, group) in grouped {
+        tx.execute("SAVEPOINT clip_group", [])
+            .map_err(DbError::from)?;
+        let outcome = apply_clip_group(&tx, &group, batch.complete, &present, &prior_keys);
+        if outcome.failed {
+            tx.execute("ROLLBACK TO clip_group", [])
+                .map_err(DbError::from)?;
+            tx.execute("RELEASE SAVEPOINT clip_group", [])
+                .map_err(DbError::from)?;
+            report.record_errors += outcome.errors.max(1);
             continue;
         }
-        // A `complete` batch's present set is trustworthy and must contain
-        // every emitted record; a record outside it is inconsistent (only
-        // reachable over a forged wire — the in-process producer always
-        // satisfies it) and is skipped rather than ingested.
-        if batch.complete && !present.contains(record.canonical_key.as_str()) {
-            report.record_errors += 1;
-            continue;
-        }
-        let is_front = record.is_front();
-        match apply_record(&tx, record, is_front) {
-            Ok(outcome) => {
-                report.clips_written += 1;
-                if is_front {
-                    report.front_walked += 1;
-                    report.waypoints += outcome.waypoints_written;
-                    match outcome.front_state {
-                        Some(FrontApplyState::ParseError) => report.front_parse_errors += 1,
-                        Some(FrontApplyState::ReadError) => report.front_read_errors += 1,
-                        Some(FrontApplyState::NoWaypoints) => report.front_no_waypoints += 1,
-                        _ => {}
-                    }
-                }
-            }
-            Err(_) => report.record_errors += 1,
+        tx.execute("RELEASE SAVEPOINT clip_group", [])
+            .map_err(DbError::from)?;
+        report.clips_written += outcome.clips_written;
+        report.front_walked += outcome.front_walked;
+        report.waypoints += outcome.waypoints_written;
+        report.front_parse_errors += outcome.front_parse_errors;
+        report.front_read_errors += outcome.front_read_errors;
+        report.front_no_waypoints += outcome.front_no_waypoints;
+        if outcome.new_sentry || outcome.dirty {
+            derived_dirty = true;
         }
     }
+
+    apply_unplaceable_fronts(&tx, &batch.front_unplaceable)?;
 
     if batch.complete {
         let present_keys: HashSet<String> = batch.present_keys.iter().cloned().collect();
         report.pruned = prune_missing_clips(&tx, &present_keys)?;
-        let _ = prune_orphan_front_parse_attempts(&tx)?;
+        if report.pruned > 0 {
+            derived_dirty = true;
+        }
+        let _ = prune_orphan_front_parse_attempts(&tx, &present_keys)?;
     }
 
     // MEDIA (p2) inventory. Only a media-aware producer touches the catalog:
@@ -346,7 +521,7 @@ pub fn apply(
                 report.record_errors += 1;
                 continue;
             }
-            upsert_media(
+            if upsert_media(
                 &tx,
                 &MediaFacts {
                     partition: media.partition.clone(),
@@ -355,7 +530,12 @@ pub fn apply(
                     size_bytes: media.size_bytes,
                     modified: media.modified_local.clone(),
                 },
-            )?;
+            )
+            .is_err()
+            {
+                report.record_errors += 1;
+                continue;
+            }
             report.media_written += 1;
         }
         // Prune only when the inventory is also a complete scan: a torn pass
@@ -373,10 +553,7 @@ pub fn apply(
                 report.record_errors += 1;
                 continue;
             }
-            // Present-set = the event_dir_keys this batch emitted; on a
-            // complete batch an inconsistent record is unreachable from the
-            // in-process producer.
-            upsert_clip_event(
+            let Ok(changed) = upsert_clip_event(
                 &tx,
                 &ClipEventFacts {
                     event_dir_key: ev.event_dir_key.clone(),
@@ -391,8 +568,14 @@ pub fn apply(
                     city: ev.city.clone(),
                     camera: ev.camera.clone(),
                 },
-            )?;
-            report.clip_events_written += 1;
+            ) else {
+                report.record_errors += 1;
+                continue;
+            };
+            report.clip_events_written += changed;
+            if changed > 0 {
+                derived_dirty = true;
+            }
         }
         if batch.complete {
             let present_event_keys: HashSet<String> = batch
@@ -401,18 +584,28 @@ pub fn apply(
                 .map(|e| e.event_dir_key.clone())
                 .collect();
             report.clip_events_pruned = prune_missing_clip_events(&tx, &present_event_keys)?;
+            if report.clip_events_pruned > 0 {
+                derived_dirty = true;
+            }
         }
     }
 
-    let clips = load_derive_clips(&tx)?;
-    let clip_events = load_clip_events(&tx)?;
-    let derivation = derive(&clips, &clip_events, derive_cfg);
-    rebuild_derived(&tx, &derivation)?;
+    if derived_dirty {
+        let clips = load_derive_clips(&tx)?;
+        let clip_events = load_clip_events(&tx)?;
+        let derivation = derive(&clips, &clip_events, derive_cfg);
+        rebuild_derived(&tx, &derivation)?;
+        report.trips = derivation.trips.len();
+        let trip_events: usize = derivation.trips.iter().map(|t| t.events.len()).sum();
+        report.events = trip_events + derivation.sentry_events.len();
+        report.rebuild_ran = true;
+    } else {
+        report.trips = count_materialized_rows(&tx, "trips")?;
+        report.events = count_materialized_rows(&tx, "events")?;
+        report.rebuild_ran = false;
+    }
+    report.derived_dirty = derived_dirty;
     tx.commit().map_err(DbError::from)?;
-
-    report.trips = derivation.trips.len();
-    let trip_events: usize = derivation.trips.iter().map(|t| t.events.len()).sum();
-    report.events = trip_events + derivation.sentry_events.len();
 
     Ok(report)
 }
@@ -433,8 +626,8 @@ mod tests {
     use rusqlite::Connection;
     use scannerd::produce::wire_waypoint_from_walk;
     use scannerd::record::{
-        AngleRecord, Bucket, ClipAngleRecord, ClipEventRecord, MediaFileRecord, PROTOCOL_VERSION,
-        PARSER_VERSION, ProducerStats, ScanBatch,
+        AngleRecord, Bucket, ClipAngleRecord, ClipEventRecord, FrontUnplaceableRecord,
+        MediaFileRecord, PARSER_VERSION, PROTOCOL_VERSION, ProducerStats, ScanBatch,
     };
     use scannerd::seiwalk::Waypoint;
     use teslausb_core::sei::tesla::{AutopilotState, Gear, SeiMessage};
@@ -574,6 +767,8 @@ mod tests {
             complete,
             stats: ProducerStats::default(),
             present_keys,
+            front_census: Vec::new(),
+            front_unplaceable: Vec::new(),
             records,
             media: Vec::new(),
             media_present_paths: Vec::new(),
@@ -604,6 +799,29 @@ mod tests {
         .ok()
     }
 
+    fn front_attempt_count(conn: &Connection, key: &str) -> Option<(i64, Option<i64>)> {
+        conn.query_row(
+            "SELECT attempt_count, next_retry_at FROM front_parse_attempts WHERE canonical_key = ?1",
+            [key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok()
+    }
+
+    fn front_attempt_row(
+        conn: &Connection,
+        key: &str,
+    ) -> Option<(String, Option<String>, i64, Option<i64>)> {
+        conn.query_row(
+            "SELECT parse_state, parse_fingerprint, attempt_count, next_retry_at
+               FROM front_parse_attempts
+              WHERE canonical_key = ?1",
+            [key],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .ok()
+    }
+
     #[test]
     fn apply_ingests_clip_angle_and_waypoints() {
         let mut conn = open_in_memory().unwrap();
@@ -626,6 +844,26 @@ mod tests {
         assert_eq!(count(&conn, "clips"), 1);
         assert_eq!(count(&conn, "angles"), 2);
         assert_eq!(count(&conn, "clip_waypoints"), 2);
+    }
+
+    #[test]
+    fn apply_indexes_non_front_only_clip_without_front_attempt_marker() {
+        let mut conn = open_in_memory().unwrap();
+        let dir = "TeslaCam/SavedClips/2026-06-01_20-10-04";
+        let key = "0:TeslaCam/SavedClips/2026-06-01_20-10-04/2026-06-01_20-10-04";
+        let b = batch(
+            vec![
+                other_record(key, dir, "back", 1_700_000_000),
+                other_record(key, dir, "left_repeater", 1_700_000_000),
+                other_record(key, dir, "right_repeater", 1_700_000_000),
+            ],
+            true,
+        );
+        let report = apply(&mut conn, &b, DeriveConfig::default()).unwrap();
+        assert_eq!(report.clips_written, 3);
+        assert_eq!(count(&conn, "clips"), 1);
+        assert_eq!(count(&conn, "angles"), 3);
+        assert_eq!(front_attempt_state(&conn, key), None);
     }
 
     #[test]
@@ -672,11 +910,18 @@ mod tests {
             None,
             None,
         );
-        let report = apply(&mut conn, &batch(vec![parse_error], true), DeriveConfig::default())
-            .unwrap();
+        let report = apply(
+            &mut conn,
+            &batch(vec![parse_error], true),
+            DeriveConfig::default(),
+        )
+        .unwrap();
         assert_eq!(report.front_parse_errors, 1);
         assert_eq!(waypoint_count_for_key(&conn, key), 2);
-        assert_eq!(front_attempt_state(&conn, key).as_deref(), Some("parse_error"));
+        assert_eq!(
+            front_attempt_state(&conn, key).as_deref(),
+            Some("parse_error")
+        );
     }
 
     #[test]
@@ -701,11 +946,146 @@ mod tests {
             None,
             None,
         );
-        let report = apply(&mut conn, &batch(vec![read_error], true), DeriveConfig::default())
-            .unwrap();
+        let report = apply(
+            &mut conn,
+            &batch(vec![read_error], true),
+            DeriveConfig::default(),
+        )
+        .unwrap();
         assert_eq!(report.front_read_errors, 1);
         assert_eq!(waypoint_count_for_key(&conn, key), 2);
-        assert_eq!(front_attempt_state(&conn, key).as_deref(), Some("read_error"));
+        assert_eq!(
+            front_attempt_state(&conn, key).as_deref(),
+            Some("read_error")
+        );
+        let attempt = front_attempt_count(&conn, key).unwrap();
+        assert_eq!(attempt.0, 1);
+        assert!(attempt.1.is_some());
+    }
+
+    #[test]
+    fn read_error_attempts_back_off_and_fingerprint_change_resets_counter() {
+        let mut conn = open_in_memory().unwrap();
+        let dir = "TeslaCam/SavedClips/2026-06-01_20-10-04";
+        let key = "0:TeslaCam/SavedClips/2026-06-01_20-10-04/2026-06-01_20-10-04";
+        let mut read_error = front_record_with_state(
+            key,
+            dir,
+            1_700_000_000,
+            "read_error",
+            Vec::new(),
+            None,
+            None,
+        );
+        read_error.parse_fingerprint = Some("a".to_owned());
+        apply(
+            &mut conn,
+            &batch(vec![read_error.clone()], true),
+            DeriveConfig::default(),
+        )
+        .unwrap();
+        let first = front_attempt_count(&conn, key).unwrap();
+        assert_eq!(first.0, 1);
+        assert!(first.1.is_some());
+
+        apply(
+            &mut conn,
+            &batch(vec![read_error.clone()], true),
+            DeriveConfig::default(),
+        )
+        .unwrap();
+        let second = front_attempt_count(&conn, key).unwrap();
+        assert_eq!(second.0, 2);
+        assert!(second.1.is_some());
+        assert!(second.1.unwrap_or_default() >= first.1.unwrap_or_default());
+
+        read_error.parse_fingerprint = Some("b".to_owned());
+        apply(
+            &mut conn,
+            &batch(vec![read_error], true),
+            DeriveConfig::default(),
+        )
+        .unwrap();
+        let reset = front_attempt_count(&conn, key).unwrap();
+        assert_eq!(reset.0, 1);
+    }
+
+    #[test]
+    fn unplaceable_parse_error_writes_attempt_without_dirtying_derive() {
+        let mut conn = open_in_memory().unwrap();
+        let key = "0:TeslaCam/SavedClips/unplaceable/2026-13-99_00-00-00";
+        let fingerprint = 0xabc_u64;
+        let mut unplaceable_batch = batch(Vec::new(), true);
+        unplaceable_batch.present_keys = vec![key.to_owned()];
+        unplaceable_batch.front_unplaceable = vec![FrontUnplaceableRecord {
+            canonical_key: key.to_owned(),
+            front_fingerprint: fingerprint,
+            reason: "parse_error".to_owned(),
+        }];
+        let before = crate::db::now_epoch_s();
+        let report = apply(&mut conn, &unplaceable_batch, DeriveConfig::default()).unwrap();
+        let after = crate::db::now_epoch_s();
+
+        let row = front_attempt_row(&conn, key).expect("front attempt row");
+        assert_eq!(row.0, "parse_error");
+        assert_eq!(row.1.as_deref(), Some("abc"));
+        assert_eq!(row.2, 1);
+        let retry = row.3.expect("next_retry_at");
+        assert!(retry >= before + 60);
+        assert!(retry <= after + 60);
+        assert!(!report.derived_dirty);
+    }
+
+    #[test]
+    fn repeated_unplaceable_front_advances_backoff() {
+        let mut conn = open_in_memory().unwrap();
+        let key = "0:TeslaCam/SavedClips/unplaceable/2026-13-99_00-00-00";
+        let mut unplaceable_batch = batch(Vec::new(), true);
+        unplaceable_batch.present_keys = vec![key.to_owned()];
+        unplaceable_batch.front_unplaceable = vec![FrontUnplaceableRecord {
+            canonical_key: key.to_owned(),
+            front_fingerprint: 0xabc_u64,
+            reason: "parse_error".to_owned(),
+        }];
+
+        apply(&mut conn, &unplaceable_batch, DeriveConfig::default()).unwrap();
+        let before = crate::db::now_epoch_s();
+        apply(&mut conn, &unplaceable_batch, DeriveConfig::default()).unwrap();
+        let after = crate::db::now_epoch_s();
+
+        let row = front_attempt_row(&conn, key).expect("front attempt row");
+        assert_eq!(row.2, 2);
+        let retry = row.3.expect("next_retry_at");
+        assert!(retry >= before + 240);
+        assert!(retry <= after + 240);
+    }
+
+    #[test]
+    fn unplaceable_front_fingerprint_change_resets_attempt_count() {
+        let mut conn = open_in_memory().unwrap();
+        let key = "0:TeslaCam/SavedClips/unplaceable/2026-13-99_00-00-00";
+        let mut first = batch(Vec::new(), true);
+        first.present_keys = vec![key.to_owned()];
+        first.front_unplaceable = vec![FrontUnplaceableRecord {
+            canonical_key: key.to_owned(),
+            front_fingerprint: 0xabc_u64,
+            reason: "parse_error".to_owned(),
+        }];
+        apply(&mut conn, &first, DeriveConfig::default()).unwrap();
+        apply(&mut conn, &first, DeriveConfig::default()).unwrap();
+        assert_eq!(front_attempt_count(&conn, key).map(|row| row.0), Some(2));
+
+        let mut changed = batch(Vec::new(), true);
+        changed.present_keys = vec![key.to_owned()];
+        changed.front_unplaceable = vec![FrontUnplaceableRecord {
+            canonical_key: key.to_owned(),
+            front_fingerprint: 0xdef_u64,
+            reason: "parse_error".to_owned(),
+        }];
+        apply(&mut conn, &changed, DeriveConfig::default()).unwrap();
+        let row = front_attempt_row(&conn, key).expect("front attempt row");
+        assert_eq!(row.1.as_deref(), Some("def"));
+        assert_eq!(row.2, 1);
     }
 
     #[test]
@@ -734,7 +1114,12 @@ mod tests {
             None,
             None,
         );
-        apply(&mut conn, &batch(vec![unknown], true), DeriveConfig::default()).unwrap();
+        apply(
+            &mut conn,
+            &batch(vec![unknown], true),
+            DeriveConfig::default(),
+        )
+        .unwrap();
         // Prior GPS preserved; not wiped by the incoherent empty record.
         assert_eq!(waypoint_count_for_key(&conn, key), 2);
     }
@@ -761,11 +1146,20 @@ mod tests {
             Some(1_700_000_000),
             Some(0.0),
         );
-        let report = apply(&mut conn, &batch(vec![no_waypoints], true), DeriveConfig::default())
-            .unwrap();
+        let report = apply(
+            &mut conn,
+            &batch(vec![no_waypoints], true),
+            DeriveConfig::default(),
+        )
+        .unwrap();
         assert_eq!(report.front_no_waypoints, 1);
+        assert!(report.derived_dirty);
+        assert!(report.rebuild_ran);
         assert_eq!(waypoint_count_for_key(&conn, key), 0);
-        assert_eq!(front_attempt_state(&conn, key).as_deref(), Some("no_waypoints"));
+        assert_eq!(
+            front_attempt_state(&conn, key).as_deref(),
+            Some("no_waypoints")
+        );
     }
 
     #[test]
@@ -789,7 +1183,68 @@ mod tests {
         )
         .unwrap();
         assert_eq!(waypoint_count_for_key(&conn, key), 0);
-        assert_eq!(front_attempt_state(&conn, key).as_deref(), Some("no_waypoints"));
+        assert_eq!(
+            front_attempt_state(&conn, key).as_deref(),
+            Some("no_waypoints")
+        );
+    }
+
+    #[test]
+    fn no_waypoints_removes_stale_trip_when_cached_waypoints_existed() {
+        let mut conn = open_in_memory().unwrap();
+        let dir = "TeslaCam/SavedClips/2026-06-01_20-10-04";
+        let key = "0:TeslaCam/SavedClips/trip/2026-06-01_20-10-04";
+        let started = 1_700_000_000;
+        let moving: Vec<scannerd::record::WireWaypoint> = (0..6_u32)
+            .map(|i| {
+                wire_waypoint_from_walk(
+                    &waypoint(
+                        i,
+                        f64::from(i) * 1000.0,
+                        37.5 + f64::from(i) * 0.001,
+                        -122.3,
+                    ),
+                    started,
+                )
+            })
+            .collect();
+        let seeded = front_record_with_state(
+            key,
+            dir,
+            started,
+            "parsed_with_waypoints",
+            moving,
+            Some(started + 5),
+            Some(5.0),
+        );
+        apply(
+            &mut conn,
+            &batch(vec![seeded], true),
+            DeriveConfig::default(),
+        )
+        .unwrap();
+        let trips_before = count(&conn, "trips");
+        assert!(trips_before > 0);
+
+        let no_waypoints = front_record_with_state(
+            key,
+            dir,
+            started,
+            "no_waypoints",
+            Vec::new(),
+            Some(started),
+            Some(0.0),
+        );
+        let report = apply(
+            &mut conn,
+            &batch(vec![no_waypoints], true),
+            DeriveConfig::default(),
+        )
+        .unwrap();
+        assert!(report.derived_dirty);
+        assert!(report.rebuild_ran);
+        assert_eq!(count(&conn, "trip_points"), 0);
+        assert_eq!(count(&conn, "trips"), 0);
     }
 
     #[test]
@@ -1000,6 +1455,8 @@ mod tests {
         );
         let report = apply(&mut conn, &batch, DeriveConfig::default()).unwrap();
         assert_eq!(report.clip_events_written, 1);
+        assert!(report.derived_dirty);
+        assert!(report.rebuild_ran);
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM clip_events", [], |r| r.get(0))
             .unwrap();
@@ -1041,6 +1498,32 @@ mod tests {
         assert_eq!(report.clip_events_written, 0);
         assert_eq!(report.clip_events_pruned, 0);
         assert_eq!(count(&conn, "clip_events"), 1);
+    }
+
+    #[test]
+    fn unchanged_clip_event_batch_skips_rebuild_but_semantic_change_rebuilds() {
+        let mut conn = open_in_memory().unwrap();
+        let event_key = "slot0:TeslaCam/SavedClips/2026-06-01_20-10-04";
+        let base = clip_event_batch(
+            vec![clip_event_rec(event_key, Some(47.6), Some(-122.3))],
+            true,
+            true,
+        );
+        let first = apply(&mut conn, &base, DeriveConfig::default()).unwrap();
+        assert!(first.rebuild_ran);
+        assert!(first.derived_dirty);
+        let second = apply(&mut conn, &base, DeriveConfig::default()).unwrap();
+        assert_eq!(second.clip_events_written, 0);
+        assert!(!second.derived_dirty);
+        assert!(!second.rebuild_ran);
+
+        let mut changed_event = clip_event_rec(event_key, Some(47.6), Some(-122.3));
+        changed_event.city = Some("Tacoma".to_owned());
+        let changed = clip_event_batch(vec![changed_event], true, true);
+        let third = apply(&mut conn, &changed, DeriveConfig::default()).unwrap();
+        assert_eq!(third.clip_events_written, 1);
+        assert!(third.derived_dirty);
+        assert!(third.rebuild_ran);
     }
 
     #[test]
@@ -1130,7 +1613,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_record_is_skipped_not_fatal() {
+    fn malformed_record_rolls_back_clip_group_but_other_groups_and_sidecars_commit() {
         let mut conn = open_in_memory().unwrap();
         let dir = "TeslaCam/SavedClips/2026-06-01_20-10-04";
         let good = "0:TeslaCam/SavedClips/good/2026-06-01_20-10-04";
@@ -1143,15 +1626,32 @@ mod tests {
             1_700_000_100,
         )];
 
-        let b = batch(
-            vec![front_record(good, dir, 1_700_000_000), bad_record],
+        let mut b = batch(
+            vec![
+                front_record(good, dir, 1_700_000_000),
+                front_record(bad, dir, 1_700_000_100),
+                bad_record,
+            ],
             true,
         );
+        b.media_inventory = true;
+        b.media = vec![media_rec("LockChime.wav")];
+        b.media_present_paths = vec!["LockChime.wav".to_owned()];
+        b.clip_events_inventory = true;
+        b.clip_events = vec![clip_event_rec(
+            "slot0:TeslaCam/SavedClips/2026-06-01_20-10-04",
+            Some(47.6),
+            Some(-122.3),
+        )];
         let report = apply(&mut conn, &b, DeriveConfig::default()).unwrap();
         assert_eq!(report.record_errors, 1);
         assert_eq!(report.clips_written, 1);
-        // The good clip still landed.
+        // Good group committed; bad group rolled back in full.
         assert_eq!(count(&conn, "clips"), 1);
+        assert_eq!(front_attempt_state(&conn, bad), None);
+        // Batch-level sidecars still apply outside per-clip savepoints.
+        assert_eq!(count(&conn, "media_entries"), 1);
+        assert_eq!(count(&conn, "clip_events"), 1);
     }
 
     #[test]

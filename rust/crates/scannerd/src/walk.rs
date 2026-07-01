@@ -203,7 +203,8 @@ pub fn resolve_file_by_components<R: BlockReader + ?Sized>(
         if dirs_seen > MAX_DIRECTORIES {
             return Err(ScannerError::LimitExceeded("directory count cap"));
         }
-        let depth = u32::try_from(index).map_err(|_| ScannerError::LimitExceeded("directory depth cap"))?;
+        let depth =
+            u32::try_from(index).map_err(|_| ScannerError::LimitExceeded("directory depth cap"))?;
         if depth >= MAX_DEPTH {
             return Err(ScannerError::LimitExceeded("directory depth cap"));
         }
@@ -290,7 +291,11 @@ pub fn resolve_file_by_components<R: BlockReader + ?Sized>(
 
         dir_first_cluster = record.first_cluster;
         dir_no_fat_chain = record.no_fat_chain;
-        dir_contiguous_span = Some(record.data_length.div_ceil(volume.params().bytes_per_cluster()));
+        dir_contiguous_span = Some(
+            record
+                .data_length
+                .div_ceil(volume.params().bytes_per_cluster()),
+        );
         path_prefix = record.path;
     }
 

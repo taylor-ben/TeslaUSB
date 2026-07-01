@@ -31,7 +31,7 @@
 //! — a structural error (MBR/boot/volume walk) still aborts the whole pass
 //! exactly as before.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::time::SystemTime;
 
 use crate::boot::parse_boot_sector;
@@ -41,15 +41,16 @@ use crate::error::ScannerError;
 use crate::mbr::parse_mbr;
 use crate::reader::BlockReader;
 use crate::record::{
-    autopilot_to_u32, gear_to_u32, AngleRecord, Bucket, ClipAngleRecord, ClipEventRecord,
-    MediaFileRecord, ProducerStats, ScanBatch, WireWaypoint, MAX_CLIP_EVENT_RECORDS,
-    MAX_MEDIA_RECORDS, PARSER_VERSION, PROTOCOL_VERSION,
+    AngleRecord, Bucket, ClipAngleRecord, ClipEventRecord, FrontCensusRecord,
+    FrontUnplaceableRecord, MAX_CLIP_EVENT_RECORDS, MAX_MEDIA_RECORDS, MediaFileRecord,
+    PARSER_VERSION, PROTOCOL_VERSION, ProducerStats, ScanBatch, WireWaypoint, autopilot_to_u32,
+    gear_to_u32,
 };
-use crate::seiwalk::{walk_clip_waypoints, Waypoint};
-use crate::stability::{fingerprint, StabilityTracker};
+use crate::seiwalk::{Waypoint, walk_clip_waypoints};
+use crate::stability::{StabilityTracker, fingerprint};
 use crate::timestamp::epoch_from_tesla_timestamp;
 use crate::volume::Volume;
-use crate::walk::{walk_volume, FileRecord};
+use crate::walk::{FileRecord, walk_volume};
 
 /// The Tesla front camera angle — the only one carrying the SEI telemetry
 /// that trips/events derive from.
@@ -74,7 +75,7 @@ const MAX_CLIP_BYTES: u64 = 256 * 1024 * 1024;
 /// next pass (`complete=false`), and the consumer drains the backlog over
 /// several fast batches. Non-front angles are cheap (filename only) and are
 /// not capped.
-const MAX_FRONT_SHAPES_PER_BATCH: usize = 8;
+pub const MAX_FRONT_SHAPES_PER_BATCH: usize = 8;
 
 /// Tesla event sidecar filename.
 const EVENT_JSON_NAME: &str = "event.json";
@@ -437,26 +438,26 @@ fn front_record_with_parse_state(
     }
 }
 
+enum FrontShapeOutcome {
+    Placed(Box<ClipAngleRecord>),
+    Unplaceable(&'static str),
+}
+
 /// Shape a front clip into a record: read its bytes, walk its SEI, resolve
 /// the recording instant (`mvhd`/GPS first, Tesla-filename fallback), and
 /// emit the clip + front angle + (possibly empty) waypoint stream.
-///
-/// Returns `Ok(None)` when the clip has no resolvable recording instant at
-/// all (cannot be placed in time) — mirroring the legacy `process_front`
-/// early return.
-#[allow(clippy::unnecessary_wraps)]
 fn shape_front<R: BlockReader + ?Sized>(
     volume: &Volume<'_, R>,
     record: &FileRecord,
     ident: &ClipIdent,
     sample_rate: u32,
-) -> Result<Option<ClipAngleRecord>, ScannerError> {
+) -> FrontShapeOutcome {
     let filename_started_at = epoch_from_tesla_timestamp(&ident.timestamp);
     let Ok(bytes) = read_full_file(volume, record) else {
         let Some(started_at) = filename_started_at else {
-            return Ok(None);
+            return FrontShapeOutcome::Unplaceable("read_error");
         };
-        return Ok(Some(front_record_with_parse_state(
+        return FrontShapeOutcome::Placed(Box::new(front_record_with_parse_state(
             record,
             ident,
             started_at,
@@ -469,9 +470,9 @@ fn shape_front<R: BlockReader + ?Sized>(
 
     let Ok(walk) = walk_clip_waypoints(&bytes, sample_rate) else {
         let Some(started_at) = filename_started_at else {
-            return Ok(None);
+            return FrontShapeOutcome::Unplaceable("parse_error");
         };
-        return Ok(Some(front_record_with_parse_state(
+        return FrontShapeOutcome::Placed(Box::new(front_record_with_parse_state(
             record,
             ident,
             started_at,
@@ -487,7 +488,7 @@ fn shape_front<R: BlockReader + ?Sized>(
         .and_then(systemtime_to_epoch)
         .or(filename_started_at);
     let Some(started_at) = started_at else {
-        return Ok(None);
+        return FrontShapeOutcome::Unplaceable("parse_error");
     };
 
     let waypoints: Vec<WireWaypoint> = walk
@@ -505,8 +506,14 @@ fn shape_front<R: BlockReader + ?Sized>(
         FrontParseState::ParsedWithWaypoints
     };
 
-    Ok(Some(front_record_with_parse_state(
-        record, ident, started_at, ended_at, duration_s, waypoints, parse_state,
+    FrontShapeOutcome::Placed(Box::new(front_record_with_parse_state(
+        record,
+        ident,
+        started_at,
+        ended_at,
+        duration_s,
+        waypoints,
+        parse_state,
     )))
 }
 
@@ -608,10 +615,12 @@ impl<'a, R: BlockReader + ?Sized> ImageSource<'a, R> {
 /// (`parse_mbr`, a boot sector, or a volume walk) on **any** source —
 /// exactly the cases that aborted the legacy in-process pass. Individual
 /// clip read/parse failures are non-fatal and reflected in producer stats.
+#[allow(clippy::too_many_lines, clippy::implicit_hasher)]
 pub fn produce<R: BlockReader + ?Sized>(
     sources: &[ImageSource<'_, R>],
     tracker: &mut StabilityTracker,
     now_secs: u64,
+    shape: &HashSet<String>,
     sample_rate: u32,
 ) -> Result<ScanBatch, ScannerError> {
     let mut stats = ProducerStats::default();
@@ -647,26 +656,40 @@ pub fn produce<R: BlockReader + ?Sized>(
         }
     }
 
-    let mut records: Vec<ClipAngleRecord> = Vec::new();
-    let mut front_shaped: usize = 0;
-    let mut deferred = false;
-    for &idx in &eligible {
-        let Some(record) = all_records.get(idx) else {
-            continue;
-        };
+    let mut front_census_by_key: BTreeMap<String, FrontCensusRecord> = BTreeMap::new();
+    for record in &all_records {
         let Some(ident) = clip_identity(record) else {
             continue;
         };
+        if !ident.is_front() {
+            continue;
+        }
+        front_census_by_key.insert(
+            ident.key.clone(),
+            FrontCensusRecord {
+                canonical_key: ident.key,
+                front_fingerprint: fingerprint(record),
+                front_stable: tracker.is_stable(record, now_secs),
+            },
+        );
+    }
+
+    let mut records: Vec<ClipAngleRecord> = Vec::new();
+    let mut front_unplaceable: Vec<FrontUnplaceableRecord> = Vec::new();
+    let mut front_shaped: usize = 0;
+    let mut deferred = false;
+    for record in &all_records {
+        let Some(ident) = clip_identity(record) else {
+            continue;
+        };
+        if !tracker.is_stable(record, now_secs) {
+            continue;
+        }
         if ident.is_front() {
-            // Front clips are the only expensive records (they read + parse
-            // tens of MiB of clip bytes). Once the per-pass front budget is
-            // spent, defer the remaining front clips to the next pass so this
-            // response stays small and returns well under the consumer's read
-            // timeout; unmark_emitted re-offers them. Cheap non-front angles
-            // and non-clip sidecars are never deferred, so `complete=false`
-            // strictly means expensive front work still remains.
+            if !shape.contains(&ident.key) {
+                continue;
+            }
             if front_shaped >= MAX_FRONT_SHAPES_PER_BATCH {
-                tracker.unmark_emitted(record);
                 deferred = true;
                 continue;
             }
@@ -678,17 +701,25 @@ pub fn produce<R: BlockReader + ?Sized>(
                 continue;
             };
             front_shaped += 1;
-            if let Some(rec) = shape_front(volume, record, &ident, sample_rate)? {
-                match rec.parse_state.as_deref() {
-                    Some("parse_error") => stats.parse_errors += 1,
-                    Some("read_error") => stats.read_walk_errors += 1,
-                    Some("no_waypoints") => stats.no_waypoints += 1,
-                    _ => {}
+            match shape_front(volume, record, &ident, sample_rate) {
+                FrontShapeOutcome::Placed(rec) => {
+                    match rec.parse_state.as_deref() {
+                        Some("parse_error") => stats.parse_errors += 1,
+                        Some("read_error") => stats.read_walk_errors += 1,
+                        Some("no_waypoints") => stats.no_waypoints += 1,
+                        _ => {}
+                    }
+                    records.push(*rec);
                 }
-                records.push(rec);
-            } else {
-                stats.unplaceable_clips += 1;
-                stats.unplaceable_front += 1;
+                FrontShapeOutcome::Unplaceable(reason) => {
+                    stats.unplaceable_clips += 1;
+                    stats.unplaceable_front += 1;
+                    front_unplaceable.push(FrontUnplaceableRecord {
+                        canonical_key: ident.key.clone(),
+                        front_fingerprint: fingerprint(record),
+                        reason: reason.to_owned(),
+                    });
+                }
             }
         } else {
             match shape_other(record, &ident) {
@@ -712,6 +743,8 @@ pub fn produce<R: BlockReader + ?Sized>(
         complete: !deferred,
         stats,
         present_keys: present.into_iter().collect(),
+        front_census: front_census_by_key.into_values().collect(),
+        front_unplaceable,
         records,
         // This producer DID inventory p2, so the consumer may prune stale
         // media rows against `media_present_paths` (gated on `complete`).
@@ -729,16 +762,16 @@ pub fn produce<R: BlockReader + ?Sized>(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeSet, HashSet};
 
     use super::{
-        clip_identity, collect_media, decode_exfat_timestamp, is_toybox_path, partition_label,
-        ClipIdent, MEDIA_PARTITION_SLOT,
+        ClipIdent, MEDIA_PARTITION_SLOT, clip_identity, collect_media, decode_exfat_timestamp,
+        is_toybox_path, partition_label,
     };
     use crate::record::Bucket;
     use crate::walk::FileRecord;
     use teslausb_core::fs::exfat::directory::{
-        encode_file_entry_set, FileAttributes, FileEntrySetParams, FileTimestamps,
+        FileAttributes, FileEntrySetParams, FileTimestamps, encode_file_entry_set,
     };
     use teslausb_core::fs::exfat::upcase_table::UpcaseTable;
 
@@ -984,7 +1017,7 @@ mod tests {
 
     // ---- two-image / two-LUN produce path -------------------------------
 
-    use super::{produce, ImageSource, DEFAULT_SEI_SAMPLE_RATE, MAX_FRONT_SHAPES_PER_BATCH};
+    use super::{DEFAULT_SEI_SAMPLE_RATE, ImageSource, MAX_FRONT_SHAPES_PER_BATCH, produce};
     use crate::reader::SliceReader;
     use crate::stability::{StabilityConfig, StabilityTracker};
 
@@ -998,6 +1031,8 @@ mod tests {
     const EVENT_JSON_CLUSTER: u32 = 7;
     const EVENT_TIMESTAMP: &str = "2026-06-01_20-10-35";
     const FRONT_FILE_NAME: &str = "2026-06-01_20-10-35-front.mp4";
+    const INVALID_FRONT_TIMESTAMP: &str = "2026-13-99_20-10-35";
+    const INVALID_FRONT_FILE_NAME: &str = "2026-13-99_20-10-35-front.mp4";
 
     /// Build a minimal but structurally valid single-partition exFAT image
     /// whose root directory is empty (the walk yields zero files). This is
@@ -1112,10 +1147,11 @@ mod tests {
         (u64::from(start_lba + 2) * CLUSTER_SIZE as u64) + (cluster_index * CLUSTER_SIZE as u64)
     }
 
-    fn event_fixture_image_with_front_cluster(
+    fn event_fixture_image_with_front_name(
         bucket_dir: &str,
         event_json: &[u8],
         front_cluster: u32,
+        front_file_name: &str,
     ) -> Vec<u8> {
         let mut img = vec![0_u8; 8192];
 
@@ -1175,15 +1211,8 @@ mod tests {
             true,
             &upcase,
         );
-        let front_entry = encode_entry_set(
-            FRONT_FILE_NAME,
-            false,
-            front_cluster,
-            8,
-            8,
-            true,
-            &upcase,
-        );
+        let front_entry =
+            encode_entry_set(front_file_name, false, front_cluster, 8, 8, true, &upcase);
         let event_entry = encode_entry_set(
             "event.json",
             false,
@@ -1225,6 +1254,14 @@ mod tests {
         img
     }
 
+    fn event_fixture_image_with_front_cluster(
+        bucket_dir: &str,
+        event_json: &[u8],
+        front_cluster: u32,
+    ) -> Vec<u8> {
+        event_fixture_image_with_front_name(bucket_dir, event_json, front_cluster, FRONT_FILE_NAME)
+    }
+
     fn event_fixture_image(bucket_dir: &str, event_json: &[u8]) -> Vec<u8> {
         event_fixture_image_with_front_cluster(bucket_dir, event_json, FRONT_FILE_CLUSTER)
     }
@@ -1232,9 +1269,59 @@ mod tests {
     fn produce_stable_batch(reader: &SliceReader) -> crate::record::ScanBatch {
         let sources = [ImageSource::with_slot(reader, 0)];
         let mut tracker = StabilityTracker::new(StabilityConfig::default());
-        let _ =
-            produce(&sources, &mut tracker, 1_000, DEFAULT_SEI_SAMPLE_RATE).expect("first pass");
-        produce(&sources, &mut tracker, 1_060, DEFAULT_SEI_SAMPLE_RATE).expect("second pass")
+        let first = produce(
+            &sources,
+            &mut tracker,
+            1_000,
+            &HashSet::new(),
+            DEFAULT_SEI_SAMPLE_RATE,
+        )
+        .expect("first pass");
+        let shape: HashSet<String> = first
+            .front_census
+            .iter()
+            .map(|entry| entry.canonical_key.clone())
+            .collect();
+        produce(
+            &sources,
+            &mut tracker,
+            1_060,
+            &shape,
+            DEFAULT_SEI_SAMPLE_RATE,
+        )
+        .expect("second pass")
+    }
+
+    #[test]
+    fn produce_reports_front_census_without_shaping_when_shape_list_is_empty() {
+        let event_json =
+            br#"{"timestamp":"2026-06-01T20:10:35-07:00","est_lat":"37.7749","est_lon":"-122.4194"}"#;
+        let reader = SliceReader::new(event_fixture_image("SavedClips", event_json));
+        let sources = [ImageSource::with_slot(&reader, 0)];
+        let mut tracker = StabilityTracker::new(StabilityConfig::default());
+        let warm = produce(
+            &sources,
+            &mut tracker,
+            1_000,
+            &HashSet::new(),
+            DEFAULT_SEI_SAMPLE_RATE,
+        )
+        .expect("warm pass");
+        assert_eq!(warm.front_census.len(), 1);
+        assert!(!warm.front_census[0].front_stable);
+        assert!(warm.records.is_empty());
+
+        let steady = produce(
+            &sources,
+            &mut tracker,
+            1_060,
+            &HashSet::new(),
+            DEFAULT_SEI_SAMPLE_RATE,
+        )
+        .expect("steady pass");
+        assert_eq!(steady.front_census.len(), 1);
+        assert!(steady.front_census[0].front_stable);
+        assert!(steady.records.is_empty());
     }
 
     fn sources_with_slot_overrides(readers: &[SliceReader]) -> Vec<ImageSource<'_, SliceReader>> {
@@ -1251,6 +1338,10 @@ mod tests {
         (0..source_count)
             .map(|slot| format!("{slot}:TeslaCam/SavedClips/{EVENT_TIMESTAMP}/{EVENT_TIMESTAMP}"))
             .collect()
+    }
+
+    fn shape_from_keys(keys: &BTreeSet<String>) -> HashSet<String> {
+        keys.iter().cloned().collect()
     }
 
     #[test]
@@ -1271,7 +1362,8 @@ mod tests {
         ];
         let mut tracker = StabilityTracker::new(StabilityConfig::default());
 
-        let batch = produce(&sources, &mut tracker, 1_000, 30).expect("two-image produce");
+        let batch =
+            produce(&sources, &mut tracker, 1_000, &HashSet::new(), 30).expect("two-image produce");
 
         // Both single-partition images were walked and merged.
         assert_eq!(batch.stats.partitions, 2);
@@ -1290,7 +1382,8 @@ mod tests {
         let sources = [ImageSource::native(&reader)];
         let mut tracker = StabilityTracker::new(StabilityConfig::default());
 
-        let batch = produce(&sources, &mut tracker, 1_000, 30).expect("single-image produce");
+        let batch = produce(&sources, &mut tracker, 1_000, &HashSet::new(), 30)
+            .expect("single-image produce");
         assert_eq!(batch.stats.partitions, 1);
         assert!(batch.complete);
     }
@@ -1306,54 +1399,60 @@ mod tests {
         let expected_keys = expected_savedclip_keys(source_count);
         let mut tracker = StabilityTracker::new(StabilityConfig::default());
 
-        let warmup =
-            produce(&sources, &mut tracker, 1_000, DEFAULT_SEI_SAMPLE_RATE).expect("warmup pass");
+        let warmup = produce(
+            &sources,
+            &mut tracker,
+            1_000,
+            &HashSet::new(),
+            DEFAULT_SEI_SAMPLE_RATE,
+        )
+        .expect("warmup pass");
         assert!(warmup.records.is_empty());
-
-        let first_backlog = produce(&sources, &mut tracker, 1_060, DEFAULT_SEI_SAMPLE_RATE)
-            .expect("first eligible pass");
-        assert!(!first_backlog.complete);
-        assert!(first_backlog
-            .records
-            .iter()
-            .filter(|record| record.is_front())
-            .count()
-            <= MAX_FRONT_SHAPES_PER_BATCH);
-
-        let mut emitted_front = first_backlog
-            .records
-            .iter()
-            .filter(|record| record.is_front())
-            .count();
-        let mut seen_record_keys: BTreeSet<String> = first_backlog
-            .records
-            .iter()
-            .map(|record| record.canonical_key.clone())
-            .collect();
-        let mut seen_present_keys: BTreeSet<String> =
-            first_backlog.present_keys.iter().cloned().collect();
-
-        let mut now_secs = 1_120;
+        // indexd owns draining: it drops a front from its worklist once parsed,
+        // so simulate that by removing each emitted front key from `shape` after
+        // every pass. scannerd caps front work per pass but no longer self-drains
+        // via an emitted flag, so without this the same fronts would re-emit.
+        let mut shape = shape_from_keys(&expected_keys);
+        let mut emitted_front = 0_usize;
+        let mut seen_record_keys: BTreeSet<String> = BTreeSet::new();
+        let mut seen_present_keys: BTreeSet<String> = BTreeSet::new();
+        let mut now_secs = 1_060;
         let mut passes = 0_u8;
         loop {
-            let batch =
-                produce(&sources, &mut tracker, now_secs, DEFAULT_SEI_SAMPLE_RATE).expect("pass");
-            emitted_front += batch
+            let batch = produce(
+                &sources,
+                &mut tracker,
+                now_secs,
+                &shape,
+                DEFAULT_SEI_SAMPLE_RATE,
+            )
+            .expect("pass");
+            let front_this_pass: Vec<String> = batch
                 .records
                 .iter()
                 .filter(|record| record.is_front())
-                .count();
-            seen_record_keys.extend(batch.records.iter().map(|record| record.canonical_key.clone()));
+                .map(|record| record.canonical_key.clone())
+                .collect();
+            assert!(front_this_pass.len() <= MAX_FRONT_SHAPES_PER_BATCH);
+            emitted_front += front_this_pass.len();
+            seen_record_keys.extend(
+                batch
+                    .records
+                    .iter()
+                    .map(|record| record.canonical_key.clone()),
+            );
             seen_present_keys.extend(batch.present_keys.iter().cloned());
-            if batch.complete {
+            for key in &front_this_pass {
+                shape.remove(key);
+            }
+            if shape.is_empty() {
+                assert!(batch.complete, "final drained pass must be complete");
                 break;
             }
-            assert!(batch
-                .records
-                .iter()
-                .filter(|record| record.is_front())
-                .count()
-                <= MAX_FRONT_SHAPES_PER_BATCH);
+            assert!(
+                !batch.complete,
+                "a pass with remaining front backlog must be incomplete"
+            );
             now_secs += 60;
             passes = passes.saturating_add(1);
             assert!(passes < 8, "backlog did not drain in expected passes");
@@ -1374,10 +1473,23 @@ mod tests {
         let sources = sources_with_slot_overrides(&readers);
         let mut tracker = StabilityTracker::new(StabilityConfig::default());
 
-        let _ = produce(&sources, &mut tracker, 1_000, DEFAULT_SEI_SAMPLE_RATE)
-            .expect("warmup pass");
-        let steady = produce(&sources, &mut tracker, 1_060, DEFAULT_SEI_SAMPLE_RATE)
-            .expect("eligible pass");
+        let _ = produce(
+            &sources,
+            &mut tracker,
+            1_000,
+            &HashSet::new(),
+            DEFAULT_SEI_SAMPLE_RATE,
+        )
+        .expect("warmup pass");
+        let shape = shape_from_keys(&expected_savedclip_keys(source_count));
+        let steady = produce(
+            &sources,
+            &mut tracker,
+            1_060,
+            &shape,
+            DEFAULT_SEI_SAMPLE_RATE,
+        )
+        .expect("eligible pass");
 
         assert!(steady.complete);
         assert_eq!(
@@ -1388,10 +1500,18 @@ mod tests {
                 .count(),
             source_count
         );
-        let drained = produce(&sources, &mut tracker, 1_120, DEFAULT_SEI_SAMPLE_RATE)
-            .expect("post-drain pass");
+        // Once indexd drops the parsed fronts from its worklist (empty shape),
+        // scannerd does no further front work and the pass stays complete.
+        let drained = produce(
+            &sources,
+            &mut tracker,
+            1_120,
+            &HashSet::new(),
+            DEFAULT_SEI_SAMPLE_RATE,
+        )
+        .expect("post-drain pass");
         assert!(drained.complete);
-        assert!(drained.records.is_empty());
+        assert!(drained.records.iter().all(|record| !record.is_front()));
     }
 
     #[test]
@@ -1408,10 +1528,23 @@ mod tests {
         let sources = sources_with_slot_overrides(&readers);
         let mut tracker = StabilityTracker::new(StabilityConfig::default());
 
-        let _ = produce(&sources, &mut tracker, 1_000, DEFAULT_SEI_SAMPLE_RATE)
-            .expect("warmup pass");
-        let batch = produce(&sources, &mut tracker, 1_060, DEFAULT_SEI_SAMPLE_RATE)
-            .expect("eligible pass");
+        let _ = produce(
+            &sources,
+            &mut tracker,
+            1_000,
+            &HashSet::new(),
+            DEFAULT_SEI_SAMPLE_RATE,
+        )
+        .expect("warmup pass");
+        let shape = shape_from_keys(&expected_savedclip_keys(source_count));
+        let batch = produce(
+            &sources,
+            &mut tracker,
+            1_060,
+            &shape,
+            DEFAULT_SEI_SAMPLE_RATE,
+        )
+        .expect("eligible pass");
 
         assert!(
             batch.complete,
@@ -1485,6 +1618,57 @@ mod tests {
     }
 
     #[test]
+    fn requested_unplaceable_front_is_emitted_for_durable_backoff() {
+        let event_json =
+            br#"{"timestamp":"2026-06-01T20:10:35-07:00","est_lat":"37.7749","est_lon":"-122.4194"}"#;
+        let reader = SliceReader::new(event_fixture_image_with_front_name(
+            "SavedClips",
+            event_json,
+            FRONT_FILE_CLUSTER,
+            INVALID_FRONT_FILE_NAME,
+        ));
+        let sources = [ImageSource::with_slot(&reader, 0)];
+        let mut tracker = StabilityTracker::new(StabilityConfig::default());
+        let warm = produce(
+            &sources,
+            &mut tracker,
+            1_000,
+            &HashSet::new(),
+            DEFAULT_SEI_SAMPLE_RATE,
+        )
+        .expect("warm pass");
+        assert_eq!(warm.front_census.len(), 1);
+        let key = warm.front_census[0].canonical_key.clone();
+        assert!(
+            key.ends_with(INVALID_FRONT_TIMESTAMP),
+            "front key should preserve parsed filename timestamp"
+        );
+
+        let mut shape = HashSet::new();
+        shape.insert(key.clone());
+        let batch = produce(
+            &sources,
+            &mut tracker,
+            1_060,
+            &shape,
+            DEFAULT_SEI_SAMPLE_RATE,
+        )
+        .expect("steady pass");
+        assert!(
+            batch
+                .records
+                .iter()
+                .all(|record| record.canonical_key != key),
+            "unplaceable requested front must not emit a clip row"
+        );
+        assert!(batch.front_unplaceable.iter().any(|unplaceable| {
+            unplaceable.canonical_key == key && unplaceable.reason == "parse_error"
+        }));
+        assert_eq!(batch.stats.unplaceable_clips, 1);
+        assert_eq!(batch.stats.unplaceable_front, 1);
+    }
+
+    #[test]
     fn produce_skips_malformed_event_json_without_dropping_clip() {
         let reader = SliceReader::new(event_fixture_image(
             "SavedClips",
@@ -1495,10 +1679,12 @@ mod tests {
 
         assert!(batch.clip_events_inventory);
         assert!(batch.clip_events.is_empty());
-        assert!(batch
-            .records
-            .iter()
-            .any(|r| r.canonical_key == canonical_key));
+        assert!(
+            batch
+                .records
+                .iter()
+                .any(|r| r.canonical_key == canonical_key)
+        );
         assert!(batch.present_keys.iter().any(|k| k == &canonical_key));
     }
 
@@ -1512,15 +1698,19 @@ mod tests {
 
         assert!(batch.clip_events_inventory);
         assert!(batch.clip_events.is_empty());
-        assert!(batch
-            .records
-            .iter()
-            .any(|r| r.canonical_key == canonical_key));
+        assert!(
+            batch
+                .records
+                .iter()
+                .any(|r| r.canonical_key == canonical_key)
+        );
         assert!(batch.present_keys.iter().any(|k| k == &canonical_key));
-        assert!(batch
-            .records
-            .iter()
-            .any(|r| r.angle.file_ref == front_clip_path("RecentClips")));
+        assert!(
+            batch
+                .records
+                .iter()
+                .any(|r| r.angle.file_ref == front_clip_path("RecentClips"))
+        );
     }
 
     #[test]
@@ -1536,6 +1726,6 @@ mod tests {
 
         // A structural failure on the SECOND source aborts the whole pass —
         // the consumer must never see a half-walked batch marked complete.
-        assert!(produce(&sources, &mut tracker, 1_000, 30).is_err());
+        assert!(produce(&sources, &mut tracker, 1_000, &HashSet::new(), 30).is_err());
     }
 }

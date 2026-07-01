@@ -140,9 +140,7 @@ impl<'r, R: BlockReader + ?Sized> Volume<'r, R> {
         }
 
         let bpc = self.params.bytes_per_cluster().max(1);
-        let end = start_in_file
-            .saturating_add(len as u64)
-            .min(readable_size);
+        let end = start_in_file.saturating_add(len as u64).min(readable_size);
         let window_len = end.saturating_sub(start_in_file);
         if window_len == 0 {
             return Ok(Vec::new());
@@ -310,9 +308,11 @@ impl<'r, R: BlockReader + ?Sized> Volume<'r, R> {
         clusters_needed: u64,
     ) -> Result<Vec<u32>, ScannerError> {
         let window_start = first
-            .checked_add(u32::try_from(start_cluster_index).map_err(|_| ScannerError::ChainError {
-                first,
-                reason: "window start exceeds u32",
+            .checked_add(u32::try_from(start_cluster_index).map_err(|_| {
+                ScannerError::ChainError {
+                    first,
+                    reason: "window start exceeds u32",
+                }
             })?)
             .ok_or(ScannerError::ChainError {
                 first,

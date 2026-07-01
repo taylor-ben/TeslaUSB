@@ -23,6 +23,8 @@
 //! and DB persist across passes); a single call is the per-tick unit and
 //! is what host tests drive.
 
+use std::collections::HashSet;
+
 use rusqlite::Connection;
 use scannerd::produce::{ImageSource, produce};
 use scannerd::reader::BlockReader;
@@ -138,7 +140,8 @@ pub fn run_scan_pass<R: BlockReader + ?Sized>(
     // partition's native MBR slot (p1 dashcam, p2 media). The split
     // two-image serving path lives in `scannerd serve`.
     let sources = [ImageSource::native(reader)];
-    let batch = produce(&sources, tracker, now_secs, config.sample_rate)?;
+    let shape: HashSet<String> = HashSet::new();
+    let batch = produce(&sources, tracker, now_secs, &shape, config.sample_rate)?;
     let applied = apply(conn, &batch, config.derive)?;
     let stats = batch.stats;
     Ok(ScanReport {

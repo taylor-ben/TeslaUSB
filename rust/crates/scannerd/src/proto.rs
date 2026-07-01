@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::record::ScanBatch;
 
 /// Maximum accepted frame size for a [`ScanBatch`] response. A realistic
-/// per-pass batch (a handful of newly-stable clips, or a full resync replay
+/// per-pass batch (a handful of requested front shapes plus census/inventory
 /// bounded by the [`crate::record`] caps) is well under this; the ceiling
 /// is a denial-of-service guard so a forged length prefix cannot drive an
 /// unbounded allocation on the 512 MiB Pi.
@@ -41,16 +41,14 @@ pub const MAX_READ_LEN: u32 = 8 * 1024 * 1024;
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
     /// Run one produce pass and stream the resulting batch back, stamped
-    /// with `generation`. When `resync` is set the server re-arms every
-    /// currently-stable clip so the batch replays the full present set
-    /// (used by the client on first connect / after an apply failure to
-    /// recover a batch lost before it was durably committed).
+    /// with `generation`.
     Scan {
         /// Monotonic request id the server stamps onto the response batch.
         generation: u64,
-        /// Replay all currently-stable clips, not just newly-eligible ones.
+        /// Canonical keys whose front angle should be expensively shaped in
+        /// this pass.
         #[serde(default)]
-        resync: bool,
+        shape: Vec<String>,
     },
 }
 
@@ -199,7 +197,7 @@ mod tests {
     use std::io::Cursor;
 
     use super::{
-        ClipIdentity, MAX_FRAME, Request, ReadFileHeader, ReadFileRequest, read_batch, read_frame,
+        ClipIdentity, MAX_FRAME, ReadFileHeader, ReadFileRequest, Request, read_batch, read_frame,
         read_request, write_batch, write_frame, write_request,
     };
     use crate::record::{PROTOCOL_VERSION, ProducerStats, ScanBatch};
@@ -225,11 +223,11 @@ mod tests {
         for req in [
             Request::Scan {
                 generation: 7,
-                resync: false,
+                shape: Vec::new(),
             },
             Request::Scan {
                 generation: 9,
-                resync: true,
+                shape: vec!["slot0:TeslaCam/SavedClips/clip".to_owned()],
             },
         ] {
             let mut buf = Vec::new();
@@ -240,13 +238,13 @@ mod tests {
     }
 
     #[test]
-    fn request_resync_defaults_false() {
+    fn request_shape_defaults_empty() {
         let req: Request = serde_json::from_slice(br#"{"cmd":"scan","generation":3}"#).unwrap();
         assert_eq!(
             req,
             Request::Scan {
                 generation: 3,
-                resync: false
+                shape: Vec::new()
             }
         );
     }
@@ -270,6 +268,8 @@ mod tests {
             complete: true,
             stats: ProducerStats::default(),
             present_keys: vec!["0:TeslaCam/SavedClips/x".to_owned()],
+            front_census: Vec::new(),
+            front_unplaceable: Vec::new(),
             records: Vec::new(),
             media: Vec::new(),
             media_present_paths: Vec::new(),

@@ -471,7 +471,10 @@ mod tests {
     fn rounded_tz_offset_quantises_to_fifteen_minutes() {
         let clip_started_utc = 1_780_358_823;
         let file_local = clip_started_utc + 3 * 3600 + 52 * 60 + 10;
-        assert_eq!(rounded_tz_offset(file_local, clip_started_utc), Some(3 * 3600 + 45 * 60));
+        assert_eq!(
+            rounded_tz_offset(file_local, clip_started_utc),
+            Some(3 * 3600 + 45 * 60)
+        );
     }
 
     #[test]
