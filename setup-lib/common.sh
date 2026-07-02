@@ -33,6 +33,7 @@ EX_STEP=4
 # --- run identity ------------------------------------------------------------
 : "${TESLAUSB_RUN_TS:=$(date -u +%Y%m%dT%H%M%SZ)}"
 : "${DRY_RUN:=0}"
+: "${BOOT_CHANGED:=0}"
 
 # --- paths (contract §1; sandbox-overridable) --------------------------------
 : "${TESLAUSB_PREFIX:=}"
@@ -61,6 +62,11 @@ TESLAUSB_UNIT_DIR="${TESLAUSB_PREFIX}/etc/systemd/system"
 TESLAUSB_CONFIG_DIR="${TESLAUSB_PREFIX}/etc/teslausb"
 TESLAUSB_SECRETS_DIR="${TESLAUSB_CONFIG_DIR}/secrets"
 TESLAUSB_STATE_DIR="${TESLAUSB_PREFIX}/var/lib/teslausb"
+TESLAUSB_BOOT_DIR="${TESLAUSB_PREFIX}/boot/firmware"
+TESLAUSB_BOOT_CONFIG="${TESLAUSB_BOOT_DIR}/config.txt"
+TESLAUSB_MODULES_LOAD="${TESLAUSB_PREFIX}/etc/modules-load.d/teslausb-gadget.conf"
+TESLAUSB_BOOT_MARKER_BEGIN="# >>> TeslaUSB B-1 (managed) >>>"
+TESLAUSB_BOOT_MARKER_END="# <<< TeslaUSB B-1 (managed) <<<"
 
 # --- service / unit sets -----------------------------------------------------
 # App services: ENABLED + restarted by the install/deploy/update modes because

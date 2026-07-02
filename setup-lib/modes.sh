@@ -60,20 +60,31 @@ mode_install() {
     require_privilege
     artifact_resolve_and_verify
     local rel="$RESOLVED_RELEASE_DIR"
+    install_packages
     ensure_data_roots
     install_binaries "$rel"
     install_spa "$rel"
     ensure_secrets_dir
     install_unit_files "$rel"
     enable_app_services
+    BOOT_CHANGED=0
+    configure_boot_dwc2
     if [ "${BOOTSTRAP_IMAGE:-0}" = "1" ]; then
         log_warn "bootstrap: enabling ${TESLAUSB_PROVISION_UNIT} — gadgetd will create disk.img IF ABSENT, then bring the gadget up"
         log_warn "staged-reboot model: boot mutations are backed up; post-boot validation gates success (setup.md §7 step 9)"
         enable_provision_unit
-        start_gadget_units
+        if [ "${BOOT_CHANGED}" = "1" ]; then
+            log_warn "staged reboot: gadget units ENABLED for next boot; NOT started now (UDC appears after dwc2 peripheral is active post-reboot)"
+            enable_gadget_units
+        else
+            start_gadget_units
+        fi
     else
         log_info "no --bootstrap-image: NOT provisioning; no image will be created. Enabling gadget units for next boot only."
         enable_gadget_units
+    fi
+    if [ "${BOOT_CHANGED}" = "1" ]; then
+        log_warn "REBOOT REQUIRED: dwc2 USB-peripheral overlay and gadget modules take effect on the next boot (setup.md §7 step 9)"
     fi
     restart_app_services
     log_info "install complete"

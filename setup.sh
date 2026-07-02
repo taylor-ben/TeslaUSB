@@ -24,6 +24,8 @@ export SETUP_LIB_DIR
 . "${SETUP_LIB_DIR}/artifact.sh"
 # shellcheck source=setup-lib/units.sh
 . "${SETUP_LIB_DIR}/units.sh"
+# shellcheck source=setup-lib/system.sh
+. "${SETUP_LIB_DIR}/system.sh"
 # shellcheck source=setup-lib/modes.sh
 . "${SETUP_LIB_DIR}/modes.sh"
 

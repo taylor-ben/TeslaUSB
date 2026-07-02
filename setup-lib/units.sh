@@ -85,8 +85,13 @@ start_gadget_units() {
 # so gadgetd creates the image if (and only if) it is absent.
 enable_provision_unit() {
     local unit="${TESLAUSB_UNIT_DIR}/${TESLAUSB_PROVISION_UNIT}.service"
-    [ -e "$unit" ] || die "$EX_PRECOND" \
-        "--bootstrap-image requested but ${TESLAUSB_PROVISION_UNIT}.service is not in the release"
+    # In --dry-run nothing is actually enabled (systemctl_do is a no-op) and the
+    # unit was not really copied by the preceding install_unit_files, so the
+    # installed-location precondition can only be enforced on a real run.
+    if [ "${DRY_RUN:-0}" != "1" ] && [ ! -e "$unit" ]; then
+        die "$EX_PRECOND" \
+            "--bootstrap-image requested but ${TESLAUSB_PROVISION_UNIT}.service is not in the release"
+    fi
     systemctl_do enable "${TESLAUSB_PROVISION_UNIT}.service"
     systemctl_do start "${TESLAUSB_PROVISION_UNIT}.service"
 }

@@ -82,12 +82,19 @@ case "\${1:-}" in
 esac
 exit 0
 EOF
-    chmod +x "${base}/bin/systemctl" "${base}/bin/gadgetd"
+    cat > "${base}/bin/apt-get" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "\${APT_LOG}"
+exit 0
+EOF
+    chmod +x "${base}/bin/systemctl" "${base}/bin/gadgetd" "${base}/bin/apt-get"
 
     export TESLAUSB_PREFIX="${base}/root"
     export SYSTEMCTL_LOG="${base}/systemctl.log"
+    export APT_LOG="${base}/apt.log"
     export TESLAUSB_AUDIT="${base}/audit.log"
     : > "$SYSTEMCTL_LOG"
+    : > "$APT_LOG"
     : > "$TESLAUSB_AUDIT"
     export FAKE_GADGET_BOUND=0
     export PATH="${base}/bin:${PATH}"
@@ -97,7 +104,7 @@ EOF
 }
 
 # reset_sandbox_logs — clear the audit + systemctl logs between phases.
-reset_sandbox_logs() { : > "$SYSTEMCTL_LOG"; : > "$TESLAUSB_AUDIT"; }
+reset_sandbox_logs() { : > "$SYSTEMCTL_LOG"; : > "$APT_LOG"; : > "$TESLAUSB_AUDIT"; }
 
 # make_fake_disk_img — create a fake LUN under the sandbox; echoes its path.
 make_fake_disk_img() {

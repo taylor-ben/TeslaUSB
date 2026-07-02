@@ -47,11 +47,129 @@ cleanup_sandbox "$sbx"
 # A2: install --bootstrap-image is the ONLY path that enables provisioning.
 new_sandbox; sbx="$SANDBOX"
 rel="${sbx}/rel"; make_release_dir "$rel" gadgetd-provision.service gadgetd-control.service
+mkdir -p "${TESLAUSB_PREFIX}/boot/firmware"
+printf '%s\n' '[cm5]' 'dtoverlay=dwc2,dr_mode=host' > "${TESLAUSB_PREFIX}/boot/firmware/config.txt"
 rc=0; run_setup install --artifact-dir "$rel" --bootstrap-image --allow-unverified --yes >/dev/null 2>&1 || rc=$?
 assert_eq "$rc" 0 "install --bootstrap-image succeeds"
 assert_grep 'enable gadgetd-provision\.service' "$SYSTEMCTL_LOG" "bootstrap enables gadgetd-provision"
 assert_grep 'start gadgetd-provision\.service'  "$SYSTEMCTL_LOG" "bootstrap runs gadgetd-provision oneshot"
-assert_grep 'start gadgetd\.service'            "$SYSTEMCTL_LOG" "bootstrap starts the gadget"
+assert_grep 'enable gadgetd\.service'           "$SYSTEMCTL_LOG" "bootstrap ENABLES the gadget for next boot"
+assert_nogrep 'start gadgetd\.service'          "$SYSTEMCTL_LOG" "bootstrap does NOT start the gadget pre-reboot (staged)"
+assert_grep 'install .*exfatprogs' "$APT_LOG" "bootstrap apt-installs exfatprogs"
+assert_grep 'install .*hostapd'    "$APT_LOG" "bootstrap apt-installs hostapd"
+assert_grep 'install .*dnsmasq'    "$APT_LOG" "bootstrap apt-installs dnsmasq"
+assert_grep 'disable --now hostapd\.service' "$SYSTEMCTL_LOG" "bootstrap disables hostapd (wifid drives it)"
+assert_grep 'disable --now dnsmasq\.service' "$SYSTEMCTL_LOG" "bootstrap disables dnsmasq (wifid drives it)"
+assert_grep 'dtoverlay=dwc2,dr_mode=peripheral' "${TESLAUSB_PREFIX}/boot/firmware/config.txt" "config.txt gains dwc2 peripheral overlay"
+assert_grep 'dr_mode=host' "${TESLAUSB_PREFIX}/boot/firmware/config.txt" "inert [cm5] host line preserved"
+assert_grep 'dwc2'         "${TESLAUSB_PREFIX}/etc/modules-load.d/teslausb-gadget.conf" "modules-load has dwc2"
+assert_grep 'libcomposite' "${TESLAUSB_PREFIX}/etc/modules-load.d/teslausb-gadget.conf" "modules-load has libcomposite"
+if ls "${TESLAUSB_PREFIX}/boot/firmware/"config.txt.b1-backup-* >/dev/null 2>&1; then
+    _ok "config.txt backup sidecar created"
+else
+    _fail "config.txt backup sidecar created"
+fi
+cleanup_sandbox "$sbx"
+
+# A2b: already-configured bootstrap is idempotent and starts gadget immediately.
+new_sandbox; sbx="$SANDBOX"
+rel="${sbx}/rel"; make_release_dir "$rel" gadgetd-provision.service gadgetd-control.service
+mkdir -p "${TESLAUSB_PREFIX}/boot/firmware"
+cat > "${TESLAUSB_PREFIX}/boot/firmware/config.txt" <<'EOF'
+# >>> TeslaUSB B-1 (managed) >>>
+[all]
+dtoverlay=dwc2,dr_mode=peripheral
+# <<< TeslaUSB B-1 (managed) <<<
+EOF
+mkdir -p "${TESLAUSB_PREFIX}/etc/modules-load.d"
+cat > "${TESLAUSB_PREFIX}/etc/modules-load.d/teslausb-gadget.conf" <<'EOF'
+# TeslaUSB B-1: USB gadget modules (managed)
+dwc2
+libcomposite
+EOF
+rc=0; run_setup install --artifact-dir "$rel" --bootstrap-image --allow-unverified --yes >/dev/null 2>&1 || rc=$?
+assert_eq "$rc" 0 "install --bootstrap-image (preconfigured) succeeds"
+assert_nogrep 'dr_mode=otg' "${TESLAUSB_PREFIX}/boot/firmware/config.txt" "preconfigured bootstrap does not write dr_mode=otg"
+if [ "$(find "${TESLAUSB_PREFIX}/boot/firmware" -maxdepth 1 -name 'config.txt.b1-backup-*' | wc -l | tr -d ' ')" = "0" ]; then
+    _ok "preconfigured bootstrap creates no new config backup"
+else
+    _fail "preconfigured bootstrap creates no new config backup"
+fi
+assert_grep 'start gadgetd\.service' "$SYSTEMCTL_LOG" "already-configured bootstrap starts the gadget (BOOT_CHANGED=0)"
+cleanup_sandbox "$sbx"
+
+# A2c: package install is idempotent when required tools already exist.
+new_sandbox; sbx="$SANDBOX"
+rel="${sbx}/rel"; make_release_dir "$rel" gadgetd-provision.service gadgetd-control.service
+mkdir -p "${TESLAUSB_PREFIX}/boot/firmware"
+printf '%s\n' '[cm5]' 'dtoverlay=dwc2,dr_mode=host' > "${TESLAUSB_PREFIX}/boot/firmware/config.txt"
+while read -r pkg probe _ || [ -n "$pkg" ]; do
+    case "$pkg" in ''|'#'*) continue ;; esac
+    cat > "${SANDBOX}/bin/${probe}" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+    chmod +x "${SANDBOX}/bin/${probe}"
+done < "${REPO_ROOT}/setup-lib/required-packages.list"
+rc=0; run_setup install --artifact-dir "$rel" --bootstrap-image --allow-unverified --yes >/dev/null 2>&1 || rc=$?
+assert_eq "$rc" 0 "install --bootstrap-image succeeds when tools preexist"
+assert_nogrep 'install' "$APT_LOG" "no apt install when all tools present"
+assert_grep 'disable --now hostapd\.service' "$SYSTEMCTL_LOG" "hostapd still disabled even when present"
+cleanup_sandbox "$sbx"
+
+# A2d: a policy-rc.d guard left by an interrupted prior run is self-healed
+# (adopted by its content marker and removed) on the next install. Probe tools
+# are left ABSENT so packages install and the guard path runs.
+new_sandbox; sbx="$SANDBOX"
+rel="${sbx}/rel"; make_release_dir "$rel" gadgetd-provision.service gadgetd-control.service
+mkdir -p "${TESLAUSB_PREFIX}/boot/firmware"
+printf '%s\n' '[cm5]' 'dtoverlay=dwc2,dr_mode=host' > "${TESLAUSB_PREFIX}/boot/firmware/config.txt"
+mkdir -p "${TESLAUSB_PREFIX}/usr/sbin"
+printf '%s\n' '#!/bin/sh' \
+    '# teslausb: transient apt no-start guard (auto-removed after install)' \
+    'exit 101' > "${TESLAUSB_PREFIX}/usr/sbin/policy-rc.d"
+chmod 0755 "${TESLAUSB_PREFIX}/usr/sbin/policy-rc.d"
+run_setup install --artifact-dir "$rel" --bootstrap-image --allow-unverified --yes >/dev/null 2>&1 || true
+assert_file_absent "${TESLAUSB_PREFIX}/usr/sbin/policy-rc.d" "leftover teslausb policy-rc.d guard is self-healed on re-run"
+cleanup_sandbox "$sbx"
+
+# A2e: a FOREIGN policy-rc.d (not our marker body) is NEVER removed or rewritten.
+new_sandbox; sbx="$SANDBOX"
+rel="${sbx}/rel"; make_release_dir "$rel" gadgetd-provision.service gadgetd-control.service
+mkdir -p "${TESLAUSB_PREFIX}/boot/firmware"
+printf '%s\n' '[cm5]' 'dtoverlay=dwc2,dr_mode=host' > "${TESLAUSB_PREFIX}/boot/firmware/config.txt"
+mkdir -p "${TESLAUSB_PREFIX}/usr/sbin"
+printf '%s\n' '#!/bin/sh' '# admin policy: allow all' 'exit 0' \
+    > "${TESLAUSB_PREFIX}/usr/sbin/policy-rc.d"
+chmod 0755 "${TESLAUSB_PREFIX}/usr/sbin/policy-rc.d"
+run_setup install --artifact-dir "$rel" --bootstrap-image --allow-unverified --yes >/dev/null 2>&1 || true
+assert_file_exists "${TESLAUSB_PREFIX}/usr/sbin/policy-rc.d" "foreign policy-rc.d is preserved (never removed)"
+assert_grep 'admin policy: allow all' "${TESLAUSB_PREFIX}/usr/sbin/policy-rc.d" "foreign policy-rc.d content is untouched"
+cleanup_sandbox "$sbx"
+
+# A2f: a stale matching guard is self-healed even when ALL probe tools already
+# exist (pkgs=0, so the package-install branch is skipped) — covers a crash that
+# happened AFTER apt succeeded on a prior run.
+new_sandbox; sbx="$SANDBOX"
+rel="${sbx}/rel"; make_release_dir "$rel" gadgetd-provision.service gadgetd-control.service
+mkdir -p "${TESLAUSB_PREFIX}/boot/firmware"
+printf '%s\n' '[cm5]' 'dtoverlay=dwc2,dr_mode=host' > "${TESLAUSB_PREFIX}/boot/firmware/config.txt"
+while read -r pkg probe _ || [ -n "$pkg" ]; do
+    case "$pkg" in ''|'#'*) continue ;; esac
+    cat > "${SANDBOX}/bin/${probe}" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+    chmod +x "${SANDBOX}/bin/${probe}"
+done < "${REPO_ROOT}/setup-lib/required-packages.list"
+mkdir -p "${TESLAUSB_PREFIX}/usr/sbin"
+printf '%s\n' '#!/bin/sh' \
+    '# teslausb: transient apt no-start guard (auto-removed after install)' \
+    'exit 101' > "${TESLAUSB_PREFIX}/usr/sbin/policy-rc.d"
+chmod 0755 "${TESLAUSB_PREFIX}/usr/sbin/policy-rc.d"
+run_setup install --artifact-dir "$rel" --bootstrap-image --allow-unverified --yes >/dev/null 2>&1 || true
+assert_nogrep 'install' "$APT_LOG" "no apt install when all tools present (self-heal case)"
+assert_file_absent "${TESLAUSB_PREFIX}/usr/sbin/policy-rc.d" "stale guard self-healed even with pkgs=0 (crash-after-apt)"
 cleanup_sandbox "$sbx"
 
 # A3: install WITHOUT --bootstrap-image never provisions nor starts the gadget.
@@ -68,11 +186,17 @@ cleanup_sandbox "$sbx"
 # B. Dry-run invokes NO raw mutator and NO systemctl enable/restart
 # ============================================================================
 new_sandbox; sbx="$SANDBOX"
-rc=0; run_setup deploy-app --artifact-dir "$GOOD" --dry-run --yes >/dev/null 2>&1 || rc=$?
-assert_eq "$rc" 0 "deploy-app --dry-run succeeds"
+rel="${sbx}/rel"; make_release_dir "$rel" gadgetd-provision.service gadgetd-control.service
+mkdir -p "${TESLAUSB_PREFIX}/boot/firmware"
+printf '%s\n' '[cm5]' 'dtoverlay=dwc2,dr_mode=host' > "${TESLAUSB_PREFIX}/boot/firmware/config.txt"
+rc=0; run_setup install --artifact-dir "$rel" --bootstrap-image --dry-run --allow-unverified --yes >/dev/null 2>&1 || rc=$?
+assert_eq "$rc" 0 "install --bootstrap-image --dry-run succeeds"
+assert_eq "$(wc -c < "$APT_LOG" | tr -d ' ')" 0 "dry-run invoked NO apt-get"
 assert_eq "$(wc -c < "$TESLAUSB_AUDIT" | tr -d ' ')" 0 "dry-run executed NO mutation (audit log empty)"
 assert_eq "$(wc -c < "$SYSTEMCTL_LOG" | tr -d ' ')" 0 "dry-run invoked NO systemctl"
-assert_file_absent "${TESLAUSB_PREFIX}/usr/local/bin/gadgetd" "dry-run created no files"
+assert_grep 'dr_mode=host' "${TESLAUSB_PREFIX}/boot/firmware/config.txt" "dry-run keeps existing boot config"
+assert_nogrep 'dtoverlay=dwc2,dr_mode=peripheral' "${TESLAUSB_PREFIX}/boot/firmware/config.txt" "dry-run does not append dwc2 overlay"
+assert_file_absent "${TESLAUSB_PREFIX}/etc/modules-load.d/teslausb-gadget.conf" "dry-run does not write modules-load file"
 cleanup_sandbox "$sbx"
 
 # ============================================================================

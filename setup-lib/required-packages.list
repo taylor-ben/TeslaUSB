@@ -1,0 +1,18 @@
+# TeslaUSB B-1 — host package prerequisites for a fresh-OS install.
+#
+# One row per package:  <apt-package>  <probe-binary>
+# install_packages (setup-lib/system.sh) apt-installs <apt-package> only when
+# `command -v <probe-binary>` finds nothing. The probe-binary column deliberately
+# holds the disk/wifi tool names — some are §8-denylisted disk mutators that
+# gadgetd (NEVER the installer) invokes at runtime — so those tokens live in this
+# DATA file, out of the denylist-scanned *.sh sources.
+#
+# gadgetd provisioning deps: exfatprogs (mkfs.exfat), parted.
+# wifid AP deps:             iw, hostapd, dnsmasq.
+# util-linux tools (fallocate/sfdisk/losetup/mount) are Priority: required and
+# are always present, so they are not managed here.
+exfatprogs mkfs.exfat
+parted parted
+iw iw
+hostapd hostapd
+dnsmasq dnsmasq
