@@ -77,7 +77,6 @@ impl CandidateSource for VolumeCandidateSource {
                 .tracker
                 .lock()
                 .map_err(|_| io::Error::other("stability tracker lock poisoned"))?;
-            tracker.arm_resync();
             select_stable_records(&mut tracker, &records, now_secs)
         };
         Ok(group_recent_candidates(
@@ -358,10 +357,16 @@ fn select_stable_records(
     records: &[FileRecord],
     now_secs: u64,
 ) -> Vec<FileRecord> {
-    tracker
-        .observe(records, now_secs)
-        .into_iter()
-        .filter_map(|idx| records.get(idx))
+    // retentiond is an always-on archiver: it must re-offer *every*
+    // currently-stable clip each cycle (level-triggered), not just those
+    // that became stable on this exact scan — otherwise a clip that settles
+    // while the archiver is busy would be listed once and never again. We
+    // advance the settle-window state via `observe`, then return everything
+    // the tracker now considers stable (rather than the one-shot delta).
+    let _ = tracker.observe(records, now_secs);
+    records
+        .iter()
+        .filter(|record| tracker.is_stable(record, now_secs))
         .filter(|record| record.valid_data_length == record.data_length && record.set_checksum_ok)
         .cloned()
         .collect()
@@ -628,7 +633,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_clip_is_reoffered_each_cycle_when_resync_is_armed() {
+    fn stable_clip_is_reoffered_each_cycle() {
         let mut tracker = StabilityTracker::new(StabilityConfig {
             required_stable_scans: 2,
             quiescence_secs: 60,
@@ -641,12 +646,9 @@ mod tests {
             true,
         )];
 
-        tracker.arm_resync();
         assert!(select_stable_records(&mut tracker, &complete, 0).is_empty());
-        tracker.arm_resync();
         let first = select_stable_records(&mut tracker, &complete, 120);
         assert_eq!(first.len(), 1);
-        tracker.arm_resync();
         let second = select_stable_records(&mut tracker, &complete, 180);
         assert_eq!(second.len(), 1);
     }
