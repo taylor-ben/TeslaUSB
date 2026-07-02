@@ -702,6 +702,18 @@ fn catalog_rejects_newer_schema() {
     assert!(matches!(err, crate::CatalogError::SchemaTooNew { .. }));
 }
 
+#[test]
+fn catalog_accepts_current_indexd_schema() {
+    // Regression guard for indexd<->webd schema drift: `seed` applies indexd's
+    // full migration ladder (up to its `LATEST_VERSION`), so a stale
+    // `SUPPORTED_SCHEMA_VERSION` here fails this test rather than shipping a
+    // webd that crash-loops against every live catalog.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catalog.db");
+    seed(&path);
+    Catalog::open(&path).expect("webd must accept the current indexd schema");
+}
+
 // ─── Task 5.1b: archive streaming + export ───────────────────────────────
 
 /// A live media fixture: a seeded catalog wired to a real on-disk archive root,

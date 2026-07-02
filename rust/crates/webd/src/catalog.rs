@@ -19,9 +19,10 @@ use rusqlite::{Connection, OpenFlags};
 /// by a newer `indexd` and is refused rather than misread.
 ///
 /// v4 adds the internal `front_parse_attempts` provenance table (per-front-clip
-/// parse state); `webd` never reads it, so v4 is fully read-compatible with the
-/// v3 surface this build queries.
-const SUPPORTED_SCHEMA_VERSION: i64 = 4;
+/// parse state) and v5 adds retry/backoff columns (`attempt_count`,
+/// `next_retry_at`) to that same table; `webd` never reads it, so v4 and v5 are
+/// fully read-compatible with the v3 surface this build queries.
+const SUPPORTED_SCHEMA_VERSION: i64 = 5;
 
 /// How long a read-only connection waits on a locked database before erroring.
 /// WAL readers rarely block, but this is cheap insurance against a checkpoint
