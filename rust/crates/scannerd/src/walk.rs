@@ -182,6 +182,9 @@ pub fn walk_volume<R: BlockReader + ?Sized>(
 /// # Errors
 ///
 /// Propagates structural read failures and the same traversal caps as [`walk_volume`].
+// Marginally over clippy's line cap; kept as one cohesive targeted-descent routine
+// rather than split purely to satisfy the lint.
+#[allow(clippy::too_many_lines)]
 pub fn resolve_file_by_components<R: BlockReader + ?Sized>(
     volume: &Volume<'_, R>,
     partition_slot: u8,

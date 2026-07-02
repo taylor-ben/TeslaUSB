@@ -134,7 +134,7 @@ SELECT c.canonical_key,
 ";
 
 /// v5 DDL: add retry/backoff tracking columns for durable front parse
-/// attempts. Existing rows start at attempt_count=0 with no backoff.
+/// attempts. Existing rows start at `attempt_count=0` with no backoff.
 const V5_SQL: &str = "
 ALTER TABLE front_parse_attempts
    ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0;
