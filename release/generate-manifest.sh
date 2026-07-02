@@ -34,8 +34,8 @@ DEFAULT_TRIPLE='aarch64-unknown-linux-gnu'
 # Subdirs hashed into SHA256SUMS, in a stable order (§3.1). Root-level
 # metadata (SHA256SUMS, manifest.*) is excluded by only scanning these.
 SCAN_DIRS='bin spa units'
-# The 7 service binaries that a complete release ships (schema enum, §3).
-EXPECTED_BINS='gadgetd scannerd indexd webd uploadd retentiond wifid'
+# The 8 service binaries that a complete release ships (schema enum, §3).
+EXPECTED_BINS='gadgetd scannerd indexd webd uploadd retentiond wifid schedulerd'
 
 gm__log() { printf '[generate-manifest] %s\n' "$*" >&2; }
 gm__die() { local code="$1"; shift; gm__log "$*"; exit "$code"; }

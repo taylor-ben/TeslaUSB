@@ -72,10 +72,12 @@ TESLAUSB_BOOT_MARKER_END="# <<< TeslaUSB B-1 (managed) <<<"
 # App services: ENABLED + restarted by the install/deploy/update modes because
 # their live loops are wired today. (Per-service OOM kill order is set in each
 # unit's OOMScoreAdjust, not by this list order — SPEC.md §7.)
-# scannerd is listed before indexd so restart_app_services brings the IPC
-# producer up before its consumer (systemd's After=/Requires= also enforces
-# this, but the list order keeps the restart sequence intuitive).
-TESLAUSB_APP_SERVICES="scannerd indexd webd wifid"
+# Ordering keeps each IPC producer ahead of its consumer in the restart
+# sequence: scannerd before indexd (also enforced by systemd After=/Requires=),
+# and schedulerd before webd. webd reaches schedulerd's control socket lazily
+# (per-tick, with retry) so there is NO unit-level After= between them — this
+# list order is what starts schedulerd ahead of webd's boot enforcement tick.
+TESLAUSB_APP_SERVICES="scannerd indexd schedulerd webd wifid"
 # Staged services: their unit FILES are installed (install_unit_files globs
 # units/*.service), but they are NOT enabled/started because their live wiring
 # is not yet landed:

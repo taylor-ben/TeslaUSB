@@ -182,6 +182,18 @@ assert_grep   'enable gadgetd\.service' "$SYSTEMCTL_LOG" "non-bootstrap install 
 assert_nogrep 'start gadgetd\.service'  "$SYSTEMCTL_LOG" "non-bootstrap install NEVER starts the gadget"
 cleanup_sandbox "$sbx"
 
+# A3f: schedulerd (the chime-scheduler state owner) is a first-class app service
+# — webd reaches its control socket — so install must ENABLE + RESTART it. This
+# guards the fresh-OS deploy gap where schedulerd shipped in the release but was
+# omitted from TESLAUSB_APP_SERVICES, leaving the chime scheduler dormant.
+new_sandbox; sbx="$SANDBOX"
+rel="${sbx}/rel"; make_release_dir "$rel" schedulerd.service
+rc=0; run_setup install --artifact-dir "$rel" --allow-unverified --yes >/dev/null 2>&1 || rc=$?
+assert_eq "$rc" 0 "install (with schedulerd unit) succeeds"
+assert_grep '^enable schedulerd\.service$'  "$SYSTEMCTL_LOG" "install ENABLES schedulerd (chime scheduler state owner)"
+assert_grep '^restart schedulerd\.service$' "$SYSTEMCTL_LOG" "install RESTARTS schedulerd app service"
+cleanup_sandbox "$sbx"
+
 # ============================================================================
 # B. Dry-run invokes NO raw mutator and NO systemctl enable/restart
 # ============================================================================
