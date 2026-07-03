@@ -23,6 +23,11 @@ const RESERVE_MIB: u64 = 1;
 const MIN_TESLACAM_MIB: u64 = 16;
 /// Smallest usable media partition we will create.
 const MIN_MEDIA_MIB: u64 = 1;
+/// Root-owned parent for transient seed mountpoints. Under `/run` (tmpfs,
+/// root-only, NOT world-writable) — unlike `/tmp` — so a predictable mountpoint
+/// cannot be symlink-raced by a local user to redirect the seed `mkdir`s off the
+/// mounted image.
+const SEED_MOUNT_ROOT: &str = "/run/teslausb/provision-mnt";
 
 /// Desired on-disk layout for ONE single-partition backing image.
 #[derive(Debug, Clone)]
@@ -33,8 +38,16 @@ pub(crate) struct ImagePlan {
     pub(crate) size_mib: u64,
     /// exFAT volume label for the single partition.
     pub(crate) label: String,
-    /// Whether to seed a top-level `TeslaCam/` directory (`TeslaCam` image only).
-    pub(crate) seed_teslacam: bool,
+    /// Top-level directories to create on the freshly-formatted partition so the
+    /// car (and our media features) find the folders they expect. Empty = no seed
+    /// (and the partition is not mounted).
+    pub(crate) seed_dirs: &'static [&'static str],
+    /// When the backing image already exists, whether to idempotently reconcile
+    /// `seed_dirs` on it (loop-mount + create missing folders). `true` only for
+    /// images we own and must keep structurally correct (the media image); the
+    /// car-owned `TeslaCam` image stays strictly create-only-if-absent so its
+    /// large volume is never routinely mounted at boot.
+    reseed_existing: bool,
     /// Smallest usable partition size (MiB) tolerated for this image.
     min_usable_mib: u64,
 }
@@ -47,18 +60,22 @@ impl ImagePlan {
             image,
             size_mib,
             label: "TESLACAM".to_owned(),
-            seed_teslacam: true,
+            seed_dirs: &["TeslaCam"],
+            reseed_existing: false,
             min_usable_mib: MIN_TESLACAM_MIB,
         }
     }
 
-    /// The media (`lun.1`) image: single `MEDIA` exFAT partition, no seed.
+    /// The media (`lun.1`) image: single `MEDIA` exFAT partition seeded with the
+    /// Tesla media-feature folders (`Chimes`, `Boombox`, `LicensePlate`,
+    /// `LightShow`, `Music`, `Wraps`) using exact casing.
     pub(crate) fn media(image: PathBuf, size_mib: u64) -> Self {
         Self {
             image,
             size_mib,
             label: "MEDIA".to_owned(),
-            seed_teslacam: false,
+            seed_dirs: &["Boombox", "Chimes", "LicensePlate", "LightShow", "Music", "Wraps"],
+            reseed_existing: true,
             min_usable_mib: MIN_MEDIA_MIB,
         }
     }
@@ -162,6 +179,15 @@ fn run(program: &str, args: &[String]) -> io::Result<String> {
 pub(crate) fn provision_image(plan: &ImagePlan) -> io::Result<bool> {
     plan.validate()?;
     if plan.image.exists() {
+        // The image already exists: never re-create it (that would destroy the
+        // car's data). For images we own and must keep structurally correct (the
+        // media image), idempotently reconcile the seed folders so a card
+        // provisioned before those folders were introduced self-heals on the
+        // next provision. Non-destructive: only creates missing top-level
+        // directories — never formats, deletes, or touches file data.
+        if plan.reseed_existing && !plan.seed_dirs.is_empty() {
+            ensure_seed_dirs(plan)?;
+        }
         return Ok(false);
     }
     // #1-invariant guard: never touch a backing file the car is actively using.
@@ -226,16 +252,96 @@ fn format_and_seed(plan: &ImagePlan, loop_dev: &str) -> io::Result<()> {
     let p1 = PathBuf::from(format!("{loop_dev}p1"));
     wait_for_path(&p1)?;
     run("mkfs.exfat", &mkfs_exfat_args(&p1, &plan.label))?;
+    seed_dirs_on_partition(plan, &p1)
+}
 
-    if !plan.seed_teslacam {
+/// Idempotently ensure `plan.seed_dirs` exist on an ALREADY-provisioned image
+/// without re-creating or reformatting it. Loop-mounts the existing single
+/// partition read-write, creates each missing seed directory, then unmounts.
+/// Non-destructive: never formats, never deletes, never touches file data.
+///
+/// Safe only while the gadget is DOWN and nothing else has the image mounted,
+/// so it refuses when either is not true:
+///   * the image is exported by a bound gadget (the #1 invariant — never touch
+///     the live car write path), or
+///   * the image is already attached to a loop device (e.g. the runtime
+///     read-only media mount) — a concurrent second RW mount of the same exFAT
+///     volume would corrupt it.
+///
+/// `gadgetd-provision` runs `Before=gadgetd.service`, so on a normal boot both
+/// conditions hold and this is the safe window to reconcile the folder set.
+///
+/// # Errors
+/// Returns an error if the image is in use, or if any loop/mount/mkdir/umount
+/// step fails. Errors propagate so a failed reconcile surfaces as a failed
+/// provision unit; gadgetd does not `Require` provisioning, so recording is
+/// never blocked by a media-folder problem.
+fn ensure_seed_dirs(plan: &ImagePlan) -> io::Result<()> {
+    if plan.seed_dirs.is_empty() {
         return Ok(());
     }
+    // #1-invariant guard: never RW-mount a backing file the car is using.
+    if crate::exec::image_is_exported(Path::new(crate::config::DEFAULT_CONFIGFS_ROOT), &plan.image)
+    {
+        return Err(io::Error::other(format!(
+            "refusing to reconcile folders on {}: it is exported by a bound gadget",
+            plan.image.display()
+        )));
+    }
+    // Guard against a concurrent loop attachment (e.g. the runtime read-only
+    // media mount): a second RW mount of the same exFAT volume can corrupt it.
+    if image_has_loop_device(&plan.image)? {
+        return Err(io::Error::other(format!(
+            "refusing to reconcile folders on {}: it is already attached to a loop device",
+            plan.image.display()
+        )));
+    }
 
-    // Ensure the TeslaCam directory exists on the TeslaCam image (the car needs
-    // it to record). A unique mountpoint avoids colliding with a concurrent or
-    // crashed run.
-    let mnt = std::env::temp_dir().join(format!("gadgetd-provision-{}", std::process::id()));
-    std::fs::create_dir_all(&mnt)?;
+    let loop_dev = run(
+        "losetup",
+        &[
+            "-fP".to_owned(),
+            "--show".to_owned(),
+            plan.image.to_string_lossy().into_owned(),
+        ],
+    )?;
+    let loop_dev = loop_dev.trim().to_owned();
+    let p1 = PathBuf::from(format!("{loop_dev}p1"));
+    let seeded = wait_for_path(&p1).and_then(|()| seed_dirs_on_partition(plan, &p1));
+    let detached = run("losetup", &["-d".to_owned(), loop_dev.clone()]);
+    seeded?;
+    detached?; // a leaked loop device must fail provisioning, not be ignored
+    Ok(())
+}
+
+/// `losetup -j <image>` lists the loop devices currently backing `image`; a
+/// non-empty listing means the image is already attached.
+fn image_has_loop_device(image: &Path) -> io::Result<bool> {
+    let listing = run(
+        "losetup",
+        &["-j".to_owned(), image.to_string_lossy().into_owned()],
+    )?;
+    Ok(!listing.trim().is_empty())
+}
+
+/// Mount the single partition `p1`, idempotently create each `plan.seed_dirs`
+/// entry, then unmount. Shared by fresh formatting and the existing-image
+/// reconcile. `create_dir_all` is a no-op when the directory already exists; if
+/// a NON-directory of the same name exists it errors, which we surface
+/// deliberately rather than silently masking a malformed volume.
+fn seed_dirs_on_partition(plan: &ImagePlan, p1: &Path) -> io::Result<()> {
+    if plan.seed_dirs.is_empty() {
+        return Ok(());
+    }
+    // Mount under the daemon's root-owned runtime root (see `SEED_MOUNT_ROOT`),
+    // never world-writable `/tmp`. The per-pid child is created with `create_dir`
+    // (not `create_dir_all`) so it fails closed if anything — including a planted
+    // symlink — is already there; a stale empty dir from a prior crashed run is
+    // cleared first. A unique mountpoint avoids colliding with a concurrent run.
+    std::fs::create_dir_all(SEED_MOUNT_ROOT)?;
+    let mnt = Path::new(SEED_MOUNT_ROOT).join(format!("mnt-{}", std::process::id()));
+    let _ = std::fs::remove_dir(&mnt);
+    std::fs::create_dir(&mnt)?;
     run(
         "mount",
         &[
@@ -245,7 +351,13 @@ fn format_and_seed(plan: &ImagePlan, loop_dev: &str) -> io::Result<()> {
             mnt.to_string_lossy().into_owned(),
         ],
     )?;
-    let seed = std::fs::create_dir_all(mnt.join("TeslaCam"));
+    let mut seed: io::Result<()> = Ok(());
+    for dir in plan.seed_dirs {
+        if let Err(e) = std::fs::create_dir_all(mnt.join(dir)) {
+            seed = Err(e);
+            break;
+        }
+    }
     let unmounted = run("umount", &[mnt.to_string_lossy().into_owned()]);
     let _ = std::fs::remove_dir(&mnt);
     seed?;
@@ -288,14 +400,26 @@ mod tests {
     fn teslacam_plan_labels_and_seeds() {
         let p = teslacam_plan();
         assert_eq!(p.label, "TESLACAM");
-        assert!(p.seed_teslacam, "the TeslaCam image must seed TeslaCam/");
+        assert_eq!(p.seed_dirs, &["TeslaCam"]);
+        assert!(
+            !p.reseed_existing,
+            "the car-owned TeslaCam image must stay strictly create-only-if-absent"
+        );
     }
 
     #[test]
-    fn media_plan_labels_and_does_not_seed() {
+    fn media_plan_seeds_media_feature_folders() {
         let p = media_plan();
         assert_eq!(p.label, "MEDIA");
-        assert!(!p.seed_teslacam, "the media image must not seed TeslaCam/");
+        assert_eq!(
+            p.seed_dirs,
+            &["Boombox", "Chimes", "LicensePlate", "LightShow", "Music", "Wraps"],
+            "media image must seed the exact Tesla media-feature folder names/casing"
+        );
+        assert!(
+            p.reseed_existing,
+            "the media image must reconcile its folders on an already-provisioned card"
+        );
     }
 
     #[test]

@@ -18,7 +18,12 @@ services.
 
 1. **Provision the backing image** (once / on first run): create `disk.img` of
    the configured size in the ext4 data area; lay out **MBR + 2 partitions**
-   (p1 TeslaCam exFAT, p2 media exFAT); format both exFAT.
+   (p1 TeslaCam exFAT, p2 media exFAT); format both exFAT. Seed the car-facing
+   `TeslaCam/` folder, and seed the media partition's Tesla media-feature folders
+   (`Boombox`, `Chimes`, `LicensePlate`, `LightShow`, `Music`, `Wraps`). The
+   TeslaCam image is otherwise strictly create-only-if-absent; the media image is
+   additionally reconciled idempotently on re-provision (missing folders are
+   re-created, non-destructively) so an older card self-heals.
 2. **Bring up the gadget** via configfs/libcomposite: one `usb_f_mass_storage`
    function with the image file as the LUN backing; bind to the UDC. Target
    **boot-to-gadget-ready < 8–10 s** (bring the gadget up before mounting heavier

@@ -6,8 +6,13 @@
 # Non-bootstrap modes (deploy-app/update/repair/rollback) must NEVER enable or
 # start this unit, so a fresh device can never be silently bootstrapped.
 #
-# `gadgetd provision` is idempotent and create-only-if-absent: if the image
-# already exists it is a no-op (the existing car data is left untouched). The
+# `gadgetd provision` is idempotent. For the TeslaCam image it is strictly
+# create-only-if-absent: if it already exists it is a no-op and the car's data
+# is never touched. For the media image it additionally reconciles the Tesla
+# media-feature folders (Boombox, Chimes, LicensePlate, LightShow, Music, Wraps)
+# on an already-existing image — a non-destructive, idempotent ensure that only
+# creates missing top-level directories (never formats, deletes, or disturbs
+# file data), so a card provisioned before those folders existed self-heals. The
 # image layout itself is owned wholly by the gadgetd binary; this unit only
 # delegates to it.
 #
@@ -26,7 +31,9 @@ Before=gadgetd.service
 Type=oneshot
 RemainAfterExit=yes
 # Delegate ALL image creation/layout to the gadgetd binary (the sole write-path
-# owner). create-only-if-absent: existing data is never disturbed.
+# owner). Create-only-if-absent for TeslaCam; for the media image also an
+# idempotent, non-destructive folder reconcile (existing files are never
+# disturbed).
 ExecStart=/usr/local/bin/gadgetd provision --image /data/teslausb/teslacam.img --media-image /data/teslausb/media.img --teslacam-mib 131072 --media-mib 1024
 
 [Install]
