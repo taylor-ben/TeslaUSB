@@ -120,6 +120,12 @@ function fmtClock(epochSec: number, clock: ClockPref): string {
   }
 }
 
+/** The tz to send to day-bucketing endpoints for a given clock preference. */
+function tzForClock(clock: ClockPref): string {
+  if (clock === "utc") return "UTC";
+  return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+}
+
 function humanizeType(type: string): string {
   return type
     .split("_")
@@ -175,6 +181,7 @@ export function TripMap() {
   const watchSeqRef = useRef(0);
   const watchAbortRef = useRef<AbortController | null>(null);
   const routeEventsByTripIdRef = useRef<Map<number, number[]>>(new Map());
+  const fetchedClockRef = useRef<ClockPref | null>(null);
 
   const [days, setDays] = useState<DaySummary[] | null>(null);
   const [dayIndex, setDayIndex] = useState(0);
@@ -324,17 +331,17 @@ export function TripMap() {
     const boot = new AbortController();
     (async () => {
       try {
-        const [dayList, settings] = await Promise.all([
-          api.days(boot.signal),
-          api.settings(boot.signal),
-        ]);
+        const settings = await api.settings(boot.signal);
         const pref = settings.find((p) => p.key === "speed_unit")?.value ?? "";
         const initialUnit: SpeedUnit = /kph|km/i.test(pref) ? "kph" : "mph";
         const clockPref = settings.find((p) => p.key === "clock")?.value;
+        const initialClock: ClockPref = clockPref === "utc" ? "utc" : "local";
         setUnit(initialUnit);
-        setClock(clockPref === "utc" ? "utc" : "local");
+        setClock(initialClock);
+        const dayList = await api.days(tzForClock(initialClock), boot.signal);
         setDays(dayList);
         setDayIndex(0);
+        fetchedClockRef.current = initialClock;
       } catch (err) {
         if (boot.signal.aborted) return;
         setError(errMessage(err));
@@ -350,11 +357,33 @@ export function TripMap() {
     };
   }, [onWatchEvent]);
 
+  // Re-bucket the day list when the clock preference flips (Local uses the
+  // browser tz, UTC uses UTC). Skips the initial mount fetch (done above) and
+  // resets to the newest day.
+  useEffect(() => {
+    if (fetchedClockRef.current === null) return;
+    if (fetchedClockRef.current === clock) return;
+    fetchedClockRef.current = clock;
+    const ac = new AbortController();
+    (async () => {
+      try {
+        const dayList = await api.days(tzForClock(clock), ac.signal);
+        setDays(dayList);
+        setDayIndex(0);
+      } catch (err) {
+        if (ac.signal.aborted) return;
+        setError(errMessage(err));
+      }
+    })();
+    return () => ac.abort();
+  }, [clock]);
+
   // ── Load the selected day whenever it changes. ──
   useEffect(() => {
     if (!currentDay) return;
     const seq = ++seqRef.current;
     const ac = new AbortController();
+    const tz = tzForClock(clock);
     watchAbortRef.current?.abort();
     watchAbortRef.current = null;
     routeEventsByTripIdRef.current = new Map();
@@ -362,7 +391,7 @@ export function TripMap() {
 
     (async () => {
       try {
-        const trips = await api.trips(currentDay.day, ac.signal);
+        const trips = await api.trips(currentDay.day, tz, ac.signal);
         // Per-trip detail (points + speed) and bounded on-route bubble events.
         const details = await Promise.all(
           trips.map((t) =>
@@ -378,7 +407,7 @@ export function TripMap() {
           ),
         );
         const standaloneEvents = await api
-          .events({ day: currentDay.day, limit: 5000 }, ac.signal)
+          .events({ day: currentDay.day, tz, limit: 5000 }, ac.signal)
           .then((p) => p.items)
           .catch(() => [] as EventItem[]);
         if (seq !== seqRef.current) return;
@@ -447,7 +476,7 @@ export function TripMap() {
     })();
 
     return () => ac.abort();
-  }, [currentDay?.day]);
+  }, [currentDay?.day, clock]);
 
   useEffect(() => {
     const ctrl = ctrlRef.current;

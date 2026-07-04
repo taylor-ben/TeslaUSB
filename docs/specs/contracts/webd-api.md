@@ -33,8 +33,13 @@ Binds:   5.1 (defines, contract-first) → 5.2–5.x (SPA screens fan out)
 - **Errors** use a uniform envelope: `{"error": {"code": "<machine>", "message":
   "<human>"}}` with appropriate HTTP status (`400` validation, `404` not found,
   `409` handoff refused/busy, `503` service unavailable, `507` storage exhausted).
-- **Times** are UTC epoch seconds (matching D1; unit conversion/civil-date display is
-  client-side — `spa.md §4` speed-unit toggle, day nav).
+- **Times** are UTC epoch seconds (matching D1). Civil-date **day bucketing** for the
+  map is computed **server-side** from an optional `tz` query param (IANA name, or
+  `UTC`) on `GET /api/days`, `/api/trips`, and `/api/events` (day mode): absent `tz`
+  buckets in **UTC** (backward compatible); a supplied `tz` buckets into that zone's
+  local civil days (DST-correct). Invalid/unknown `tz` ⇒ `400 invalid_timezone`. The
+  SPA sends the viewer's browser zone when its clock toggle is **Local**, `UTC` when
+  **UTC** (`spa.md §4` day nav); other unit conversion stays client-side.
 - **Units** unit-neutral on the wire (speed in m/s); the SPA converts per the
   speed-unit pref ([`spa.md §3`](../spa.md)).
 - **Validation is `webd`'s job**, before any handoff — path-traversal, file-type,
@@ -56,11 +61,11 @@ SQLite ([D1](./indexd-schema.md)).
 | Method · Route | Screen | Returns (shape sketch) | Reads |
 |---|---|---|---|
 | `GET /api/overview` | Home / media hub | counts, recent events, feature availability, health summary | D1 + service status |
-| `GET /api/days` | Trip map day-nav | `[{day, trip_count, event_count, distance_m}]` | `trips`, `events` |
-| `GET /api/trips?day=YYYY-MM-DD` | Trip map (day view) | `[{id, day, started_at, ended_at, bbox, distance_m, polyline|point_ref}]` — **day-scoped, non-paginated** (drives the map). | `trips`(+`trip_points`) |
+| `GET /api/days[?tz=]` | Trip map day-nav | `[{day, trip_count, event_count, distance_m}]` — day buckets in `tz` (IANA/`UTC`) when supplied, else UTC. | `trips`, `events` |
+| `GET /api/trips?day=YYYY-MM-DD[&tz=]` | Trip map (day view) | `[{id, day, started_at, ended_at, bbox, distance_m, polyline|point_ref}]` — **day-scoped, non-paginated** (drives the map); `day` is interpreted in `tz` (IANA/`UTC`) when supplied, else UTC. | `trips`(+`trip_points`) |
 | `GET /api/trips/page?cursor=&limit=` | Side-panel Trips browser | `Page<Trip>` — **global, newest-first, cursor-paginated** (§2.1.1). | `trips` |
 | `GET /api/trips/:id/route` | Trip map route | ordered points / simplified polyline | `trip_points` |
-| `GET /api/events?cursor=&limit=&trip=` | Event bubbles + side-panel Events browser | `Page<{id, type, severity, t, lat, lon, clip_id, front_frame_offset_ms, …}>` — **newest-first, cursor-paginated** (§2.1.1); optional `trip` filter (map's per-trip fetch). | `events` |
+| `GET /api/events?cursor=&limit=&trip=` (or `?day=YYYY-MM-DD&tz=`) | Event bubbles + side-panel Events browser | `Page<{id, type, severity, t, lat, lon, clip_id, front_frame_offset_ms, …}>` — **newest-first, cursor-paginated** (§2.1.1); optional `trip` filter (map's per-trip fetch), or `day`(+optional `tz`) mode returning that local day's standalone pinned events. | `events` |
 | `GET /api/events/:id` | Event player deep-link (`/events?event=<id>`) | A single event — the **same item shape** as one element of `GET /api/events` — or `404` when no such event exists. Point lookup (no cursor/snapshot): lets the player resolve a deep-linked `?event=<id>` that falls **outside** the loaded newest-N window without paginating the whole catalog. Read-only. | `events` |
 | `GET /api/clips?cursor=&limit=&folder_class=` | All-clips browser | `Page<{id, started_at, folder_class, is_sentry, duration_s, availability, angles:[camera]}>` — **newest-first, cursor-paginated** (§2.1.1); optional `folder_class` filter. | `clips`,`angles` |
 | `GET /api/clips/:id` | Event player | clip + its angle set + linked event/jump-offset (`front_frame_offset_ms`) | `clips`,`angles`,`events` |

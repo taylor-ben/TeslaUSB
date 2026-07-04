@@ -24,6 +24,7 @@ use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::{Stream, StreamExt};
 use tower_http::services::{ServeDir, ServeFile};
 
+use crate::daybucket::{local_day_bounds, parse_tz};
 use crate::dto::{
     AnalyticsDto, ClipDto, DaySummary, EventDto, Page, PrefDto, TripDetailDto, TripDto,
 };
@@ -175,6 +176,8 @@ where
 struct TripsQuery {
     /// Optional civil-day filter (`YYYY-MM-DD`).
     day: Option<String>,
+    /// Optional day-bucketing timezone (`UTC` or IANA name).
+    tz: Option<String>,
 }
 
 /// Query parameters for cursor-paginated `GET /api/events`.
@@ -189,6 +192,15 @@ struct EventsQuery {
     /// Optional civil-day (YYYY-MM-DD) filter that returns standalone pinned
     /// events (`trip_id` NULL) for that day, unpaginated.
     day: Option<String>,
+    /// Optional day-bucketing timezone (`UTC` or IANA name).
+    tz: Option<String>,
+}
+
+/// Query parameters for `GET /api/days`.
+#[derive(Deserialize)]
+struct DaysQuery {
+    /// Optional day-bucketing timezone (`UTC` or IANA name).
+    tz: Option<String>,
 }
 
 /// Query parameters for cursor-paginated `GET /api/clips`.
@@ -211,8 +223,16 @@ struct TripsPageQuery {
     limit: Option<i64>,
 }
 
-async fn days(State(state): State<AppState>) -> Result<Json<Vec<DaySummary>>, ApiError> {
-    let out = read(state.catalog, query::list_days).await?;
+async fn days(
+    State(state): State<AppState>,
+    Query(q): Query<DaysQuery>,
+) -> Result<Json<Vec<DaySummary>>, ApiError> {
+    let out = if let Some(tz_name) = q.tz {
+        let tz = parse_tz(&tz_name)?;
+        read(state.catalog, move |conn| query::list_days_tz(conn, &tz)).await?
+    } else {
+        read(state.catalog, query::list_days).await?
+    };
     Ok(Json(out))
 }
 
@@ -220,10 +240,26 @@ async fn trips(
     State(state): State<AppState>,
     Query(q): Query<TripsQuery>,
 ) -> Result<Json<Vec<TripDto>>, ApiError> {
-    let out = read(state.catalog, move |conn| {
-        query::list_trips(conn, q.day.as_deref())
-    })
-    .await?;
+    let out = match (q.tz, q.day) {
+        (Some(tz_name), Some(day)) => {
+            let tz = parse_tz(&tz_name)?;
+            let (lo, hi) = local_day_bounds(&day, &tz)?;
+            read(state.catalog, move |conn| {
+                query::list_trips_tz(conn, lo, hi)
+            })
+            .await?
+        }
+        (Some(tz_name), None) => {
+            let _tz = parse_tz(&tz_name)?;
+            read(state.catalog, move |conn| query::list_trips(conn, None)).await?
+        }
+        (None, day) => {
+            read(state.catalog, move |conn| {
+                query::list_trips(conn, day.as_deref())
+            })
+            .await?
+        }
+    };
     Ok(Json(out))
 }
 
@@ -278,6 +314,12 @@ async fn events(
 ) -> Result<Json<Page<EventDto>>, ApiError> {
     let day = q.day;
     let trip = q.trip;
+    // Validate tz in every mode (day, trip, keyset) so an invalid tz never
+    // silently no-ops; absent tz keeps the exact prior UTC behavior.
+    let tz = match q.tz {
+        Some(name) => Some(parse_tz(&name)?),
+        None => None,
+    };
     if let Some(day) = day {
         if trip.is_some() {
             return Err(ApiError::bad_request(
@@ -294,10 +336,18 @@ async fn events(
         // Day mode is unpaginated map hydration: it honours an explicit `limit`
         // but caps at DAY_EVENTS_LIMIT, independent of the keyset `MAX_LIMIT`.
         let day_limit = validate_day_limit(q.limit)?;
-        let items = read(state.catalog, move |conn| {
-            query::list_standalone_day_events(conn, &day, day_limit)
-        })
-        .await?;
+        let items = if let Some(tz) = tz {
+            let (lo, hi) = local_day_bounds(&day, &tz)?;
+            read(state.catalog, move |conn| {
+                query::list_standalone_day_events_range(conn, lo, hi, day_limit)
+            })
+            .await?
+        } else {
+            read(state.catalog, move |conn| {
+                query::list_standalone_day_events(conn, &day, day_limit)
+            })
+            .await?
+        };
         return Ok(Json(Page {
             items,
             next_cursor: None,

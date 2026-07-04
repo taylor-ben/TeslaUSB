@@ -198,10 +198,11 @@ export interface ChimeHandoffResult {
 export const CHIME_MAX_BYTES = 1024 * 1024;
 
 export const api = {
-  days: (signal?: AbortSignal) => getJson<DaySummary[]>("/api/days", signal),
+  days: (tz?: string, signal?: AbortSignal) =>
+    getJson<DaySummary[]>(`/api/days${qs({ tz })}`, signal),
 
-  trips: (day?: string, signal?: AbortSignal) =>
-    getJson<Trip[]>(`/api/trips${qs({ day })}`, signal),
+  trips: (day?: string, tz?: string, signal?: AbortSignal) =>
+    getJson<Trip[]>(`/api/trips${qs({ day, tz })}`, signal),
 
   tripsPage: (params: TripsPageParams = {}, signal?: AbortSignal) =>
     getJson<Page<Trip>>(`/api/trips/page${qs({ ...params })}`, signal),

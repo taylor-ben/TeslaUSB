@@ -29,17 +29,21 @@ pub(crate) struct Page<T> {
     pub limit: i64,
 }
 
-/// One entry in `GET /api/days`: a civil day that has driving trips, with
-/// rolled-up counts. `day` is `trips.day` (UTC civil date — the only stable
-/// civil date on the RTC-less Pi). `event_count` counts events linked to trips
-/// on that day; trip-less sentry events are not attributed to a day here.
+/// One entry in `GET /api/days`: a civil day that has driving trips or
+/// standalone pinned events, with rolled-up counts. `day` is the UTC civil
+/// date by default (the stable civil date on the RTC-less Pi), or the
+/// requested `tz` civil day when `tz` is supplied. `event_count` counts
+/// trip-linked events (on their trip's day) plus standalone pinned events
+/// (trip_id NULL with GPS, on the event's own day).
 #[derive(Debug, Serialize)]
 pub(crate) struct DaySummary {
-    /// `trips.day` (`YYYY-MM-DD`).
+    /// Day bucket key (`YYYY-MM-DD`): UTC by default, or the requested `tz`
+    /// civil day when `tz` is supplied to `GET /api/days`.
     pub day: String,
     /// Number of trips on this day (`COUNT(trips)`).
     pub trip_count: i64,
-    /// Number of events linked to trips on this day.
+    /// Number of events attributed to this day: trip-linked events (on their
+    /// trip's day) plus standalone pinned events (on the event's own day).
     pub event_count: i64,
     /// Total distance on this day (`SUM(trips.distance_m)`), metres.
     pub distance_m: f64,
@@ -64,7 +68,8 @@ pub(crate) struct Bbox {
 pub(crate) struct TripDto {
     /// `trips.id`.
     pub id: i64,
-    /// `trips.day` (`YYYY-MM-DD`).
+    /// `trips.day` (`YYYY-MM-DD`): UTC fallback value, and when `tz` day
+    /// filters are used this still carries the stored UTC trip day.
     pub day: String,
     /// `trips.started_at`, UTC epoch seconds.
     pub started_at: i64,

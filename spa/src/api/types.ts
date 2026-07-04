@@ -87,6 +87,8 @@ export interface EventsParams {
   trip?: number;
   /** Civil day (`YYYY-MM-DD`) for standalone pinned events. */
   day?: string;
+  /** Day-bucketing timezone (IANA name or "UTC"); only meaningful with day. */
+  tz?: string;
 }
 
 export interface Angle {

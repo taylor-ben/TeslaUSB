@@ -102,7 +102,7 @@ CREATE TABLE angles (
 -- ── trips: per-day driving segments ──────────────────────────────────
 CREATE TABLE trips (
     id           INTEGER PRIMARY KEY,
-    day          TEXT    NOT NULL,          -- local civil date 'YYYY-MM-DD' (UI day-nav key)
+    day          TEXT    NOT NULL,          -- UTC civil date 'YYYY-MM-DD' (indexd fallback bucket; NOT the sole UI day authority — webd re-buckets by client tz per D2)
     started_at   INTEGER NOT NULL,
     ended_at     INTEGER NOT NULL,
     bbox_min_lat REAL, bbox_min_lon REAL,

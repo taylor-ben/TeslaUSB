@@ -35,6 +35,7 @@ mod chime_enforcer;
 mod chime_library;
 mod chime_scheduler;
 mod chimes;
+mod daybucket;
 mod dto;
 mod error;
 mod gadget;

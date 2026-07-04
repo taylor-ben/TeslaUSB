@@ -4,12 +4,14 @@
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
+use crate::daybucket::civil_day;
 use crate::dto::{
     AnalyticsDto, AngleDto, Bbox, ClipDto, DaySummary, DayTripCount, EventDto, EventTypeCount,
     FolderClassStat, InstalledChimeDto, MediaItemDto, PrefDto, SeverityCount, TripDetailDto,
     TripDto, TripPointDto, VideoStats,
 };
 use crate::polyline;
+use jiff::tz::TimeZone;
 
 /// `trips` column list shared by the list/detail queries (column order is
 /// relied on by [`map_trip`]).
@@ -107,6 +109,67 @@ pub(crate) fn list_days(conn: &Connection) -> Result<Vec<DaySummary>, rusqlite::
     Ok(out)
 }
 
+/// `GET /api/days?tz=...`: timezone-aware day rollups computed in Rust.
+pub(crate) fn list_days_tz(
+    conn: &Connection,
+    tz: &TimeZone,
+) -> Result<Vec<DaySummary>, rusqlite::Error> {
+    use std::collections::BTreeMap;
+
+    let mut by_day: BTreeMap<String, DaySummary> = BTreeMap::new();
+
+    let mut trip_stmt = conn.prepare("SELECT started_at, distance_m FROM trips")?;
+    let trip_rows = trip_stmt.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, Option<f64>>(1)?))
+    })?;
+    for row in trip_rows {
+        let (started_at, distance_m) = row?;
+        let day = civil_day(started_at, tz);
+        let summary = by_day.entry(day.clone()).or_insert_with(|| DaySummary {
+            day,
+            trip_count: 0,
+            event_count: 0,
+            distance_m: 0.0,
+        });
+        summary.trip_count += 1;
+        summary.distance_m += distance_m.unwrap_or(0.0);
+    }
+
+    let mut trip_event_stmt =
+        conn.prepare("SELECT t.started_at FROM events e JOIN trips t ON e.trip_id = t.id")?;
+    let trip_event_rows = trip_event_stmt.query_map([], |row| row.get::<_, i64>(0))?;
+    for row in trip_event_rows {
+        let day = civil_day(row?, tz);
+        let summary = by_day.entry(day.clone()).or_insert_with(|| DaySummary {
+            day,
+            trip_count: 0,
+            event_count: 0,
+            distance_m: 0.0,
+        });
+        summary.event_count += 1;
+    }
+
+    let mut standalone_stmt = conn.prepare(
+        "SELECT t FROM events \
+         WHERE trip_id IS NULL AND lat IS NOT NULL AND lon IS NOT NULL",
+    )?;
+    let standalone_rows = standalone_stmt.query_map([], |row| row.get::<_, i64>(0))?;
+    for row in standalone_rows {
+        let day = civil_day(row?, tz);
+        let summary = by_day.entry(day.clone()).or_insert_with(|| DaySummary {
+            day,
+            trip_count: 0,
+            event_count: 0,
+            distance_m: 0.0,
+        });
+        summary.event_count += 1;
+    }
+
+    let mut out = by_day.into_values().collect::<Vec<_>>();
+    out.reverse();
+    Ok(out)
+}
+
 /// `GET /api/trips[?day=]`: trip rows with bbox + decoded cached polyline.
 pub(crate) fn list_trips(
     conn: &Connection,
@@ -127,6 +190,20 @@ pub(crate) fn list_trips(
             .collect::<Result<Vec<_>, _>>()?;
         Ok(out)
     }
+}
+
+/// `GET /api/trips?day=...&tz=...`: day-filtered trips by UTC range.
+pub(crate) fn list_trips_tz(
+    conn: &Connection,
+    lo: i64,
+    hi: i64,
+) -> Result<Vec<TripDto>, rusqlite::Error> {
+    let sql = format!(
+        "{TRIP_COLS} WHERE started_at >= ?1 AND started_at < ?2 ORDER BY started_at DESC, id DESC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    stmt.query_map(params![lo, hi], map_trip)?
+        .collect::<Result<Vec<_>, _>>()
 }
 
 /// `GET /api/trips/page`: newest-first keyset page over the whole trip catalog.
@@ -260,6 +337,23 @@ pub(crate) fn list_standalone_day_events(
     );
     let mut stmt = conn.prepare(&sql)?;
     stmt.query_map(params![day, limit], map_event)?
+        .collect::<Result<Vec<_>, _>>()
+}
+
+/// `GET /api/events?day=...&tz=...`: standalone parked pins in `[lo, hi)`.
+pub(crate) fn list_standalone_day_events_range(
+    conn: &Connection,
+    lo: i64,
+    hi: i64,
+    limit: i64,
+) -> Result<Vec<EventDto>, rusqlite::Error> {
+    let sql = format!(
+        "{EVENT_COLS} WHERE trip_id IS NULL AND lat IS NOT NULL AND lon IS NOT NULL \
+         AND t >= ?1 AND t < ?2 \
+         ORDER BY t DESC, id DESC LIMIT ?3"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    stmt.query_map(params![lo, hi, limit], map_event)?
         .collect::<Result<Vec<_>, _>>()
 }
 
@@ -877,11 +971,15 @@ pub(crate) fn list_wraps(conn: &Connection) -> Result<Vec<MediaItemDto>, rusqlit
 
 #[cfg(test)]
 mod tests {
+    use jiff::Timestamp;
     use rusqlite::{Connection, params};
+
+    use crate::daybucket::{local_day_bounds, parse_tz};
 
     use super::{
         Keyset, SnapshotResource, get_clip, list_chime_library, list_clips, list_days,
-        list_standalone_day_events, snapshot_max_id,
+        list_days_tz, list_standalone_day_events, list_standalone_day_events_range, list_trips,
+        list_trips_tz, snapshot_max_id,
     };
 
     fn seed_media_rows(conn: &Connection, rows: &[(&str, &str, &str, i64)]) {
@@ -938,6 +1036,29 @@ mod tests {
             params![id, day, started_at, started_at + 60, distance_m],
         )
         .unwrap();
+    }
+
+    fn insert_event(
+        conn: &Connection,
+        id: i64,
+        event_type: &str,
+        t: i64,
+        lat: Option<f64>,
+        lon: Option<f64>,
+        trip_id: Option<i64>,
+        description: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO events \
+                (id, type, severity, t, lat, lon, clip_id, trip_id, front_frame_index, front_frame_offset, description, created_at) \
+             VALUES (?1, ?2, 1, ?3, ?4, ?5, NULL, ?6, NULL, NULL, ?7, ?3)",
+            params![id, event_type, t, lat, lon, trip_id, description],
+        )
+        .unwrap();
+    }
+
+    fn epoch(instant: &str) -> i64 {
+        instant.parse::<Timestamp>().unwrap().as_second()
     }
 
     #[test]
@@ -1103,5 +1224,128 @@ mod tests {
         let events = list_standalone_day_events(&conn, "1970-01-04", 5_000).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].id, 10);
+    }
+
+    #[test]
+    fn list_days_tz_buckets_boundary_rows_and_keeps_parked_only_days() {
+        let conn = test_conn();
+        let ny = parse_tz("America/New_York").unwrap();
+        let utc = parse_tz("UTC").unwrap();
+
+        insert_trip(&conn, 1, "2026-07-04", epoch("2026-07-04T01:00:00Z"), 111.0);
+        insert_trip(&conn, 2, "2026-07-04", epoch("2026-07-04T15:00:00Z"), 222.0);
+        insert_event(
+            &conn,
+            100,
+            "hard_brake",
+            epoch("2026-07-05T02:00:00Z"),
+            Some(47.0),
+            Some(-122.0),
+            Some(1),
+            "trip-linked late event",
+        );
+        insert_event(
+            &conn,
+            101,
+            "sentry",
+            epoch("2026-07-04T01:30:00Z"),
+            Some(47.1),
+            Some(-122.1),
+            None,
+            "boundary standalone pin",
+        );
+        insert_event(
+            &conn,
+            102,
+            "saved",
+            epoch("2026-07-06T12:00:00Z"),
+            Some(47.2),
+            Some(-122.2),
+            None,
+            "parked only day pin",
+        );
+
+        let days_utc = list_days_tz(&conn, &utc).unwrap();
+        let day_utc = days_utc
+            .iter()
+            .find(|item| item.day == "2026-07-04")
+            .unwrap();
+        assert_eq!(day_utc.trip_count, 2);
+        assert_eq!(day_utc.event_count, 2);
+        assert_eq!(day_utc.distance_m, 333.0);
+
+        let days_ny = list_days_tz(&conn, &ny).unwrap();
+        let day_ny = days_ny
+            .iter()
+            .find(|item| item.day == "2026-07-03")
+            .unwrap();
+        assert_eq!(day_ny.trip_count, 1);
+        assert_eq!(day_ny.event_count, 2);
+        assert_eq!(day_ny.distance_m, 111.0);
+
+        let parked_only = days_ny
+            .iter()
+            .find(|item| item.day == "2026-07-06")
+            .unwrap();
+        assert_eq!(parked_only.trip_count, 0);
+        assert_eq!(parked_only.event_count, 1);
+    }
+
+    #[test]
+    fn list_trips_tz_filters_by_local_day_range_and_utc_path_is_unchanged() {
+        let conn = test_conn();
+        let ny = parse_tz("America/New_York").unwrap();
+        insert_trip(&conn, 1, "2026-07-04", epoch("2026-07-04T01:00:00Z"), 11.0);
+        insert_trip(&conn, 2, "2026-07-04", epoch("2026-07-04T15:00:00Z"), 22.0);
+
+        let (lo_0703, hi_0703) = local_day_bounds("2026-07-03", &ny).unwrap();
+        let trips_0703 = list_trips_tz(&conn, lo_0703, hi_0703).unwrap();
+        assert_eq!(trips_0703.len(), 1);
+        assert_eq!(trips_0703[0].id, 1);
+
+        let (lo_0704, hi_0704) = local_day_bounds("2026-07-04", &ny).unwrap();
+        let trips_0704 = list_trips_tz(&conn, lo_0704, hi_0704).unwrap();
+        assert_eq!(trips_0704.len(), 1);
+        assert_eq!(trips_0704[0].id, 2);
+
+        let utc_path = list_trips(&conn, Some("2026-07-04")).unwrap();
+        assert_eq!(
+            utc_path.iter().map(|trip| trip.id).collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+    }
+
+    #[test]
+    fn list_standalone_day_events_range_uses_epoch_bounds() {
+        let conn = test_conn();
+        let ny = parse_tz("America/New_York").unwrap();
+
+        insert_event(
+            &conn,
+            200,
+            "saved",
+            epoch("2026-07-04T01:30:00Z"),
+            Some(47.0),
+            Some(-122.0),
+            None,
+            "in range",
+        );
+        insert_event(
+            &conn,
+            201,
+            "saved",
+            epoch("2026-07-04T04:30:00Z"),
+            Some(47.1),
+            Some(-122.1),
+            None,
+            "out of range",
+        );
+
+        let (lo, hi) = local_day_bounds("2026-07-03", &ny).unwrap();
+        let events = list_standalone_day_events_range(&conn, lo, hi, 5_000).unwrap();
+        assert_eq!(
+            events.iter().map(|event| event.id).collect::<Vec<_>>(),
+            vec![200]
+        );
     }
 }

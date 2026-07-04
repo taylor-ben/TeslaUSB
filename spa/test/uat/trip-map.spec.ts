@@ -4,6 +4,8 @@ import type { Page } from "@playwright/test";
 import { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
+test.use({ timezoneId: "UTC" });
+
 // ── Task 5.3 UAT gate (spa.md §5/§6) ──────────────────────────────────────
 // Drives the REAL bundle served by webd against the seeded read-only catalog
 // (global-setup). The trip map is the new HOME route `/`; the 5.2 media hub
@@ -1221,6 +1223,166 @@ test.describe("trip map UAT", () => {
     });
   });
 
+  test.describe("timezone day bucketing", () => {
+    test.use({ timezoneId: "America/New_York" });
+
+    let dayTzRequests: (string | null)[] = [];
+
+    test.beforeEach(async ({ page }) => {
+      dayTzRequests = [];
+      const settings = new Map<string, string>([
+        ["clock", "local"],
+        ["speed_unit", "mph"],
+      ]);
+
+      await page.route("**/api/settings", async (route) => {
+        const req = route.request();
+        if (req.method() === "PUT") {
+          const body = JSON.parse(req.postData() || "{}") as { key?: string; value?: string };
+          if (body.key && body.value) settings.set(body.key, body.value);
+          await route.fulfill({
+            status: 200,
+            contentType: "application/json",
+            body: JSON.stringify({ key: body.key, value: body.value }),
+          });
+          return;
+        }
+        if (req.method() === "GET") {
+          await route.fulfill({
+            status: 200,
+            contentType: "application/json",
+            body: JSON.stringify(
+              [...settings].map(([key, value]) => ({ key, value })),
+            ),
+          });
+          return;
+        }
+        await route.continue();
+      });
+
+      await page.route("**/api/days**", async (route) => {
+        if (route.request().method() !== "GET") {
+          await route.continue();
+          return;
+        }
+        const url = new URL(route.request().url());
+        dayTzRequests.push(url.searchParams.get("tz"));
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify([
+            { day: "2024-06-01", trip_count: 1, event_count: 0, distance_m: 12000 },
+            { day: "2024-05-31", trip_count: 1, event_count: 0, distance_m: 9000 },
+          ]),
+        });
+      });
+
+      await page.route("**/api/trips**", async (route) => {
+        const req = route.request();
+        if (req.method() !== "GET") {
+          await route.continue();
+          return;
+        }
+        const url = new URL(req.url());
+        if (url.pathname === "/api/trips") {
+          await route.fulfill({
+            status: 200,
+            contentType: "application/json",
+            body: JSON.stringify([
+              {
+                id: 101,
+                day: url.searchParams.get("day") || "2024-06-01",
+                started_at: 1717243200,
+                ended_at: 1717243800,
+                bbox: null,
+                distance_m: 12000,
+                point_count: 2,
+                polyline: [],
+              },
+            ]),
+          });
+          return;
+        }
+        if (/^\/api\/trips\/\d+$/.test(url.pathname)) {
+          await route.fulfill({
+            status: 200,
+            contentType: "application/json",
+            body: JSON.stringify({
+              id: 101,
+              day: "2024-06-01",
+              started_at: 1717243200,
+              ended_at: 1717243800,
+              bbox: null,
+              distance_m: 12000,
+              point_count: 2,
+              polyline: [],
+              points: [
+                { t: 1717243200, lat: 40.715, lon: -74.006, speed: 10, heading: 45 },
+                { t: 1717243500, lat: 40.72, lon: -74.0, speed: 12, heading: 50 },
+              ],
+            }),
+          });
+          return;
+        }
+        await route.continue();
+      });
+
+      await page.route("**/api/events**", async (route) => {
+        if (route.request().method() !== "GET") {
+          await route.continue();
+          return;
+        }
+        const url = new URL(route.request().url());
+        const limit = Number(url.searchParams.get("limit") || "5000");
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({ items: [], next_cursor: null, limit }),
+        });
+      });
+
+      await page.route("**/api/clips**", async (route) => {
+        if (route.request().method() !== "GET") {
+          await route.continue();
+          return;
+        }
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({ items: [], next_cursor: null, limit: 25 }),
+        });
+      });
+    });
+
+    test("sends browser tz for local clock and refetches day buckets on toggle", async ({
+      page,
+    }) => {
+      await gotoMap(page);
+      await expect
+        .poll(() => dayTzRequests.length)
+        .toBeGreaterThanOrEqual(1);
+      expect(dayTzRequests[0]).toBe("America/New_York");
+
+      // The clock toggle lives in the display-preferences panel; open it first.
+      await page.locator("#btnDisplayPrefs").click();
+      await expect(page.locator("#displayPanel")).toBeVisible();
+
+      await page.locator("#clockUtc").click();
+      await expect(page.locator("#clockUtc")).toHaveAttribute("aria-pressed", "true");
+      await expect
+        .poll(() => dayTzRequests.length)
+        .toBeGreaterThanOrEqual(2);
+      expect(dayTzRequests[dayTzRequests.length - 1]).toBe("UTC");
+
+      await page.locator("#clockLocal").click();
+      await expect(page.locator("#clockLocal")).toHaveAttribute("aria-pressed", "true");
+      await expect
+        .poll(() => dayTzRequests.length)
+        .toBeGreaterThanOrEqual(3);
+      expect(dayTzRequests[dayTzRequests.length - 1]).toBe("America/New_York");
+    });
+  });
+
   // ── Gate 5: wiring proof — the served HTML runs the freshly-built bundle ─
   test("wiring — served HTML runs the built bundle and Leaflet initialised", async ({
     page,
@@ -1586,7 +1748,7 @@ test.describe("trip map UAT", () => {
   test("map→video — marker watch-link ignores stale opens from rapid click and day change", async ({
     page,
   }) => {
-    await page.route("**/api/days", async (route) => {
+    await page.route("**/api/days**", async (route) => {
       const req = route.request();
       if (req.method() !== "GET") {
         await route.continue();
@@ -1601,7 +1763,7 @@ test.describe("trip map UAT", () => {
         ]),
       });
     });
-    await page.route("**/api/trips?day=2024-05-31", async (route) => {
+    await page.route("**/api/trips?day=2024-05-31**", async (route) => {
       const req = route.request();
       if (req.method() !== "GET") {
         await route.continue();
@@ -2175,7 +2337,7 @@ test.describe("trip map UAT", () => {
     const PIN_LON = -122.414;
 
     // /api/days: newest driving day (real seed) + an older purely-parked day.
-    await page.route("**/api/days", async (route) => {
+    await page.route("**/api/days**", async (route) => {
       if (route.request().method() !== "GET") {
         await route.continue();
         return;
@@ -2190,7 +2352,7 @@ test.describe("trip map UAT", () => {
       });
     });
     // The parked day has zero trips → empty route set.
-    await page.route(`**/api/trips?day=${PARKED_DAY}`, async (route) => {
+    await page.route(`**/api/trips?day=${PARKED_DAY}**`, async (route) => {
       if (route.request().method() !== "GET") {
         await route.continue();
         return;
