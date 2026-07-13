@@ -145,6 +145,5 @@ test.describe("webd catalog client", () => {
     expect(map.get("speed_limit_mph")).toBe("75");
     expect(map.get("trip_gap_minutes")).toBe("15");
     expect(map.get("display_timezone")).toBe("America/Los_Angeles");
-    expect(map.get("samba_enabled")).toBe("true");
   });
 });

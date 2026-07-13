@@ -202,7 +202,7 @@ A companion `uninstall.sh`:
 
 - Services run as the unprivileged `teslausb` account **where possible**;
   `gadgetd` and `wifid` need privilege for `configfs`/netlink and secret access.
-- **Secrets** (cloud OAuth/rclone tokens, WiFi PSK + AP passphrase, Samba creds)
+- **Secrets** (cloud OAuth/rclone tokens, WiFi PSK + AP passphrase)
   are stored **`0600` root-owned** and delivered to the owning service via systemd
   **`LoadCredential=`** — this preserves the [`SPEC.md` §7](./SPEC.md) /
   [`wifid.md` §2](./wifid.md) "root-only `0600`" rule **and** lets a non-root

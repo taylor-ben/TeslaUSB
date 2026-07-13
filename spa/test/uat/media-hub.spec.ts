@@ -34,7 +34,6 @@ const SECTION_ORDER = [
   "Access Point",
   "Storage & Auto-Cleanup",
   "Mapping & Indexing",
-  "Network File Sharing",
   "Storage Health",
   "System",
 ];
@@ -186,8 +185,8 @@ test.describe("settings dashboard UAT", () => {
     await expect(
       sh.locator("#system-health-overall .health-dot.health-dot-ok"),
     ).toBeVisible();
-    // 10 subsystem rows × 3 grid cells = 30 direct children.
-    await expect(page.locator("#system-health-rows > div")).toHaveCount(30);
+    // 9 subsystem rows × 3 grid cells = 27 direct children.
+    await expect(page.locator("#system-health-rows > div")).toHaveCount(27);
     const shText = await page.locator("#system-health-rows").innerText();
     expect(shText).toContain("USB Gadget");
     expect(shText).toContain("USB gadget configured (attached)"); // probe message
@@ -198,8 +197,8 @@ test.describe("settings dashboard UAT", () => {
     // Video Indexer carries REAL catalog data in the baseline's exact phrasing.
     expect(shText).toMatch(/\d+ clips indexed; newest is \d+ d old/);
     expect(shText).not.toContain("Indexer healthy");
-    // The five unprobed subsystems degrade to "—" — none is fabricated.
-    expect((shText.match(/—/g) ?? []).length).toBe(5);
+    // The four unprobed subsystems degrade to "—" — none is fabricated.
+    expect((shText.match(/—/g) ?? []).length).toBe(4);
     const indexerLabel = sh.locator("#system-health-rows > div", {
       hasText: "Video Indexer",
     });
@@ -303,7 +302,6 @@ test.describe("settings dashboard UAT", () => {
     await expect(page.locator("#mapping-display-timezone")).toHaveValue(
       "America/Los_Angeles",
     );
-    await expect(page.locator("#samba_enabled")).toBeChecked();
 
     // Section order + count — exact parity with the captured dashboard.
     const summaries = page.locator("details.settings-section > summary");
@@ -550,7 +548,6 @@ test.describe("settings dashboard UAT", () => {
 
     const urlBefore = page.url();
     await page.locator("#mapping-speed-limit").press("Enter");
-    await page.locator("#samba_password").press("Enter");
     // Settle: let any (errant) delayed/debounced submit fetch reach the wire
     // before we assert the read-only invariant.
     await page.waitForLoadState("networkidle");
@@ -565,8 +562,8 @@ test.describe("settings dashboard UAT", () => {
     );
     expect(mutating, `mutating request(s): ${JSON.stringify(mutating)}`).toEqual([]);
 
-    // The Save buttons are disabled (cannot be the source of a mutation).
-    await expect(page.locator("form button[disabled]")).toHaveCount(2);
+    // The Save button is disabled (cannot be the source of a mutation).
+    await expect(page.locator("form button[disabled]")).toHaveCount(1);
   });
 
   // ── Gate 3 (console + network): zero warnings/errors/pageerror, no failures ─

@@ -1,5 +1,78 @@
 # TeslaUSB B-1 — Build Status (vs. `Requirements.md`)
 
+> ## ⏯️ RESUME HERE (2026-07-04) — server-side SEI telemetry HUD endpoint BUILT + unit-tested (340 webd, 0 fail); NOT deployed / NOT Playwright / NOT live-verified
+>
+> **Operator symptom:** the map route-click overlay HUD (Slice 3, §4.1) "is not
+> positioned correctly and I don't think it is working." Slice 3 was previously
+> ticked, but only ever exercised with the **UAT fixture** — on **real clips** the
+> HUD was dead + mispositioned. Empirical diagnosis found **two bugs + one data
+> caveat**:
+> - **Dead on real data:** `spa/src/player/hud-controller.ts` `loadTelemetry` re-
+>   downloaded the **entire 54–79 MB MP4 a second time** to parse SEI client-side.
+>   Over the ~0.78 MB/s in-car link that's ~97 s → telemetry never appeared.
+> - **Mispositioned:** map overlay's `.overlay-hud` (`position:absolute; bottom:8px`)
+>   sat on top of the native `<video controls>` scrubber → collision. EventPlayer's
+>   top-center `.tesla-hud` card is the correct parity target.
+> - **Caveat:** many driving clips genuinely have **NO SEI** (baked into the raw
+>   Tesla files; archive copies byte-verbatim) → those can never show a HUD → need a
+>   graceful empty state, not a broken one.
+>
+> ### Fix — FULL PARITY (operator-approved), server-side parse. BUILT, NOT DEPLOYED.
+> New `webd` endpoint parses SEI **on the Pi** via the tested Rust driver and returns
+> **KB of JSON** instead of the SPA re-downloading MB:
+> - **`GET /api/clips/{id}/telemetry?camera=front`** → `200` **bare JSON array** of
+>   `TelemetrySample` (camelCase, drop-in for the existing `parseSeiTelemetry()`
+>   pipeline). Empty `[]` for non-archive angle / no-SEI / read-fail / oversize;
+>   `404` unknown clip/camera. **Archive-only** (never touches the live USB image →
+>   no recording-path IO). Safety: `static Semaphore(1)` serializes parses (only one
+>   ~80 MB buffer alive at a time → protects recording), 256 MiB size cap,
+>   `spawn_blocking` off the async runtime, NaN/Inf sanitized (serde_json can't
+>   serialize them). Reuses `scannerd::seiwalk::walk_clip_waypoints(&bytes, 1)` (all
+>   HUD fields: gear/speed/steering/blinkers/brake/throttle/autopilot).
+> - **SPA rewire:** `hud-controller.ts` `loadTelemetry(url)` now fetches the JSON
+>   endpoint (not the MP4); `client.ts` adds `telemetryUrl`/`clipTelemetry`;
+>   `MapVideoOverlay.tsx` + `EventPlayer.tsx` pass the telemetry URL; empty-state
+>   toggles `hud-empty` + a "No telemetry" note.
+> - **CSS reposition:** `mapping.css` `.overlay-hud` moved to a top-center card +
+>   `pointer-events:none` + empty-state styling (was the `bottom:8px` collision).
+> - Contract documented in `docs/specs/contracts/webd-api.md`.
+>
+> ### Verified so far
+> - `tsc --noEmit` + `npm run build` clean.
+> - **`cargo test -p webd` (podman, warm volumes) → 340 passed / 0 failed**, incl. 4
+>   new telemetry tests (unknown-clip 404, non-archive empty-200, no-SEI empty-200,
+>   with-SEI returns samples) + a Tesla-SEI-NAL fixture MP4 builder.
+> - **Clippy (our code clean):** `cargo clippy -p webd` is still red, but **only from
+>   pre-existing lib debt** (`media_events.rs:71/75` `eprintln!`, `route.rs:1486`
+>   `unwrap_or` — confirmed not in our diff; the test target adds ~70 pre-existing
+>   `unwrap_used` errors). **Our telemetry change is clippy-clean:** the 3 new
+>   `eprintln!` in `media.rs` carry a documented `#[allow(clippy::print_stderr)]`
+>   (graceful-degradation breadcrumbs → `journalctl -u webd`; webd has no
+>   `tracing`/`log` dep, matching the `media_events.rs` convention), and the 2 test
+>   fixture helpers carry `#[allow(clippy::trivially_copy_pass_by_ref)]` (by-ref is
+>   the ergonomic fit for `b"..."` byte-string literals). Lib errors 7→4, test
+>   warnings 58→56 after the cleanup; 340 tests still pass. Pre-existing lib/test
+>   debt left untouched (surgical) — there is **no CI clippy gate**.
+>
+> ### NOT done (next session, in order)
+> 1. **Playwright** — review the SPA/CSS diffs, then scoped (`UAT_FAST=1`) → full
+>    `trip-map` + `event-player` UAT, both viewports (375 + ≥1280). Confirm the HUD
+>    renders top-center, the empty-state shows "No telemetry", console clean.
+> 2. **Offer GPT-5.5 pre-deploy review** (doubt-driven) of the endpoint (80 MB read /
+>    recording-path angle), then reconcile.
+> 3. **Deploy under the hardware-test skill** — cross-build the `webd` aarch64 binary
+>    (podman, warm cross volumes) → swap binary + restart webd; deploy the SPA dir
+>    (chunked base64-over-SSH uploader for the flaky link). Confirm the car is
+>    powered + device reachable first.
+> 4. **Live verify on-device** — open a **known-SEI** driving clip via map route-click
+>    → HUD populates with moving telemetry in the top-center card; screenshot 375 +
+>    1280; console clean. Also confirm a **no-SEI** clip shows "No telemetry."
+> 5. Only then tick §4.2 "Telemetry HUD overlay" + note the Slice 3 real-data fix.
+>
+> **State:** uncommitted on `mhackermsft/b1-clean`; prior route-click files are
+> intermixed in the working tree — keep them separate and **exclude**
+> `.github/skills/hardware-test/SKILL.md` from any HUD commit. No deploy performed.
+>
 > ## ⏯️ RESUME HERE (2026-06-30 PM) — scanner re-parse storm ROOT-CAUSED IN CODE; durable fix DESIGNED (awaiting review + approval, NOT built)
 >
 > **Two operator symptoms this session:** (1) a spontaneous **hardware-watchdog
@@ -863,8 +936,8 @@ non-gated) backend lanes are now essentially exhausted. This session shipped the
 last of the pure-logic validation lanes (Boombox + Wrap caps, both `cargo`-verified
 and GPT-5.5-reviewed) and ticked §1 `TeslaTrackMode` recognition (scannerd logic
 green). What remains in the list below is one of: (a) **live-hardware foundation**
-(Phase 0 F1–F6, operator-run via `hardware-test`); (b) **gated backends** (SMB §2,
-cloud sync §4.14, WiFi §4.16 — need their daemon serve loops); or (c) **new
+(Phase 0 F1–F6, operator-run via `hardware-test`); (b) **gated backends** (cloud
+sync §4.14, WiFi §4.16 — need their daemon serve loops); or (c) **new
 full-stack features** that need a webd route **+ SPA screen + Playwright** (LightShow
 "set active" §4.10:324, Tracked-plate list §4.9:344, Chime rename §4.5:278). Each (c)
 is a multi-surface lane — pick ONE and run the full Opus→mai→GPT-5.5→Playwright loop.
@@ -1093,16 +1166,14 @@ LUNs) is the single make-or-break that still needs the car.**
 
 ---
 
-## 2. SMB / network shares (`Requirements.md` §2)
+## 2. Network file sharing (SMB / Samba) — DESCOPED
 
-- [ ] `TeslaCam` + `Media` SMB shares published (browseable, read-write).
-- [ ] Authenticated (guests rejected, `map to guest = Bad User`); no anonymous access.
-- [ ] Set/change Samba password from the web UI (8–63 chars).
-- [ ] Toggle Samba on/off from Settings; top-bar Samba dot reflects state.
-- [ ] SMB reads/writes land in the correct folder; car re-reads on next medium-change
-  (chime still needs re-enumeration). **(depends on §1.1)**
-- [ ] **SMB delete/move** of files directly from Explorer/Finder (drag-out, delete)
-  works on both shares (Requirements §2: shares are read-write). **(depends on §2 shares)**
+- **DESCOPED (2026-07-13):** SMB/Samba network sharing is **out of scope** and will
+  not be built. A read-write SMB share is irreconcilable with the locked USB-I/O
+  contract (the live TeslaCam image must never be kernel-mounted; media writes go
+  only through gadgetd's serialized eject-handoff), and the safe staging-based
+  alternative added too much complexity for the value. Media/dashcam management
+  stays in the web UI. See `Requirements.md` §2.
 
 ---
 
@@ -1156,7 +1227,6 @@ LUNs) is the single make-or-break that still needs the car.**
   UAT `spa/test/uat/shell.spec.ts` (active/inactive) 12 pass at 375+1280. LIVE-verified
   on hardware 2026-06-26: banner correctly **hidden** when no handoff active, both
   viewports, console + network clean. See `files/hw-results.md` "bb-folder+op-banner live".)**
-- [ ] Samba status dot (shown only when sharing on). **(depends on §2)**
 - [ ] Primary nav (sidebar desktop / bottom tabs mobile), availability-gated items. **(partial: nav present; per-feature availability gating to finish — A9)**
 - [ ] Feedback model: JSON for AJAX + flash banners; live-poll views. **(partial: proven on media routes; not yet audited across all routes — see §5 error-code audit)**
 
@@ -1366,7 +1436,7 @@ LUNs) is the single make-or-break that still needs the car.**
   streaming/gate wiring proven 206/200).
 - [x] Switch camera angle (position preserved where possible). **(proven)**
 - [x] Navigate clips within an event (prev/next). **(A6b proven)**
-- [ ] Telemetry HUD overlay (SEI: speed/gear/brake/throttle/steering/AP-FSD), synced. **(partial: client-side SEI parse exists — A7; verify full HUD)**
+- [ ] Telemetry HUD overlay (SEI: speed/gear/brake/throttle/steering/AP-FSD), synced. **(partial → real-data fix BUILT 2026-07-04, NOT deployed: the client-side path re-downloaded the whole 54–79 MB MP4 to parse SEI → dead over the in-car link. Replaced by a server-side `webd` endpoint `GET /api/clips/{id}/telemetry?camera=` that SEI-walks on the Pi and returns KB of JSON; HUD repositioned to the top-center card + graceful "No telemetry" empty-state. `cargo test -p webd` 340/0 incl. 4 new telemetry tests; tsc/vite clean. Pending: Playwright, cross-build+deploy, live on-device verify — see the 2026-07-04 RESUME block up top. Do NOT tick until live-verified on a known-SEI clip.)**
 - [x] Download single angle + download whole event as ZIP. **(A8 proven — single-angle "Download Angle" + whole-clip "Download All" ZIP UI in EventPlayer; webd `GET|HEAD /api/clips/:id/export` + `/api/clips/:id/angles/:camera/download`; event-player.spec.ts "downloads —" happy-path + ro_usb disabled/inert tests, 28 passed)** **(A7 2026-06-26 — V1 Preparing→Downloading…→reset cosmetic feedback added to BOTH buttons w/ re-entry guard; live-verified bundle `index-cXtV-Iin.js`, see `files/hw-results.md` §A7)**
 - [ ] Archive event to cloud. **(gated:B3)**
 - [ ] Delete event/clip (confirm) via privileged path-validated helper; car re-reads. **(partial: TeslaCam delete via handoff — verify end-to-end)**
@@ -1797,8 +1867,6 @@ LUNs) is the single make-or-break that still needs the car.**
 
 ### 4.15 Settings (system) — `Requirements.md` §4.15
 
-- [ ] Toggle Samba + status dot. **(depends on §2)**
-- [ ] Set/change Samba password (8–63). **(depends on §2)**
 - [ ] Map/display prefs (units, timezone) + network settings. **(partial: map display prefs now persist via `PUT /api/settings` — speed unit + local/UTC clock, see §4.1; network settings + dedicated Settings screen still pending)**
 - [ ] System-health card (per-subsystem behind top-bar dot). **(gated:A5/B1)**
 
@@ -1881,7 +1949,7 @@ LUNs) is the single make-or-break that still needs the car.**
    the simplified [`contracts/scannerd-readfile.md`](./specs/contracts/scannerd-readfile.md).
 5. **Media write parity remainder** (chunked/multi upload, music folder ops,
    lightshow ZIP, plate cropper) — needs the multi-file gadgetd op.
-6. **SMB (§2) + Settings (§4.15) + Storage Settings (§4.11/B5).**
+6. **Settings (§4.15) + Storage Settings (§4.11/B5).**
 7. **uploadd/cloud (B3, gated C5) · wifid/captive portal (B4, WiFi-gated) ·
    chime enforcement loop (A3d — bench-unblocked now F4/F5 are done; reuses the
    proven Set-Active gadgetd path; only A3d.5 car re-enum is Tier-C/C6) · Failed

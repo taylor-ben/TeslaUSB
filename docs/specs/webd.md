@@ -73,7 +73,7 @@ this rebuild preserves it — do **not** silently add or remove authentication
 - **Bind to the LAN/AP interface only** as today; never expose the API to the
   public internet. Mutations (clip delete, media install) are powerful and
   unauthenticated on the trusted segment by design.
-- **Secrets at rest:** cloud OAuth **refresh tokens** and WiFi/Samba credentials
+- **Secrets at rest:** cloud OAuth **refresh tokens** and WiFi credentials
   are root-only (`0600`), never world-readable, never logged, never embedded in
   the SPA bundle, never written to the Tesla volume. `webd` reads them via the
   owning service (`uploadd`/`wifid`), not from the browser.

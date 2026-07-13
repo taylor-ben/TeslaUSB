@@ -28,19 +28,14 @@ import type {
  * fields. CPU and SD/USB I/O tiles stay "—" because webd does not yet sample
  * them (tracked gap) — never fabricated.
  *
- * The config forms (Mapping & Indexing, Network File Sharing) are reproduced
- * for structural parity but are inert: buttons are `type="button"` and the
- * forms `preventDefault`, so the screen can never issue a mutation.
+ * The config form (Mapping & Indexing) is reproduced for structural parity but
+ * is inert: buttons are `type="button"` and the form `preventDefault`s, so the
+ * screen can never issue a mutation.
  */
 
 function pref(prefs: Pref[] | null, key: string, dflt = ""): string {
   const p = prefs?.find((x) => x.key === key);
   return p ? p.value : dflt;
-}
-
-function prefBool(prefs: Pref[] | null, key: string): boolean {
-  const v = pref(prefs, key).toLowerCase();
-  return v === "1" || v === "true" || v === "on" || v === "yes";
 }
 
 const METRIC_TILES = [
@@ -78,7 +73,6 @@ const SUBSYSTEMS = [
   { key: "disk", label: "SD Card" },
   { key: "storage_writable", label: "Storage Roots" },
   { key: "network", label: "WiFi" },
-  { key: "samba", label: "Network Share" },
   { key: "journal", label: "Recent Errors" },
 ];
 
@@ -594,63 +588,6 @@ export function MediaHub() {
                 disabled
               >
                 Save Mapping Settings
-              </button>
-            </form>
-          </div>
-        </details>
-
-        {/* Network File Sharing — config form, inert; bound to /api/settings. */}
-        <details class="settings-section" id="network-file-sharing">
-          <summary>Network File Sharing</summary>
-          <div class="section-content">
-            <form onSubmit={(e) => e.preventDefault()}>
-              <p style="font-size:0.85rem; color:var(--text-secondary); margin:0 0 12px">
-                Enable Samba (SMB) network sharing so you can browse the TeslaCam
-                and media partitions from your computer over WiFi.
-              </p>
-              <div
-                class="form-group"
-                style="margin-bottom:12px; padding:12px; background-color:var(--bg-info); border:1px solid var(--border-color); border-radius:var(--radius-md,8px)"
-              >
-                <label style="display:flex; align-items:center; gap:12px; font-size:0.95rem; min-height:44px; cursor:pointer; margin:0">
-                  <input
-                    type="checkbox"
-                    name="samba_enabled"
-                    id="samba_enabled"
-                    value="on"
-                    checked={prefBool(prefs, "samba_enabled")}
-                    style="width:22px; height:22px; flex:0 0 22px"
-                  />
-                  <span>
-                    <strong>Enable network file sharing (SMB)</strong>
-                  </span>
-                </label>
-              </div>
-              <div class="form-group" style="margin-bottom:12px">
-                <label style="font-size:0.85rem">Samba Password</label>
-                <div style="display:flex; gap:8px">
-                  <input
-                    type="password"
-                    name="samba_password"
-                    id="samba_password"
-                    value=""
-                    placeholder="Set a password before clients can connect"
-                    class="settings-form-input"
-                    style="flex:1"
-                    autocomplete="new-password"
-                  />
-                </div>
-                <p style="font-size:0.8rem; color:var(--text-secondary); margin:4px 0 0">
-                  Username: <code>pi</code>
-                </p>
-              </div>
-              <button
-                type="button"
-                class="btn btn-primary"
-                style="width:100%"
-                disabled
-              >
-                Save Network Settings
               </button>
             </form>
           </div>

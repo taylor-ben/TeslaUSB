@@ -338,7 +338,7 @@ future code-quality document is added, it supplements (does not replace) these.
   on a **trusted home LAN**, and AP-onboarding mode must use **WPA2** (never an
   open AP). Preserve that model — do **not** silently add or drop auth — but treat
   it explicitly: `webd` mutations (clip delete, media install) are powerful, and
-  cloud **OAuth refresh tokens** + WiFi/Samba credentials are secrets that must be
+  cloud **OAuth refresh tokens** + WiFi credentials are secrets that must be
   stored with restrictive permissions (root-only, `0600`), never world-readable,
   never logged, never in the SPA bundle or the Tesla volume. See [`webd` §security](./webd.md).
 - **SQLite (WAL)** lives on the **Pi-side ext4 data filesystem** (outside the

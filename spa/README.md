@@ -20,7 +20,7 @@ The captured parity baseline at `docs/tasks/parity-baseline/media-hub/` is the
 legacy **settings / device-status dashboard** (route `/settings/`, template
 `index.html`): a device-status banner, then **System Health**, **Live Metrics**,
 and the collapsed **WiFi / Access Point / Storage & Auto-Cleanup / Mapping &
-Indexing / Network File Sharing / Storage Health / System** sections.
+Indexing / Storage Health / System** sections.
 
 On a real device that page is populated by legacy system services
 (`/api/system/health`, `/api/system/metrics`, `/api/storage/health`) and its
@@ -49,7 +49,7 @@ zero-console gate):
 - **System** → host facts shown as "—" (an on-device concern; not fabricated).
 
 The screen performs two read-only catalog reads: `GET /api/settings` populates
-the **Mapping & Indexing** and **Network File Sharing** form fields where prefs
+the **Mapping & Indexing** form fields where prefs
 keys map, and `GET /api/clips` drives the **Video Indexer** System-Health row.
 The config forms are reproduced for structural parity but are **inert**
 (`type="button"` + `onSubmit preventDefault`), so the screen can never mutate.

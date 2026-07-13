@@ -63,7 +63,7 @@
 
 ### 1.1 How the car notices changes the user makes
 
-The car aggressively caches USB contents. After the web UI (or SMB) changes files,
+The car aggressively caches USB contents. After the web UI changes files,
 v1 forces the car to re-read using one of two mechanisms:
 
 - **Soft SCSI medium-change** (`tesla_cache_invalidate.sh`, ~200 ms): clears and
@@ -85,30 +85,17 @@ v1 forces the car to re-read using one of two mechanisms:
 
 ---
 
-## 2. How the end user sees the device over the network (SMB)
+## 2. Network file sharing (SMB / Samba) — DESCOPED for B-1
 
-When network sharing (Samba) is enabled, the Pi exposes the storage as standard
-**SMB/CIFS network shares**, reachable from Windows Explorer / macOS Finder /
-Linux at `\\teslausb\…` (or the device's hostname/IP).
-
-- **Two shares** are published by default:
-  - **`TeslaCam`** — comment "TeslaUSB Dashcam & Sentry footage". Points at the
-    TeslaCam storage tree.
-  - **`Media`** — comment "TeslaUSB Music, Boombox & Light Shows". Points at the
-    media storage tree.
-- Both shares are **browseable** and **read-write**, so the user can **drag files
-  in and delete files** directly (e.g. drop a batch of MP3s into `Media\Music`, or
-  copy dashcam events off `TeslaCam` for archiving).
-- Shares are **authenticated** (guests are rejected — `map to guest = Bad User`).
-  The user sets/changes the Samba password from the web UI; there is no anonymous
-  access.
-- **Expected outcome of an SMB write:** the file lands in the corresponding folder
-  on the drive; the car picks it up on the next medium-change / re-read cycle (for
-  the lock chime, a full re-enumeration is still required — SMB drops do not
-  themselves trigger the chime re-enumeration).
-- Samba can be **toggled on/off** in the web UI (Settings). When off, no shares are
-  advertised and the top-bar status dot is hidden; when on, the dot is amber
-  ("Network sharing active").
+> **Not a B-1 requirement (descoped 2026-07-13).** SMB/Samba network sharing is
+> **out of scope** for the B-1 re-implementation and will not be built. It was
+> cut deliberately: a read-write SMB share cannot be reconciled with the locked
+> USB-I/O contract — the live TeslaCam image must never be kernel-mounted, and all
+> media writes go through gadgetd's serialized eject-handoff (see
+> [`specs/usb-io-and-archiving-architecture.md`](./specs/usb-io-and-archiving-architecture.md)).
+> The safe staging-based alternative added too much complexity for the value.
+> Users manage media and dashcam footage through the **web UI** instead. (v1's
+> Samba behavior remains in v1 source / git history for reference.)
 
 ---
 
@@ -120,8 +107,7 @@ via the device's Wi-Fi access point — see §4.13).
 
 - **Top bar:** brand/logo (links to the Map), a **system-health status dot**
   (polls `/api/system/health`; green/amber/red/grey by severity; click → Settings
-  health card), the **Samba status dot** (shown only when sharing is on), and a
-  **light/dark theme toggle** (persisted in the browser).
+  health card), and a **light/dark theme toggle** (persisted in the browser).
 - **Primary navigation** (sidebar on desktop, bottom tabs on mobile), each item
   shown only when its data/feature is available:
   - **Map** — trip map + event/clip browser (the home screen).
@@ -129,7 +115,7 @@ via the device's Wi-Fi access point — see §4.13).
   - **Media** — hub linking to Chimes, Music, Boombox, Light Shows, Wraps,
     License Plates.
   - **Cloud** — cloud archive / off-device backup.
-  - **Settings** — Wi-Fi, network sharing, storage, system health, etc.
+  - **Settings** — Wi-Fi, storage, system health, etc.
 - **Feedback model:** actions either return JSON (for in-page AJAX) or perform a
   redirect with a **flash banner** (success = green, error = red, info = blue,
   warning = yellow). Long-running/health views **poll** and update live.
@@ -436,10 +422,6 @@ The user can:
 
 The user can:
 
-- **Toggle network sharing (Samba)** on/off (see §2). *Outcome:* shares
-  appear/disappear; status dot reflects state.
-- **Set/Change the Samba password** (8–63 chars). *Outcome:* SMB auth uses the new
-  password.
 - **Set map/display preferences** (speed units, timezone) and **network settings**.
 - Access the **system-health** card (per-subsystem breakdown behind the top-bar dot).
 
