@@ -67,12 +67,14 @@ async fn system_metrics(State(state): State<AppState>) -> Json<SystemMetrics> {
 
 async fn storage(State(state): State<AppState>) -> Json<Storage> {
     let sys = state.sys;
+    let stats = state.stats_client;
     let out = tokio::task::spawn_blocking(move || {
-        sysinfo::storage(sys.probe.as_ref(), sys.paths.as_ref())
+        sysinfo::storage(sys.probe.as_ref(), sys.paths.as_ref(), stats.as_ref())
     })
     .await
     .unwrap_or_else(|_| Storage {
         filesystems: Vec::new(),
+        volumes: Vec::new(),
         governor: None,
     });
     Json(out)

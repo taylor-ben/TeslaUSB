@@ -55,6 +55,7 @@ mod read_client;
 mod route;
 mod scheduler;
 mod sysinfo;
+mod stats_client;
 pub(crate) mod timezone;
 mod wraps;
 
@@ -89,6 +90,7 @@ struct AppState {
     scheduler: Arc<dyn scheduler::SchedulerClient>,
     indexd: Arc<dyn indexd_client::IndexdClient>,
     read_client: Arc<dyn read_client::ReadFileClient + Send + Sync>,
+    stats_client: Arc<dyn stats_client::VolumeStatsClient + Send + Sync>,
     jobs: jobs::JobHub,
     /// Process-wide media-change bus: a background `data_version` monitor ticks
     /// this whenever `indexd` commits, and the `/api/media-events` SSE forwards
@@ -230,6 +232,7 @@ fn router_with_all_clients(
         scheduler,
         indexd,
         default_read_client(),
+        default_stats_client(),
         chime_library_dir,
     )
 }
@@ -247,6 +250,19 @@ fn default_read_client() -> Arc<dyn read_client::ReadFileClient + Send + Sync> {
     }
 }
 
+fn default_stats_client() -> Arc<dyn stats_client::VolumeStatsClient + Send + Sync> {
+    #[cfg(unix)]
+    {
+        Arc::new(stats_client::UnixVolumeStatsClient::new(
+            stats_client::SCANNERD_STAT_SOCKET_PATH,
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        Arc::new(stats_client::UnavailableVolumeStatsClient)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn router_with_all_clients_and_read_client(
     catalog: Catalog,
@@ -256,6 +272,7 @@ fn router_with_all_clients_and_read_client(
     scheduler: Arc<dyn scheduler::SchedulerClient>,
     indexd: Arc<dyn indexd_client::IndexdClient>,
     read_client: Arc<dyn read_client::ReadFileClient + Send + Sync>,
+    stats_client: Arc<dyn stats_client::VolumeStatsClient + Send + Sync>,
     chime_library_dir: PathBuf,
 ) -> Router {
     let sys = SysHandle {
@@ -268,6 +285,9 @@ fn router_with_all_clients_and_read_client(
             indexer_health_file: std::env::var_os("WEBD_INDEXER_HEALTH_FILE")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("/run/teslausb/indexd.health.json")),
+            media_ro_mount: std::env::var_os("WEBD_MEDIA_RO_MOUNT")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/run/teslausb/media-ro")),
         }),
     };
     let media_events = media_events::MediaEvents::start(&catalog);
@@ -280,6 +300,7 @@ fn router_with_all_clients_and_read_client(
         scheduler,
         indexd,
         read_client,
+        stats_client,
         jobs: jobs::JobHub::new(),
         media_events,
         chime_library_dir,

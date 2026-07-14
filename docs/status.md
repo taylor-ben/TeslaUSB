@@ -1,6 +1,46 @@
 # TeslaUSB B-1 — Build Status (vs. `Requirements.md`)
 
-> ## ⏯️ RESUME HERE (2026-07-04) — server-side SEI telemetry HUD endpoint BUILT + unit-tested (340 webd, 0 fail); NOT deployed / NOT Playwright / NOT live-verified
+> ## ✅ DONE (2026-07-14) — server-side SEI telemetry HUD (§4.2) COMPLETE + LIVE-VERIFIED on device
+>
+> **§4.2 telemetry HUD is ticked below.** The map route-click overlay HUD was live-
+> verified in a real headless-Chromium browser against `cybertruckusb.local` on real
+> on-device SEI, via the operator's actual route-click flow (`__TESLAUSB_MAP_HOOKS__.
+> triggerRoutePick(lat,lon)` → covering-clip resolution → overlay):
+> - **Populates with real telemetry, top-center 2-row Tesla card** (gear · ◀ blinker ·
+>   big MPH · blinker ▶ · steering wheel; row 2 brake · autopilot · accelerator) — the
+>   old "smooshed at the bottom" bug is gone. Screenshots at **1280** (`hud-live-desktop-
+>   1280.png`) and **375** (`hud-live-mobile-375.png`) in `C:\Users\mhack\.copilot\`.
+> - **Values match real data** (clip **4493**, steady autopilot cruise): HUD `56 mph` ==
+>   independently-computed `sampleAt(currentTime)` at t=0/12/25/40/55.
+> - **Time-syncs to `video.currentTime`** (clip **4441**, city drive): seeking shows the
+>   HUD speed tracking the real drive **40 → 0 → 20 → 45 mph** (complete stop at t≈18s
+>   then accel) and the steering-wheel `--wheel-rotation` changing — decisive proof the
+>   HUD is live, not stuck.
+> - **Real Tesla H.264 decodes** in Chromium (avc1, 2896×1876, readyState 3).
+> - **No-SEI empty state**: endpoint verified live returning `[]` for freshly-recorded
+>   ro_usb clips (e.g. 5693); the `hud-empty` / "No telemetry" client render is covered
+>   by the off-device UAT (90/90, both viewports). Not forced live (route-click resolves
+>   to archive/SEI clips; panel nav is hung — see follow-up).
+> - **Device stayed healthy** through heavy probing (several 78 MB SEI parses + streams
+>   during the scanner storm): webd `NRestarts=0`, same MainPID, **no panics/errors/OOM**
+>   in its journal, SSH rock-solid, `is-system-running=running`, 0 failed.
+>
+> **Follow-ups surfaced during verify — both benign (NOT blocking §4.2, NOT real bugs):**
+> 1. **Video panel "Loading…" hang — DISPROVEN as a regression (2026-07-14).** On a
+>    **fresh page load** the panel is fine: Events (`/api/events` ~83 ms), Trips
+>    (`/api/trips/page` ~131 ms → Trip #24/#23/#22), All Clips (`/api/clips` ~137 ms →
+>    Recent/Saved/Sentry/Archived) all render immediately. The "Loading…" spin only
+>    appeared in the **single long-lived Playwright tab** that had been subjected to
+>    dozens of injected `fetch()`s, forced `video.currentTime` seeks, and `triggerRoutePick`
+>    hook calls during verification → a wedged client-state artifact of invasive testing,
+>    cleared by any normal reload. **Not a user-facing bug; no action needed.**
+> 2. **webd transient `ERR_CONNECTION_REFUSED` under load** — during a 78 MB SEI parse
+>    (5 s, `Semaphore(1)`, `spawn_blocking`) *while* the scanner re-parse storm holds
+>    load ~3, webd briefly refused new SYNs (kernel backlog) → a few dropped health/
+>    stream polls in the browser console. webd never crashed (NRestarts=0). Capacity/
+>    perf note: consider a smaller size cap or accept-loop priority; harmless today.
+>
+> ### (history) 2026-07-13 — endpoint BUILT + unit-tested (340 webd) + Playwright GREEN (90/90); webd endpoint + SPA already LIVE on device
 >
 > **Operator symptom:** the map route-click overlay HUD (Slice 3, §4.1) "is not
 > positioned correctly and I don't think it is working." Slice 3 was previously
@@ -55,19 +95,29 @@
 >   debt left untouched (surgical) — there is **no CI clippy gate**.
 >
 > ### NOT done (next session, in order)
-> 1. **Playwright** — review the SPA/CSS diffs, then scoped (`UAT_FAST=1`) → full
->    `trip-map` + `event-player` UAT, both viewports (375 + ≥1280). Confirm the HUD
->    renders top-center, the empty-state shows "No telemetry", console clean.
+> 1. **✅ Playwright DONE (2026-07-13)** — full `trip-map` + `event-player` UAT green,
+>    both viewports (375 + 1280): **90 passed / 0 failed**; `tsc --noEmit` clean. Fixed
+>    one **stale** test (`trip-map.spec.ts` "slice 3 HUD telemetry parity"): it asserted
+>    the OLD per-camera telemetry reload, but the server-side rework makes telemetry
+>    **clip-level / always-front** (`api.telemetryUrl(clip.id, "front")`) — car state is
+>    camera-independent and SEI lives in the front angle, so the HUD must stay populated
+>    + unchanged on a camera switch. Updated the test to assert that; removed the
+>    now-unused `HUD_FIXTURE_B`. **Follow-up (device-verifiable):** `EventPlayer.tsx`
+>    still loads telemetry **per-camera** (`api.telemetryUrl(clip.id, camera)`) —
+>    inconsistent with the map overlay's always-front. If non-front angles lack SEI its
+>    HUD would blank on camera switch; align it to always-front after confirming on-device
+>    whether non-front carries SEI.
 > 2. **Offer GPT-5.5 pre-deploy review** (doubt-driven) of the endpoint (80 MB read /
 >    recording-path angle), then reconcile.
 > 3. **Deploy under the hardware-test skill** — cross-build the `webd` aarch64 binary
 >    (podman, warm cross volumes) → swap binary + restart webd; deploy the SPA dir
 >    (chunked base64-over-SSH uploader for the flaky link). Confirm the car is
 >    powered + device reachable first.
-> 4. **Live verify on-device** — open a **known-SEI** driving clip via map route-click
->    → HUD populates with moving telemetry in the top-center card; screenshot 375 +
->    1280; console clean. Also confirm a **no-SEI** clip shows "No telemetry."
-> 5. Only then tick §4.2 "Telemetry HUD overlay" + note the Slice 3 real-data fix.
+> 4. **✅ Live verify on-device DONE (2026-07-14)** — real route-click overlay HUD renders
+>    top-center + time-syncs to real on-device SEI (clips 4493 + 4441); screenshots at
+>    375 + 1280; no-SEI endpoint returns `[]` live (empty-state render covered by UAT).
+>    See the DONE block up top for evidence + the two follow-ups.
+> 5. **✅ §4.2 ticked** (see below) + Slice 3 real-data fix noted.
 >
 > **State:** uncommitted on `mhackermsft/b1-clean`; prior route-click files are
 > intermixed in the working tree — keep them separate and **exclude**
@@ -1436,7 +1486,7 @@ LUNs) is the single make-or-break that still needs the car.**
   streaming/gate wiring proven 206/200).
 - [x] Switch camera angle (position preserved where possible). **(proven)**
 - [x] Navigate clips within an event (prev/next). **(A6b proven)**
-- [ ] Telemetry HUD overlay (SEI: speed/gear/brake/throttle/steering/AP-FSD), synced. **(partial → real-data fix BUILT 2026-07-04, NOT deployed: the client-side path re-downloaded the whole 54–79 MB MP4 to parse SEI → dead over the in-car link. Replaced by a server-side `webd` endpoint `GET /api/clips/{id}/telemetry?camera=` that SEI-walks on the Pi and returns KB of JSON; HUD repositioned to the top-center card + graceful "No telemetry" empty-state. `cargo test -p webd` 340/0 incl. 4 new telemetry tests; tsc/vite clean. Pending: Playwright, cross-build+deploy, live on-device verify — see the 2026-07-04 RESUME block up top. Do NOT tick until live-verified on a known-SEI clip.)**
+- [x] Telemetry HUD overlay (SEI: speed/gear/brake/throttle/steering/AP-FSD), synced. **(DONE + LIVE-VERIFIED 2026-07-14. The client-side path re-downloaded the whole 54–79 MB MP4 to parse SEI → dead over the in-car link; replaced by a server-side `webd` endpoint `GET /api/clips/{id}/telemetry?camera=` that SEI-walks on the Pi and returns KB of JSON; HUD repositioned to the top-center 2-row Tesla card + graceful "No telemetry" empty-state. `cargo test -p webd` 340/0 incl. 4 telemetry tests; full `trip-map`+`event-player` Playwright 90/90 both viewports; tsc/vite clean. webd endpoint + SPA live on `cybertruckusb.local`. Live-verified in headless Chromium against the device via the real route-click flow: HUD renders top-center + matches real SEI (clip 4493 `56 mph` == `sampleAt` at 5 timestamps) + time-syncs (clip 4441 `40→0→20→45 mph` across seeks, wheel rotates); H.264 decodes 2896×1876; screenshots 375+1280; no-SEI endpoint returns `[]` live; webd stable NRestarts=0, no panics. See the 2026-07-14 DONE block up top. Two non-blocking follow-ups noted (both benign): video-panel "Loading…" hang was DISPROVEN as a regression (fresh reload loads all tabs in ~130ms; only a wedged long-lived test tab hung) + webd transient connection-refusal is a symptom of the known scanner-storm load.)**
 - [x] Download single angle + download whole event as ZIP. **(A8 proven — single-angle "Download Angle" + whole-clip "Download All" ZIP UI in EventPlayer; webd `GET|HEAD /api/clips/:id/export` + `/api/clips/:id/angles/:camera/download`; event-player.spec.ts "downloads —" happy-path + ro_usb disabled/inert tests, 28 passed)** **(A7 2026-06-26 — V1 Preparing→Downloading…→reset cosmetic feedback added to BOTH buttons w/ re-entry guard; live-verified bundle `index-cXtV-Iin.js`, see `files/hw-results.md` §A7)**
 - [ ] Archive event to cloud. **(gated:B3)**
 - [ ] Delete event/clip (confirm) via privileged path-validated helper; car re-reads. **(partial: TeslaCam delete via handoff — verify end-to-end)**

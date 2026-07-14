@@ -9,18 +9,22 @@ import type { Page } from "@playwright/test";
 import { writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
-// ── Storage health screen UAT (fe-storage-health) ─────────────────────────
+// ── Storage screen UAT (fe-storage-health) ────────────────────────────────
 // Each test drives the REAL bundle served by webd against a seeded read-only
-// catalog (global-setup). The screen at /storage is a read-only reproduction
-// of the legacy "Storage" page (docs/tasks/parity-baseline/storage/): it shows
-// LIVE storage/health/metrics and degrades unsupported facts (allocation, SD
-// wear telemetry, retention governor) to "—" rather than fabricating them.
+// catalog (global-setup). The screen at /storage is the redesigned, actionable
+// Storage view: a recording-safety banner, an SD-card composition breakdown,
+// the two USB drives Tesla sees (TeslaCam exact-from-bitmap + Media statvfs),
+// and a collapsible "Device health & diagnostics" section folding the legacy
+// health/filesystems/subsystems/resources/retention cards. Unreadable facts
+// degrade to "—" rather than being fabricated.
 //
-// The functional-parity test intercepts the four read-only probes with
-// deterministic fixtures so the assertions never depend on the build host's
-// real /proc or disk (webd on a non-Linux host honestly degrades those). The
-// clean / read-only / wiring tests hit the REAL endpoints to prove they return
-// 2xx with a clean console. We capture screenshots as artifacts (no pixel-diff).
+// The functional + responsive tests intercept the four read-only probes with
+// deterministic fixtures (coherent volumes so the composition path renders) so
+// the assertions never depend on the build host's real /proc or disk (webd on a
+// non-Linux host honestly degrades those). The clean / read-only / wiring tests
+// hit the REAL endpoints (dashcam/media bytes come back null → the degraded
+// path) to prove they return 2xx with a clean console. Screenshots are captured
+// as artifacts (no pixel-diff).
 
 // The read APIs the storage-health screen is permitted to call. webd is
 // read-only; anything outside this set (or any non-GET) is a hard failure.
@@ -29,6 +33,9 @@ const ALLOWED_API = new Set([
   "/api/storage/health",
   "/api/system/metrics",
   "/api/system/health",
+  // The app shell (Shell.tsx) polls gadget status on every page mount to drive
+  // the header status dot — a cross-cutting read-only GET, not storage-specific.
+  "/api/gadget/status",
 ]);
 
 // Deterministic fixtures. Field names mirror the webd serde DTOs exactly.
@@ -40,10 +47,10 @@ const STORAGE_FIXTURE = {
   filesystems: [
     {
       mount: "/mnt/teslausb",
-      device: "/dev/mmcblk0p3",
+      device: "/dev/mmcblk0p2",
       fstype: "ext4",
-      free_bytes: 200 * GIB,
-      total_bytes: 256 * GIB,
+      free_bytes: 94 * GIB,
+      total_bytes: 470 * GIB,
       free_inodes: 1_900_000,
       total_inodes: 2_000_000,
     },
@@ -57,17 +64,42 @@ const STORAGE_FIXTURE = {
       total_inodes: 0,
     },
   ],
+  // The two USB drives Tesla sees. Dashcam free is exact (allocation bitmap);
+  // media is statvfs. Coherent with the SD-card composition, whose reserved
+  // segments must fit under the card: 128 + 1 + free 94 <= 470.
+  volumes: [
+    {
+      role: "dashcam",
+      label: "TESLACAM",
+      fstype: "exfat",
+      total_bytes: 128 * GIB,
+      free_bytes: 40 * GIB,
+      used_bytes: 88 * GIB,
+      source: "bitmap",
+      stable: true,
+    },
+    {
+      role: "media",
+      label: "MEDIA",
+      fstype: "exfat",
+      total_bytes: 1 * GIB,
+      free_bytes: 512 * MIB,
+      used_bytes: 512 * MIB,
+      source: "statvfs",
+      stable: true,
+    },
+  ],
   governor: null,
 };
 
 const STORAGE_HEALTH_FIXTURE = {
   severity: "ok",
-  summary: "200 GB free of 256 GB",
-  device: "/dev/mmcblk0p3",
+  summary: "94 GB free of 470 GB",
+  device: "/dev/mmcblk0p2",
   fstype: "ext4",
   mount: "/mnt/teslausb",
-  used_bytes: 56 * GIB,
-  total_bytes: 256 * GIB,
+  used_bytes: 376 * GIB,
+  total_bytes: 470 * GIB,
   fs_errors: null,
   io_errors_24h: null,
   trim: null,
@@ -85,7 +117,7 @@ const METRICS_FIXTURE = {
 const SYS_HEALTH_FIXTURE = {
   overall: "ok",
   subsystems: {
-    disk: { severity: "ok", message: "200.0 GB free of 256.0 GB (78%)" },
+    disk: { severity: "ok", message: "94.0 GB free of 470.0 GB (80%)" },
     storage_writable: { severity: "ok", message: "archive root writable" },
     teslafat_0: { severity: "warn", message: "TeslaCam exFAT inactive" },
     gadget: { severity: "ok", message: "USB gadget configured (attached)" },
@@ -130,7 +162,7 @@ function assertCleanConsole(probe: Probe) {
 
 test.describe("storage health UAT", () => {
   // ── Gate 1: functional + structural parity ─────────────────────────────
-  test("functional — shell, live capacity/health/metrics, degraded facts", async ({
+  test("functional — banner, SD composition, USB drives, folded diagnostics", async ({
     page,
     probe,
   }, testInfo) => {
@@ -151,51 +183,84 @@ test.describe("storage health UAT", () => {
     await expect(activeNav).toHaveAttribute("aria-current", "page");
     await expect(activeNav).toContainText("Settings");
 
-    // Header — title + live SD pills from the primary filesystem (/mnt/teslausb:
-    // 256 GB total, 200 GB free ⇒ 56 GB used). Allocation pills degrade to "—".
     await expect(page.locator(".storage-title")).toHaveText("Storage");
-    const pills = page.locator(".storage-header .storage-pill-row .storage-pill");
-    await expect(pills).toHaveText([
-      "SD total: 256 GB",
-      "SD free: 200 GB",
-      "Used: 56 GB",
-      "Allocated: \u2014",
-      "OS + reserve: \u2014",
-      "Unallocated: \u2014",
-    ]);
 
-    // Primary capacity bar painted with a real used segment. 56 GB used of
-    // 256 GB ⇒ 22% used ⇒ the calm "used" band (not warn/crit).
-    const primaryUsed = page.locator(".storage-header [data-primary-used]");
-    await expect(primaryUsed).toHaveCount(1);
-    await expect(primaryUsed).toHaveClass("cap-seg cap-seg-used");
+    // Recording-safety banner — 94 GB free of 470 GB ⇒ 20% free ⇒ "ok".
+    const banner = page.locator("#storage-recording-banner");
+    await expect(banner).toHaveAttribute("data-banner-level", "ok");
+    await expect(banner).toContainText("Recording protected");
+    await expect(banner).toContainText("94 GB free");
 
-    // Storage Health card — severity badge + summary + the live facts; the SD
-    // wear-telemetry rows (errors / I/O / TRIM) degrade to "—" (not fabricated).
+    // SD-card composition card — big free figure + the 4-part stacked bar whose
+    // segments carry REAL proportional widths (dashcam 128/470 ⇒ 27.23%,
+    // system 247/470 ⇒ 52.55%), proving the byte math drove the geometry.
+    await expect(page.locator("#storage-sdcard-card [data-sd-free]")).toHaveText("94 GB");
+    await expect(page.locator("#storage-sdcard-card .cap-figure-label")).toContainText(
+      "free of 470 GB",
+    );
+    const comp = page.locator("#storage-composition");
+    await expect(comp).toHaveCount(1);
+    await expect(comp.locator('[data-comp="dashcam"]')).toHaveAttribute(
+      "style",
+      /width:\s*27\.23%/,
+    );
+    await expect(comp.locator('[data-comp="system"]')).toHaveAttribute(
+      "style",
+      /width:\s*52\.55%/,
+    );
+    await expect(comp.locator('[data-comp="media"]')).toHaveCount(1);
+    await expect(comp.locator('[data-comp="free"]')).toHaveCount(1);
+    const legend = page.locator("#storage-sdcard-card .comp-legend");
+    await expect(legend).toContainText("Dashcam buffer 128 GB");
+    await expect(legend).toContainText("Media library 1.0 GB");
+    await expect(legend).toContainText("System & archived footage 247 GB");
+    await expect(legend).toContainText("Free 94 GB");
+
+    // TeslaCam drive card — exact (bitmap) free, stable ⇒ no "approximate" note.
+    const dash = page.locator("#storage-dashcam-card");
+    await expect(dash.locator(".cap-figure-value")).toHaveText("40 GB");
+    await expect(dash.locator(".cap-figure-label")).toContainText("free of 128 GB");
+    await expect(dash.locator("[data-vol-meta]")).toContainText("88 GB used (69%)");
+    await expect(dash.locator("[data-vol-meta]")).not.toContainText("approximate");
+
+    // Media drive card — statvfs.
+    const med = page.locator("#storage-media-card");
+    await expect(med.locator(".cap-figure-value")).toHaveText("512 MB");
+    await expect(med.locator(".cap-figure-label")).toContainText("free of 1.0 GB");
+    await expect(med.locator("[data-vol-meta]")).toContainText("512 MB used (50%)");
+
+    // Device-health diagnostics start COLLAPSED (the legacy cards are folded).
+    const details = page.locator("#storage-device-health");
+    await expect(details).toHaveJSProperty("open", false);
+
+    // Expand, then assert the folded legacy cards + their live/degraded facts.
+    await details.locator("summary").click();
+    await expect(page.locator("#storage-health-card")).toBeVisible();
+
     await expect(page.locator("#storage-health-card .storage-badge")).toHaveAttribute(
       "data-severity",
       "ok",
     );
     await expect(page.locator("#storage-health-summary")).toHaveText(
-      "200 GB free of 256 GB",
+      "94 GB free of 470 GB",
     );
     await expect(page.locator("#storage-health-grid dd")).toHaveText([
-      "/dev/mmcblk0p3",
+      "/dev/mmcblk0p2",
       "ext4",
       "/mnt/teslausb",
-      "56 GB",
-      "256 GB",
+      "376 GB",
+      "470 GB",
       "\u2014",
       "\u2014",
       "\u2014",
     ]);
 
-    // Filesystems — one row per mounted filesystem from the fixture (2). The
-    // primary volume is 56 GB used of 256 GB ⇒ 22% used.
+    // Filesystems — one row per mounted filesystem (2). The primary volume is
+    // 376 GB used of 470 GB ⇒ 80% used.
     await expect(page.locator("#filesystems-list .fs-item")).toHaveCount(2);
     await expect(
       page.locator('#filesystems-list .fs-item[data-fs-mount="/mnt/teslausb"]'),
-    ).toContainText("22%");
+    ).toContainText("80%");
 
     // Subsystem status — storage-relevant rows; teslafat_1 has no probe data in
     // the fixture so it degrades to "—" while the others carry live messages.
@@ -205,7 +270,7 @@ test.describe("storage health UAT", () => {
     expect(subText).toContain("USB gadget configured (attached)");
     expect(subText).toContain("\u2014"); // teslafat_1 (Media) unprobed → degraded
 
-    // Live resources — mem/swap/load/uptime; swap is null ⇒ "—"/"none".
+    // Live resources — mem/swap/load/uptime; swap is null ⇒ "—".
     await expect(page.locator("#storage-metric-mem .storage-metric-value")).toHaveText("50%");
     await expect(page.locator("#storage-metric-mem .storage-metric-detail")).toHaveText(
       "256 MB / 512 MB",
@@ -404,10 +469,15 @@ test.describe("storage health UAT", () => {
     await routeProbes(page);
     await gotoStorage(page);
 
-    // Content present regardless of breakpoint.
+    // Top-level actionable cards present regardless of breakpoint.
+    await expect(page.locator("#storage-recording-banner")).toBeVisible();
+    await expect(page.locator("#storage-sdcard-card")).toBeVisible();
+    await expect(page.locator("#storage-dashcam-card")).toBeVisible();
+    await expect(page.locator("#storage-media-card")).toBeVisible();
+
+    // Folded diagnostics expand on demand (and enrich the fullPage screenshot).
+    await page.locator("#storage-device-health summary").click();
     await expect(page.locator("#storage-health-card")).toBeVisible();
-    await expect(page.locator("#filesystems-card")).toBeVisible();
-    await expect(page.locator("#storage-resources-card")).toBeVisible();
 
     // Breakpoint-specific chrome: desktop shows the rail, mobile the tabs.
     const isMobile = testInfo.project.name.includes("375");

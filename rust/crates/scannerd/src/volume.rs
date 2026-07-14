@@ -273,6 +273,68 @@ impl<'r, R: BlockReader + ?Sized> Volume<'r, R> {
         Ok(chain)
     }
 
+    /// Follow a FAT chain from `first`, returning at most `max_clusters` clusters.
+    ///
+    /// Unlike [`Self::follow_chain`], this stops as soon as `max_clusters` clusters
+    /// are collected and does NOT require the chain to reach `EndOfChain` — the
+    /// caller only needs the leading clusters it will actually read (e.g. the
+    /// allocation-bitmap prefix). This bounds the work on a torn FAT pointer to
+    /// `max_clusters` cluster reads instead of walking to the internal cap.
+    /// Errors on an invalid or cyclic cluster encountered within the bounded walk.
+    /// `max_clusters == 0` yields an empty chain.
+    ///
+    /// # Errors
+    ///
+    /// [`ScannerError::InvalidCluster`] / [`ScannerError::ChainError`]
+    /// on any range, cycle, or sentinel violation encountered before
+    /// `max_clusters` clusters are collected.
+    pub fn follow_chain_bounded(
+        &self,
+        first: u32,
+        max_clusters: usize,
+    ) -> Result<Vec<u32>, ScannerError> {
+        if max_clusters == 0 {
+            return Ok(Vec::new());
+        }
+        if !self.params.is_valid_cluster(first) {
+            return Err(ScannerError::InvalidCluster {
+                cluster: first,
+                reason: "chain start out of range",
+            });
+        }
+        let mut chain = Vec::new();
+        let mut visited: HashSet<u32> = HashSet::new();
+        let mut cur = first;
+        loop {
+            visited.insert(cur);
+            chain.push(cur);
+            // Inspect this cluster's successor even when we are about to stop at the cap, so a
+            // cyclic or invalid terminal entry cannot masquerade as a clean truncation.
+            match self.fat_entry(cur)? {
+                FatEntry::EndOfChain => break,
+                FatEntry::Invalid => {
+                    return Err(ScannerError::ChainError {
+                        first,
+                        reason: "free/bad/out-of-range cluster mid-chain",
+                    });
+                }
+                FatEntry::Next(next) => {
+                    if visited.contains(&next) {
+                        return Err(ScannerError::ChainError {
+                            first,
+                            reason: "FAT cycle detected",
+                        });
+                    }
+                    if chain.len() >= max_clusters {
+                        break;
+                    }
+                    cur = next;
+                }
+            }
+        }
+        Ok(chain)
+    }
+
     /// Produce `span` contiguous clusters starting at `first`,
     /// validating each is in range.
     fn contiguous_chain(&self, first: u32, span: u64) -> Result<Vec<u32>, ScannerError> {
@@ -467,5 +529,86 @@ mod tests {
         // max valid cluster = cluster_count + 1 = 17; span from 16 of 5
         // would reach 20 -> rejected.
         assert!(vol.follow_chain(16, true, 5).is_err());
+    }
+
+    #[test]
+    fn follow_chain_bounded_stops_at_max() {
+        // 2 -> 3 -> 4 -> 5 -> EOC
+        let (img, params) = tiny_volume(&[(2, 3), (3, 4), (4, 5), (5, FAT_END_OF_CHAIN)]);
+        let reader = SliceReader::new(img);
+        let vol = Volume::new(&reader, params);
+        let chain = vol.follow_chain_bounded(2, 2).unwrap();
+        assert_eq!(chain, vec![2, 3]);
+    }
+
+    #[test]
+    fn follow_chain_bounded_returns_short_chain_on_early_eoc() {
+        // 2 -> EOC
+        let (img, params) = tiny_volume(&[(2, FAT_END_OF_CHAIN)]);
+        let reader = SliceReader::new(img);
+        let vol = Volume::new(&reader, params);
+        let chain = vol.follow_chain_bounded(2, 4).unwrap();
+        assert_eq!(chain, vec![2]);
+    }
+
+    #[test]
+    fn follow_chain_bounded_detects_cycle_within_bound() {
+        // 2 -> 3 -> 2 (cycle)
+        let (img, params) = tiny_volume(&[(2, 3), (3, 2)]);
+        let reader = SliceReader::new(img);
+        let vol = Volume::new(&reader, params);
+        let err = vol.follow_chain_bounded(2, 8).unwrap_err();
+        assert!(matches!(err, ScannerError::ChainError { reason, .. } if reason.contains("cycle")));
+    }
+
+    #[test]
+    fn bounded_rejects_cycle_at_cap() {
+        // 2 -> 3 -> 2 (cycle), max=2 must still inspect 3's successor.
+        let (img, params) = tiny_volume(&[(2, 3), (3, 2)]);
+        let reader = SliceReader::new(img);
+        let vol = Volume::new(&reader, params);
+        let err = vol.follow_chain_bounded(2, 2).unwrap_err();
+        assert!(matches!(
+            err,
+            ScannerError::ChainError {
+                reason: "FAT cycle detected",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn bounded_allows_unvisited_continuation_at_cap() {
+        // 2 -> 3 -> 4 -> EOC, max=2 truncates after validating 3 -> 4.
+        let (img, params) = tiny_volume(&[(2, 3), (3, 4), (4, FAT_END_OF_CHAIN)]);
+        let reader = SliceReader::new(img);
+        let vol = Volume::new(&reader, params);
+        let chain = vol.follow_chain_bounded(2, 2).unwrap();
+        assert_eq!(chain, vec![2, 3]);
+    }
+
+    #[test]
+    fn bounded_rejects_invalid_terminal() {
+        // 2 -> 3, and 3 has invalid FAT entry.
+        let (img, params) = tiny_volume(&[(2, 3), (3, 0)]);
+        let reader = SliceReader::new(img);
+        let vol = Volume::new(&reader, params);
+        let err = vol.follow_chain_bounded(2, 2).unwrap_err();
+        assert!(matches!(
+            err,
+            ScannerError::ChainError {
+                reason: "free/bad/out-of-range cluster mid-chain",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn follow_chain_bounded_zero_max_is_empty() {
+        let (img, params) = tiny_volume(&[]);
+        let reader = SliceReader::new(img);
+        let vol = Volume::new(&reader, params);
+        let chain = vol.follow_chain_bounded(2, 0).unwrap();
+        assert!(chain.is_empty());
     }
 }

@@ -5,10 +5,11 @@
 //! rule from the design review: **fail-closed at candidate construction**. The
 //! candidate list returned by [`list_eviction_candidates`] *never contains* an
 //! item that must not be auto-deleted (pinned, leased, in-grace, quarantined,
-//! inside `disk.img`, **undurable `SavedClips`**, or undurable Sentry/Track
-//! unless the operator opted in and the tier is Emergency). A later sort or tier
-//! branch therefore cannot reintroduce an unsafe item — under exhaustion the safe
-//! set is simply **empty**, which the governor reports as a blocker rather than
+//! inside `disk.img`, **undurable `SavedClips`**, undurable `RecentClips` mirror
+//! without explicit local-only opt-in, or undurable Sentry/Track unless the
+//! operator opted in and the tier is Emergency). A later sort or tier branch
+//! therefore cannot reintroduce an unsafe item — under exhaustion the safe set is
+//! simply **empty**, which the governor reports as a blocker rather than
 //! broadening eligibility.
 //!
 //! Value is a comparable integer: a **base by class** (durability is the dominant
@@ -79,7 +80,7 @@ pub enum EvictionKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LossClass {
     /// Eviction loses nothing irreplaceable (durable, regenerable, or best-effort
-    /// mirror).
+    /// mirror with durable copy).
     ClassA,
     /// Eviction is permanent loss (undurable footage) — only under Emergency +
     /// explicit opt-in, and never for `SavedClips`.
@@ -103,6 +104,8 @@ pub enum ExclusionReason {
     UndurableSaved,
     /// Undurable Sentry/Track and the Emergency + opt-in gate is not satisfied.
     UndurableProtected,
+    /// Undurable `RecentClips` mirror and the local-only permanent-loss opt-in is unset.
+    UndurableRecentNotApproved,
 }
 
 /// A candidate item with all the signals needed to score it. Hard-exclusion
@@ -171,6 +174,10 @@ pub struct EvictionPolicy {
     pub tier: Tier,
     /// Operator opt-in for Emergency eviction of **undurable** Sentry/Track.
     pub allow_emergency_undurable_sentry: bool,
+    /// Operator opt-in for permanent LOCAL-ONLY eviction of undurable `RecentClips`
+    /// (the Pi archive is the only copy). Off => undurable `RecentMirror` is never a
+    /// candidate (fail-closed; keeps a future cloud user safe).
+    pub local_only_recent_delete_approved: bool,
 }
 
 /// Determine whether `item` is hard-excluded, and why. Order matters only for
@@ -191,6 +198,15 @@ pub fn hard_exclusion(item: &EvictionItem, policy: EvictionPolicy) -> Option<Exc
     }
     if item.inside_disk_img {
         return Some(ExclusionReason::InsideDiskImg);
+    }
+
+    // Undurable RecentMirror is the ONLY copy => permanent loss. Fail closed:
+    // excluded unless the operator explicitly opted in to local-only permanent loss.
+    if matches!(item.kind, EvictionKind::RecentMirror)
+        && !item.durability.is_durable()
+        && !policy.local_only_recent_delete_approved
+    {
+        return Some(ExclusionReason::UndurableRecentNotApproved);
     }
 
     // Durability floor (the fail-closed core). Only event folders carry a
@@ -286,8 +302,10 @@ pub fn value_score(item: &EvictionItem) -> i64 {
 }
 
 /// The loss class of an item (Class-B = undurable footage).
-fn loss_class(item: &EvictionItem) -> LossClass {
+#[must_use]
+pub fn loss_class(item: &EvictionItem) -> LossClass {
     match item.kind {
+        EvictionKind::RecentMirror if !item.durability.is_durable() => LossClass::ClassB,
         EvictionKind::Event { folder }
             if folder.is_event_folder() && !item.durability.is_durable() =>
         {
@@ -384,6 +402,15 @@ mod tests {
         EvictionPolicy {
             tier,
             allow_emergency_undurable_sentry: opt_in,
+            local_only_recent_delete_approved: false,
+        }
+    }
+
+    fn policy_with_recent_opt_in(tier: Tier, recent_opt_in: bool) -> EvictionPolicy {
+        EvictionPolicy {
+            tier,
+            allow_emergency_undurable_sentry: false,
+            local_only_recent_delete_approved: recent_opt_in,
         }
     }
 
@@ -426,6 +453,40 @@ mod tests {
         let cands = list_eviction_candidates(&[it], policy(Tier::Emergency, true));
         assert_eq!(cands.len(), 1);
         assert_eq!(cands[0].loss_class, LossClass::ClassB);
+    }
+
+    #[test]
+    fn undurable_recent_mirror_excluded_without_optin() {
+        let it = item(1, EvictionKind::RecentMirror, Durability::Undurable);
+        let policy = policy_with_recent_opt_in(Tier::Critical, false);
+        assert_eq!(
+            hard_exclusion(&it, policy),
+            Some(ExclusionReason::UndurableRecentNotApproved)
+        );
+        let cands = list_eviction_candidates(&[it], policy);
+        assert!(cands.is_empty());
+    }
+
+    #[test]
+    fn undurable_recent_mirror_evictable_and_classb_with_optin() {
+        let it = item(1, EvictionKind::RecentMirror, Durability::Undurable);
+        let policy = policy_with_recent_opt_in(Tier::Critical, true);
+        assert!(hard_exclusion(&it, policy).is_none());
+        let cands = list_eviction_candidates(&[it], policy);
+        assert_eq!(cands.len(), 1);
+        assert_eq!(cands[0].loss_class, LossClass::ClassB);
+    }
+
+    #[test]
+    fn durable_recent_mirror_is_classa_and_evictable_regardless_of_optin() {
+        let it = item(1, EvictionKind::RecentMirror, Durability::Durable);
+        for recent_opt_in in [false, true] {
+            let policy = policy_with_recent_opt_in(Tier::Critical, recent_opt_in);
+            assert!(hard_exclusion(&it, policy).is_none());
+            let cands = list_eviction_candidates(&[it.clone()], policy);
+            assert_eq!(cands.len(), 1);
+            assert_eq!(cands[0].loss_class, LossClass::ClassA);
+        }
     }
 
     #[test]

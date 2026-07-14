@@ -45,6 +45,7 @@ pub mod durability;
 pub mod folder;
 pub mod governor;
 pub mod io;
+pub mod index_delete_client;
 pub mod lease;
 pub mod manifest;
 pub mod probe;

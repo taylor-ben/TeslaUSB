@@ -325,6 +325,39 @@ a cheap win, not a setback (`hardware-first-development.md` §1).
 
 ---
 
+## Phase 8 — Clean up backups (only after the device is confirmed healthy)
+
+Run this ONLY once the change is proven good — do not delete a rollback path while it
+might still be needed. **All of these must hold:**
+
+- Result was **PASS** and Phase 5 post-conditions + Phase 6 journal were clean.
+- The **dead-man timer is cancelled** (Phase 6) — never prune backups while it is armed.
+- The device has stayed healthy for a settle window (re-verify SSH + `is-system-running`
+  + the daemon touched is `active`), so a delayed regression won't send you back.
+
+When they hold, prune the throwaway rollback artifacts THIS run created. Keep the single
+most-recent known-good of each kind until the next successful run supersedes it; list
+before deleting; never delete outside the allowed roots.
+
+```bash
+# per-file service/config snapshots from Phase 3 — keep newest, remove older ones
+ssh ... 'for base in $(ls /etc/systemd/system/*.b1-backup-* 2>/dev/null \
+           | sed "s/\.b1-backup-.*//" | sort -u); do
+           ls -1t "$base".b1-backup-* | tail -n +2 | xargs -r sudo rm -f; done;
+         echo backups-pruned'
+# stale SPA snapshots left by deploys — keep the newest 2
+ssh ... 'ls -1t /home/pi/spa-backup-*.tar.gz 2>/dev/null | tail -n +3 | xargs -r rm -f'
+# throwaway staged binaries / probe temp files from this run
+ssh ... 'rm -f /tmp/<staged-binary> /data/teslausb/.iotest* 2>/dev/null; echo tmp-cleared'
+```
+
+Do **not** auto-delete the full-system `/home/pi/v1-backup-*.tar.gz` (or its session-state
+copy) — that is the whole-device rollback. Remove it only on **explicit operator
+confirmation** in the prior turn. Session-state `files/` snapshots are the durable
+evidence trail; keep them.
+
+---
+
 ## Refuse-to-proceed conditions
 
 Hard stops where the skill SHALL NOT do the operation:

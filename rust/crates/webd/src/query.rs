@@ -269,6 +269,49 @@ pub(crate) fn get_trip(
     Ok(Some(TripDetailDto { trip, points }))
 }
 
+/// `GET /api/trips/:id/clips`: clips whose time window overlaps this trip,
+/// ordered by `started_at ASC, id ASC`.
+/// `None` when no trip has that id.
+pub(crate) fn clips_for_trip(
+    conn: &Connection,
+    trip_id: i64,
+) -> Result<Option<Vec<ClipDto>>, rusqlite::Error> {
+    let Some((trip_started, trip_ended)) = conn
+        .query_row(
+            "SELECT started_at, ended_at FROM trips WHERE id = ?1",
+            params![trip_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+
+    let sql = format!(
+        "{CLIP_COLS} WHERE started_at < ?1 AND COALESCE(ended_at, started_at) > ?2 \
+         ORDER BY started_at ASC, id ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut clips = stmt
+        .query_map(params![trip_ended, trip_started], map_clip)?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let ids: Vec<i64> = clips.iter().map(|clip| clip.id).collect();
+    let mut angles = angles_for_clips(conn, &ids)?;
+    let mut waypoints = waypoints_for_clips(conn, &ids)?;
+    for clip in &mut clips {
+        if let Some(set) = angles.remove(&clip.id) {
+            clip.angles = set;
+        }
+        if let Some((lat, lon)) = waypoints.remove(&clip.id) {
+            clip.lat = Some(lat);
+            clip.lon = Some(lon);
+        }
+    }
+
+    Ok(Some(clips))
+}
+
 /// `GET /api/events/:id`: a single event row.
 /// `None` when no event has that id.
 pub(crate) fn get_event(conn: &Connection, id: i64) -> Result<Option<EventDto>, rusqlite::Error> {

@@ -8,37 +8,37 @@ import type {
   StorageInfo,
   SystemHealth,
   SystemMetrics,
+  UsbVolumeInfo,
 } from "../api/types";
 import "../styles/storage.css";
 
 /**
- * Storage health screen (route `/storage`, Shell active "settings") — a
- * read-only reproduction of the legacy Flask "Storage" page captured at
- * docs/tasks/parity-baseline/storage/, carrying its `storage.css` (scoped) so
- * the cards / pills / capacity-bar look land.
+ * Storage screen (route `/storage`, Shell active "settings") — an actionable,
+ * read-only view of the device's storage built around the question the operator
+ * actually asks: "are my drives safe, and do I have room for more?"
  *
- * Data boundary (why this is NOT a 1:1 carry of the legacy settings FORM):
- * webd's API is strictly READ-ONLY — it serves device/storage status probes
- * (`/api/storage`, `/api/storage/health`, `/api/system/metrics`,
- * `/api/system/health`) but exposes NO mutation endpoint and NO partition
- * allocation / OS-reserve / auto-cleanup config. So, exactly as the sibling
- * MediaHub and Analytics screens do, this screen renders the LIVE read-only
- * facts and DEGRADES anything webd cannot honestly serve to the legacy grey
- * "—" state rather than fabricating values or building a POST form:
- *   · Header pills — SD total / SD free / Used are live from /api/storage;
- *     Allocated / OS+reserve / Unallocated stay "—" (allocation data is not
- *     exposed by the read-only API — never fabricated).
- *   · Storage Health — severity/summary + device/fstype/mount/used/total from
- *     /api/storage/health; the SD wear-telemetry rows (fs errors, I/O errors,
- *     TRIM) stay "—" (SD cards expose none).
- *   · Filesystems — one live used/free bar per mounted filesystem.
- *   · Live resources — memory/swap/load/uptime from /api/system/metrics.
- *   · Retention headroom — `governor` is null until retentiond is wired in, so
- *     a degraded note is shown instead of a fabricated eviction figure.
+ * Layout (top → bottom):
+ *   1. Recording-safety banner — one glanceable ok/warn/crit verdict driven by
+ *      SD-card archive headroom (the #1 loss invariant: when the card fills,
+ *      archiving stops and new drives are lost).
+ *   2. Saved footage — SD card: the primary ext4 volume with a stacked
+ *      composition bar showing WHY the card looks full — the pre-allocated
+ *      TESLACAM (128 GiB) + MEDIA image files, system + archived footage, and
+ *      free space.
+ *   3. The two USB drives the Tesla sees: the Dashcam drive (TESLACAM, exact
+ *      free from scannerd's exFAT allocation-bitmap reader) and the Media
+ *      library (MEDIA, statvfs) — each with used/free capacity.
+ *   4. A collapsed "Device health & diagnostics" `<details>` folding the
+ *      lower-level facts (storage-health severity, per-filesystem bars,
+ *      subsystem status, live resources, retention headroom).
  *
- * Every handler self-degrades to unknown/null and never 5xx, and each section
- * fetches independently, so a single probe blip leaves only that card in its
- * degraded state without logging (the zero-console UAT gate holds).
+ * Data boundary: webd's API is strictly READ-ONLY. Every figure comes from a
+ * live probe (`/api/storage` incl. `volumes[]`, `/api/storage/health`,
+ * `/api/system/metrics`, `/api/system/health`); anything a probe cannot serve
+ * honestly (a volume whose byte source is down, SD wear telemetry, the
+ * retention governor) DEGRADES to a grey "—"/note rather than being fabricated.
+ * Each probe is fetched independently and self-degrades, so a single blip
+ * leaves only that card unknown without logging (the zero-console UAT gate).
  */
 
 const DASH = "\u2014";
@@ -211,6 +211,256 @@ function FilesystemRow({ fs }: { fs: FilesystemEntry }) {
   );
 }
 
+/** Find a USB volume by role ("dashcam" | "media"); null when not reported. */
+function pickVolume(volumes: UsbVolumeInfo[], role: string): UsbVolumeInfo | null {
+  return volumes.find((v) => v.role === role) ?? null;
+}
+
+type BannerLevel = "ok" | "warn" | "crit" | "unknown";
+
+/** The one loss-critical fact for the user: is there room left to keep archiving
+ *  drives? Driven purely by the SD card's free fraction (the archive lives there).
+ *  crit < 5% free, warn < 12% free, else ok; unknown when no filesystem reported. */
+function recordingBanner(
+  primary: FilesystemEntry | null,
+): { level: BannerLevel; title: string; detail: string } {
+  const frac = primary != null ? usedFraction(primary.total_bytes, primary.free_bytes) : null;
+  if (primary == null || frac == null) {
+    return {
+      level: "unknown",
+      title: "Storage status unknown",
+      detail: "No readable filesystem was reported, so recording headroom can't be verified.",
+    };
+  }
+  const freeFrac = 1 - frac;
+  const freeText = humanBytes(primary.free_bytes);
+  if (freeFrac < 0.05) {
+    return {
+      level: "crit",
+      title: "Archive almost full",
+      detail: `Only ${freeText} free. New drives may not be saved — free up space or turn on auto-cleanup now.`,
+    };
+  }
+  if (freeFrac < 0.12) {
+    return {
+      level: "warn",
+      title: "Archive space getting low",
+      detail: `${freeText} free. Free up space or turn on auto-cleanup before the card fills and archiving stops.`,
+    };
+  }
+  return {
+    level: "ok",
+    title: "Recording protected",
+    detail: `${freeText} free on the SD card — there's room to keep archiving your drives.`,
+  };
+}
+
+const BANNER_ICON: Record<BannerLevel, string> = {
+  ok: "shield",
+  warn: "zap",
+  crit: "zap",
+  unknown: "hard-drive",
+};
+
+/** Top-of-page recording-safety banner. */
+function RecordingBanner({ primary }: { primary: FilesystemEntry | null }) {
+  const b = recordingBanner(primary);
+  return (
+    <section
+      class={`storage-banner storage-banner-${b.level}`}
+      id="storage-recording-banner"
+      data-banner-level={b.level}
+      role="status"
+    >
+      <span class="storage-banner-icon" aria-hidden="true">
+        <Icon name={BANNER_ICON[b.level]} />
+      </span>
+      <div class="storage-banner-text">
+        <span class="storage-banner-title">{b.title}</span>
+        <span class="storage-banner-detail">{b.detail}</span>
+      </div>
+    </section>
+  );
+}
+
+/** The two USB image files (dashcam + media) and the archived-footage library all
+ *  live on the one SD card. This card makes that composition explicit so a
+ *  near-full card is understandable and actionable, not mysterious. Falls back to
+ *  a plain used/free bar when the pre-allocated volume sizes aren't reported. */
+function SdCompositionCard({
+  primary,
+  dashcam,
+  media,
+}: {
+  primary: FilesystemEntry | null;
+  dashcam: UsbVolumeInfo | null;
+  media: UsbVolumeInfo | null;
+}) {
+  const frac = primary != null ? usedFraction(primary.total_bytes, primary.free_bytes) : null;
+
+  if (primary == null || frac == null) {
+    return (
+      <section class="storage-card" id="storage-sdcard-card">
+        <div class="storage-card-head">
+          <h2 class="storage-card-title">
+            <Icon name="database" /> Saved footage — SD card
+          </h2>
+        </div>
+        <p class="storage-note" data-testid="storage-sdcard-degraded">
+          Capacity is unavailable — no readable filesystem was reported.
+        </p>
+      </section>
+    );
+  }
+
+  const total = primary.total_bytes;
+  const free = primary.free_bytes;
+  const usedBytes = Math.max(0, total - free);
+  const dashTotal = dashcam?.total_bytes ?? null;
+  const mediaTotal = media?.total_bytes ?? null;
+  const canCompose =
+    dashTotal != null && mediaTotal != null && dashTotal + mediaTotal + free <= total;
+  const systemBytes = canCompose ? Math.max(0, total - dashTotal! - mediaTotal! - free) : null;
+  const pct = (b: number) => `${((b / total) * 100).toFixed(2)}%`;
+
+  return (
+    <section class="storage-card" id="storage-sdcard-card">
+      <div class="storage-card-head">
+        <h2 class="storage-card-title">
+          <Icon name="database" /> Saved footage — SD card
+        </h2>
+        <span class="storage-pill storage-pill-muted">{primary.mount || DASH}</span>
+      </div>
+      <div class="cap-figure">
+        <span class="cap-figure-value" data-sd-free>
+          {humanBytes(free)}
+        </span>
+        <span class="cap-figure-label">free of {humanBytes(total)}</span>
+      </div>
+
+      {canCompose && systemBytes != null ? (
+        <>
+          <div
+            class="comp-bar"
+            id="storage-composition"
+            role="img"
+            aria-label={`SD card composition: dashcam buffer ${humanBytes(dashTotal)}, media library ${humanBytes(mediaTotal)}, system and archived footage ${humanBytes(systemBytes)}, free ${humanBytes(free)} of ${humanBytes(total)}`}
+          >
+            <div class="comp-seg comp-dashcam" style={`width:${pct(dashTotal!)}`} data-comp="dashcam" />
+            <div class="comp-seg comp-media" style={`width:${pct(mediaTotal!)}`} data-comp="media" />
+            <div class="comp-seg comp-system" style={`width:${pct(systemBytes)}`} data-comp="system" />
+            <div class="comp-seg comp-free" style="flex:1" data-comp="free" />
+          </div>
+          <div class="comp-legend">
+            <span class="comp-legend-item">
+              <i class="comp-swatch comp-dashcam" /> Dashcam buffer {humanBytes(dashTotal)}
+            </span>
+            <span class="comp-legend-item">
+              <i class="comp-swatch comp-media" /> Media library {humanBytes(mediaTotal)}
+            </span>
+            <span class="comp-legend-item">
+              <i class="comp-swatch comp-system" /> System &amp; archived footage {humanBytes(systemBytes)}
+            </span>
+            <span class="comp-legend-item">
+              <i class="comp-swatch comp-free" /> Free {humanBytes(free)}
+            </span>
+          </div>
+          <p class="storage-help">
+            The dashcam buffer is space Tesla reserved up front, so the card reads
+            near-full even when there's still room to archive. "System &amp; archived
+            footage" is your saved drive library plus the operating system.
+          </p>
+        </>
+      ) : (
+        <>
+          <div
+            class="cap-bar"
+            role="img"
+            aria-label={`SD card: ${Math.round(frac * 100)}% used (${humanBytes(usedBytes)} of ${humanBytes(total)})`}
+          >
+            <div
+              class={`cap-seg ${capClass(frac)}`}
+              style={`width:${(frac * 100).toFixed(2)}%`}
+              data-sd-used
+            />
+            <div class="cap-seg cap-seg-free" style="flex:1" />
+          </div>
+          <div class="cap-legend">
+            <span>
+              <i class={`cap-swatch ${capClass(frac)}`} /> Used {humanBytes(usedBytes)}
+            </span>
+            <span>
+              <i class="cap-swatch cap-seg-free" style="border:1px solid var(--border-input)" /> Free{" "}
+              {humanBytes(free)}
+            </span>
+          </div>
+        </>
+      )}
+    </section>
+  );
+}
+
+/** A single USB drive (TESLACAM / MEDIA) capacity card. Degrades to a note when
+ *  its byte figures are null (measurement source down). */
+function VolumeCard({
+  id,
+  icon,
+  title,
+  subtitle,
+  volume,
+}: {
+  id: string;
+  icon: string;
+  title: string;
+  subtitle: string;
+  volume: UsbVolumeInfo | null;
+}) {
+  const total = volume?.total_bytes ?? null;
+  const free = volume?.free_bytes ?? null;
+  const used = volume?.used_bytes ?? null;
+  const frac = total != null && free != null ? usedFraction(total, free) : null;
+
+  return (
+    <section class="storage-card cap-card" id={id}>
+      <div class="storage-card-head">
+        <h2 class="storage-card-title">
+          <Icon name={icon} /> {title}
+        </h2>
+      </div>
+      <p class="storage-help">{subtitle}</p>
+      {total == null || free == null || frac == null ? (
+        <p class="storage-note" data-testid={`${id}-degraded`}>
+          Capacity is unavailable — the drive's measurement source isn't reporting
+          right now.
+        </p>
+      ) : (
+        <>
+          <div class="cap-figure">
+            <span class="cap-figure-value">{humanBytes(free)}</span>
+            <span class="cap-figure-label">free of {humanBytes(total)}</span>
+          </div>
+          <div
+            class="cap-bar"
+            role="img"
+            aria-label={`${title}: ${Math.round(frac * 100)}% used (${humanBytes(used)} of ${humanBytes(total)})`}
+          >
+            <div
+              class={`cap-seg ${capClass(frac)}`}
+              style={`width:${(frac * 100).toFixed(2)}%`}
+              data-vol-used
+            />
+            <div class="cap-seg cap-seg-free" style="flex:1" />
+          </div>
+          <div class="fs-meta" data-vol-meta>
+            {humanBytes(used)} used ({Math.round(frac * 100)}%)
+            {volume && !volume.stable ? " · measured while recording — approximate" : ""}
+          </div>
+        </>
+      )}
+    </section>
+  );
+}
+
 export function StorageHealth() {
   const [info, setInfo] = useState<StorageInfo | null>(null);
   const [health, setHealth] = useState<StorageHealthDto | null>(null);
@@ -230,12 +480,9 @@ export function StorageHealth() {
 
   const filesystems = info?.filesystems ?? [];
   const primary = primaryFs(filesystems);
-  const primaryFrac =
-    primary != null ? usedFraction(primary.total_bytes, primary.free_bytes) : null;
-  const primaryUsed =
-    primary != null && primaryFrac != null
-      ? Math.max(0, primary.total_bytes - primary.free_bytes)
-      : null;
+  const volumes = info?.volumes ?? [];
+  const dashcam = pickVolume(volumes, "dashcam");
+  const media = pickVolume(volumes, "media");
 
   // Storage-relevant subsystems lifted from /api/system/health (degrade to "—").
   const STORAGE_SUBSYSTEMS = [
@@ -255,63 +502,38 @@ export function StorageHealth() {
       <header class="storage-header">
         <h1 class="storage-title">Storage</h1>
         <p class="storage-copy">
-          Live, read-only view of the device's storage. The gadget exposes the
-          SD card as USB media to Tesla; this page reports measured capacity,
-          filesystem health, and live system resources. Allocation and
-          auto-cleanup tuning are managed on the device — the read-only catalog
-          API does not expose those controls, so allocation figures below show
-          {" "}
-          {DASH} until a writable control plane is wired in.
+          Live, read-only view of the two USB drives Tesla records to and the SD
+          card that backs them. Capacity is measured on the device; figures that
+          can't be read show {DASH} rather than a guess.
         </p>
-        <div class="storage-pill-row">
-          <span class="storage-pill">
-            SD total: {humanBytes(primary?.total_bytes)}
-          </span>
-          <span class="storage-pill">
-            SD free: {humanBytes(primary?.free_bytes)}
-          </span>
-          <span class="storage-pill">Used: {humanBytes(primaryUsed)}</span>
-          {/* Allocation breakdown is not exposed by the read-only API — shown
-              as "—" rather than fabricated (parity-degrade). */}
-          <span class="storage-pill storage-pill-muted">Allocated: {DASH}</span>
-          <span class="storage-pill storage-pill-muted">OS + reserve: {DASH}</span>
-          <span class="storage-pill storage-pill-muted">Unallocated: {DASH}</span>
-        </div>
-
-        {primary != null && primaryFrac != null ? (
-          <>
-            <div
-              class="cap-bar"
-              role="img"
-              aria-label={`Primary volume ${primary.mount}: ${Math.round(primaryFrac * 100)}% used (${humanBytes(primaryUsed)} of ${humanBytes(primary.total_bytes)})`}
-            >
-              <div
-                class={`cap-seg ${capClass(primaryFrac)}`}
-                style={`width:${(primaryFrac * 100).toFixed(2)}%`}
-                data-primary-used
-              />
-              <div class="cap-seg cap-seg-free" style="flex:1" />
-            </div>
-            <div class="cap-legend">
-              <span>
-                <i class={`cap-swatch ${capClass(primaryFrac)}`} />
-                Used {humanBytes(primaryUsed)} on {primary.mount}
-              </span>
-              <span>
-                <i
-                  class="cap-swatch cap-seg-free"
-                  style="border:1px solid var(--border-input)"
-                />
-                Free {humanBytes(primary.free_bytes)}
-              </span>
-            </div>
-          </>
-        ) : (
-          <p class="storage-note" data-testid="storage-capacity-degraded">
-            Capacity is unavailable — no readable filesystem was reported.
-          </p>
-        )}
       </header>
+
+      <RecordingBanner primary={primary} />
+
+      <SdCompositionCard primary={primary} dashcam={dashcam} media={media} />
+
+      <div class="cap-card-grid">
+        <VolumeCard
+          id="storage-dashcam-card"
+          icon="video"
+          title="TeslaCam"
+          subtitle="The drive Tesla saves dashcam and Sentry clips to. Free space is measured exactly from the drive's own allocation map."
+          volume={dashcam}
+        />
+        <VolumeCard
+          id="storage-media-card"
+          icon="music"
+          title="Media"
+          subtitle="Holds Boombox, Light Show and other media you load for the car. Reported by the filesystem."
+          volume={media}
+        />
+      </div>
+
+      <details class="storage-details" id="storage-device-health">
+        <summary class="storage-details-summary">
+          <Icon name="settings" /> Device health &amp; diagnostics
+        </summary>
+        <div class="storage-details-body">
 
       {/* Storage Health — /api/storage/health. Wear-telemetry rows degrade. */}
       <section class="storage-card" id="storage-health-card">
@@ -451,6 +673,8 @@ export function StorageHealth() {
           </p>
         )}
       </section>
+        </div>
+      </details>
     </section>
   );
 }

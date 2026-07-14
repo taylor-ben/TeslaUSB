@@ -27,6 +27,53 @@ pub enum Request {
         /// Preference value.
         value: String,
     },
+    /// Claim a LIVE, eligible archive item for delete, re-checking the full
+    /// eviction allowlist predicate atomically server-side.
+    ClaimEvictionCandidate {
+        /// Archive item id.
+        id: i64,
+        /// Items at/after this floor are ineligible (permanent-loss guard).
+        recency_floor_epoch: i64,
+        /// Opt-in: allow claiming rows that are not cloud-durable.
+        #[serde(default)]
+        allow_undurable: bool,
+    },
+    /// Transition a claimed archive item to deleting.
+    MarkArchiveDeleting {
+        /// Archive item id.
+        id: i64,
+    },
+    /// Transition a deleting archive item to deleted.
+    MarkArchiveDeleted {
+        /// Archive item id.
+        id: i64,
+        /// Bytes freed by deletion.
+        bytes_freed: i64,
+    },
+    /// Release a delete claim back to LIVE.
+    ReleaseArchiveDeleteClaim {
+        /// Archive item id.
+        id: i64,
+    },
+    /// Quarantine an archive item.
+    QuarantineArchiveItem {
+        /// Archive item id.
+        id: i64,
+        /// Human-readable reason.
+        reason: String,
+    },
+    /// List oldest-first eviction candidates.
+    ListEvictionCandidates {
+        /// Items newer than or equal to this floor are ineligible.
+        recency_floor_epoch: i64,
+        /// Opt-in: include rows that are not cloud-durable.
+        #[serde(default)]
+        allow_undurable: bool,
+        /// Max rows requested.
+        limit: u32,
+    },
+    /// List rows that need delete-state crash recovery.
+    ListRecoveryRows {},
 }
 
 /// Archive registration payload.
@@ -78,6 +125,36 @@ pub struct ArchiveAngle {
     pub size_bytes: i64,
 }
 
+/// One eviction candidate row over the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvictionCandidateWire {
+    /// Archive item id.
+    pub id: i64,
+    /// Archive-root-relative item path.
+    pub path: String,
+    /// Archive bytes.
+    pub size_bytes: i64,
+    /// Archive completion epoch seconds.
+    pub archived_at: i64,
+    /// Source folder class.
+    pub folder_class: String,
+}
+
+/// One delete-state recovery row over the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryRowWire {
+    /// Archive item id.
+    pub id: i64,
+    /// Current delete state.
+    pub delete_state: String,
+    /// Archive-root-relative item path.
+    pub path: String,
+    /// Archive bytes.
+    pub size_bytes: i64,
+    /// Delete generation token, when present.
+    pub delete_gen: Option<String>,
+}
+
 /// Outbound RPC response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -105,6 +182,27 @@ pub enum Response {
     PrefSet {
         /// The updated preference key.
         key: String,
+    },
+    /// Claim succeeded (`LIVE → DELETE_CLAIMED`).
+    Claimed {},
+    /// Claim was denied.
+    ClaimDenied {
+        /// Human-readable reason.
+        reason: String,
+    },
+    /// No such row exists.
+    NotFound {},
+    /// Generic write-ack response for delete-state transitions.
+    Acked {},
+    /// Eviction candidates query result.
+    EvictionCandidates {
+        /// Candidate rows.
+        items: Vec<EvictionCandidateWire>,
+    },
+    /// Delete-state recovery rows query result.
+    RecoveryRows {
+        /// Rows needing recovery.
+        rows: Vec<RecoveryRowWire>,
     },
 }
 
@@ -164,9 +262,12 @@ mod tests {
 
     use std::io::Cursor;
 
+    use serde_json::json;
+
     use super::{
-        ArchiveAngle, ArchiveUnit, MAX_REQUEST_FRAME, RegisterArchivedClip, Request, Response,
-        read_frame, read_request, write_frame, write_response,
+        ArchiveAngle, ArchiveUnit, EvictionCandidateWire, MAX_REQUEST_FRAME, RecoveryRowWire,
+        RegisterArchivedClip, Request, Response, read_frame, read_request, write_frame,
+        write_response,
     };
 
     #[test]
@@ -296,5 +397,119 @@ mod tests {
         );
         let decoded: Response = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn delete_control_requests_serialize_with_expected_cmd_tags() {
+        let cases = vec![
+            (
+                "claim_eviction_candidate",
+                Request::ClaimEvictionCandidate {
+                    id: 1,
+                    recency_floor_epoch: 1_700_000_000,
+                    allow_undurable: false,
+                },
+            ),
+            (
+                "mark_archive_deleting",
+                Request::MarkArchiveDeleting { id: 2 },
+            ),
+            (
+                "mark_archive_deleted",
+                Request::MarkArchiveDeleted {
+                    id: 3,
+                    bytes_freed: 4096,
+                },
+            ),
+            (
+                "release_archive_delete_claim",
+                Request::ReleaseArchiveDeleteClaim { id: 4 },
+            ),
+            (
+                "quarantine_archive_item",
+                Request::QuarantineArchiveItem {
+                    id: 5,
+                    reason: "bad state".to_owned(),
+                },
+            ),
+            (
+                "list_eviction_candidates",
+                Request::ListEvictionCandidates {
+                    recency_floor_epoch: 1_700_000_000,
+                    allow_undurable: false,
+                    limit: 100,
+                },
+            ),
+            ("list_recovery_rows", Request::ListRecoveryRows {}),
+        ];
+
+        for (expected_cmd, request) in cases {
+            let encoded = serde_json::to_value(&request).unwrap();
+            assert_eq!(
+                encoded.get("cmd").and_then(serde_json::Value::as_str),
+                Some(expected_cmd)
+            );
+            let decoded: Request = serde_json::from_value(encoded).unwrap();
+            assert_eq!(decoded, request);
+        }
+    }
+
+    #[test]
+    fn delete_control_responses_serialize_with_expected_status_tags() {
+        let cases = vec![
+            ("claimed", Response::Claimed {}),
+            (
+                "claim_denied",
+                Response::ClaimDenied {
+                    reason: "unexpired lease".to_owned(),
+                },
+            ),
+            ("not_found", Response::NotFound {}),
+            ("acked", Response::Acked {}),
+            (
+                "eviction_candidates",
+                Response::EvictionCandidates {
+                    items: vec![EvictionCandidateWire {
+                        id: 9,
+                        path: "archive/old/clip".to_owned(),
+                        size_bytes: 1_024,
+                        archived_at: 1_700_000_000,
+                        folder_class: "RecentClips".to_owned(),
+                    }],
+                },
+            ),
+            (
+                "recovery_rows",
+                Response::RecoveryRows {
+                    rows: vec![RecoveryRowWire {
+                        id: 10,
+                        delete_state: "DELETE_CLAIMED".to_owned(),
+                        path: "archive/old/clip".to_owned(),
+                        size_bytes: 2_048,
+                        delete_gen: Some("abc".to_owned()),
+                    }],
+                },
+            ),
+        ];
+
+        for (expected_status, response) in cases {
+            let encoded = serde_json::to_value(&response).unwrap();
+            assert_eq!(
+                encoded.get("status").and_then(serde_json::Value::as_str),
+                Some(expected_status)
+            );
+            let decoded: Response = serde_json::from_value(encoded).unwrap();
+            assert_eq!(decoded, response);
+        }
+    }
+
+    #[test]
+    fn unknown_request_cmd_fails_to_deserialize() {
+        let raw = json!({
+            "cmd": "definitely_unknown_cmd",
+            "id": 42
+        });
+        let result = serde_json::from_value::<Request>(raw);
+        assert!(result.is_err());
     }
 }

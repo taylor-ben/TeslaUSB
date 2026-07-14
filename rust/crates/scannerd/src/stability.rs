@@ -262,7 +262,7 @@ mod tests {
         // Resume before quiescence elapsed → window resets.
         assert!(t.observe(&resumed, 8).is_empty());
         assert!(t.observe(&resumed, 12).is_empty()); // held only 4s
-        // Now it truly settles.
+                                                     // Now it truly settles.
         assert_eq!(t.observe(&resumed, 20), vec![0]);
     }
 
@@ -273,8 +273,8 @@ mod tests {
         let grown = vec![record("2026-06-01_20-10-04-front.mp4", 2000, 2000)];
         t.observe(&small, 0);
         t.observe(&small, 20); // would be eligible, but then it grows…
-        // Re-fetch: the file grew between the eligible scan; emulate a
-        // fresh tracker timeline where growth happens before emit.
+                               // Re-fetch: the file grew between the eligible scan; emulate a
+                               // fresh tracker timeline where growth happens before emit.
         let mut t2 = StabilityTracker::new(config());
         assert!(t2.observe(&small, 0).is_empty());
         assert!(t2.observe(&grown, 5).is_empty()); // changed → reset
@@ -343,7 +343,8 @@ mod tests {
                     }
                     1 => {
                         dlen += 1 + u64::from(next(&mut rng) % 500);
-                        vdl = dlen.saturating_sub(1 + u64::from(next(&mut rng) % 200)); // mid-write
+                        vdl = dlen.saturating_sub(1 + u64::from(next(&mut rng) % 200));
+                        // mid-write
                     }
                     2 => vdl = dlen, // finalize a stalled write
                     3 => checksum_ok = next(&mut rng) % 2 == 0,

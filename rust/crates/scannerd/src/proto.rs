@@ -77,6 +77,16 @@ pub struct ReadFileRequest {
     pub handle: Option<ClipIdentity>,
 }
 
+/// A client→server request on the dedicated stat socket. Currently a
+/// parameterless "give me `TeslaCam` free space" ask; `slot` defaults to 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub struct VolumeStatsRequest {
+    /// Requested partition slot (0 = `TeslaCam`).
+    #[serde(default)]
+    pub slot: u8,
+}
+
 /// `ReadFile` JSON response header.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -98,6 +108,38 @@ pub enum ReadFileHeader {
     NotFound,
     /// Offset is beyond readable size.
     OutOfRange,
+    /// Request failed.
+    Error {
+        /// Human-readable reason.
+        message: String,
+    },
+}
+
+/// Stat-socket JSON response header.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum VolumeStatsReply {
+    /// Successful free-space facts.
+    Ok {
+        /// Total data clusters.
+        cluster_count: u32,
+        /// Bytes per cluster.
+        bytes_per_cluster: u64,
+        /// Allocated clusters.
+        used_clusters: u32,
+        /// Free clusters.
+        free_clusters: u32,
+        /// Total bytes in cluster heap.
+        total_bytes: u64,
+        /// Allocated bytes.
+        used_bytes: u64,
+        /// Free bytes.
+        free_bytes: u64,
+        /// Whether repeated bitmap reads agreed.
+        stable: bool,
+    },
+    /// The requested slot has no readable exFAT volume.
+    Unavailable,
     /// Request failed.
     Error {
         /// Human-readable reason.
@@ -197,10 +239,11 @@ mod tests {
     use std::io::Cursor;
 
     use super::{
-        ClipIdentity, MAX_FRAME, ReadFileHeader, ReadFileRequest, Request, read_batch, read_frame,
-        read_request, write_batch, write_frame, write_request,
+        read_batch, read_frame, read_request, write_batch, write_frame, write_request,
+        ClipIdentity, ReadFileHeader, ReadFileRequest, Request, VolumeStatsReply,
+        VolumeStatsRequest, MAX_FRAME,
     };
-    use crate::record::{PROTOCOL_VERSION, ProducerStats, ScanBatch};
+    use crate::record::{ProducerStats, ScanBatch, PROTOCOL_VERSION};
 
     #[test]
     fn frame_roundtrips() {
@@ -345,5 +388,38 @@ mod tests {
             .unwrap(),
             "{\"status\":\"error\",\"message\":\"...\"}"
         );
+    }
+
+    #[test]
+    fn volume_stats_request_roundtrips_and_defaults_slot() {
+        let req = VolumeStatsRequest { slot: 0 };
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(json, "{\"slot\":0}");
+        let decoded: VolumeStatsRequest = serde_json::from_str("{}").unwrap();
+        assert_eq!(decoded, VolumeStatsRequest::default());
+    }
+
+    #[test]
+    fn volume_stats_reply_roundtrips() {
+        for reply in [
+            VolumeStatsReply::Ok {
+                cluster_count: 123,
+                bytes_per_cluster: 32_768,
+                used_clusters: 33,
+                free_clusters: 90,
+                total_bytes: 4_030_464,
+                used_bytes: 1_081_344,
+                free_bytes: 2_949_120,
+                stable: true,
+            },
+            VolumeStatsReply::Unavailable,
+            VolumeStatsReply::Error {
+                message: "boom".to_owned(),
+            },
+        ] {
+            let encoded = serde_json::to_vec(&reply).unwrap();
+            let decoded: VolumeStatsReply = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(decoded, reply);
+        }
     }
 }

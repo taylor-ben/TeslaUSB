@@ -33,6 +33,7 @@ use crate::read_client::{
     UnavailableReadFileClient,
 };
 use crate::scheduler::SchedulerClient;
+use crate::stats_client::UnavailableVolumeStatsClient;
 use crate::{
     Catalog, MediaConfig, build_router, router_with_all_clients,
     router_with_all_clients_and_read_client, router_with_clients, router_with_gadget,
@@ -290,6 +291,41 @@ async fn trip_detail_includes_points_and_404s() {
     assert_eq!(points[0]["speed"], 10.0);
 
     let (status, body) = get_json(&fx.app, "/api/trips/999").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["code"], "not_found");
+}
+
+#[tokio::test]
+async fn trip_clips_lists_overlapping_clips_and_404s() {
+    let fx = fixture();
+    let conn = Connection::open(&fx.db_path).unwrap();
+    conn.execute_batch(
+        "INSERT INTO clips (id, canonical_key, started_at, ended_at, partition, folder_class, is_sentry, duration_s, availability, created_at, updated_at) VALUES
+            (3, 'clip-3', 900, 1001, 'p1', 'RecentClips', 0, 101.0, 'present', 0, 0),
+            (4, 'clip-4', 1190, 1300, 'p1', 'RecentClips', 0, 110.0, 'present', 0, 0),
+            (5, 'clip-5', 700, 999, 'p1', 'RecentClips', 0, 299.0, 'present', 0, 0),
+            (6, 'clip-6', 1200, 1300, 'p1', 'RecentClips', 0, 100.0, 'present', 0, 0);
+         INSERT INTO angles (id, clip_id, camera, file_ref, view_kind, offset_ms, duration_s, size_bytes) VALUES
+            (4, 3, 'front', 'p1/clip-3/front.mp4', 'ro_usb', 0, 101.0, 4444),
+            (5, 4, 'front', 'p1/clip-4/front.mp4', 'ro_usb', 0, 110.0, 5555),
+            (6, 5, 'front', 'p1/clip-5/front.mp4', 'ro_usb', 0, 299.0, 6666),
+            (7, 6, 'front', 'p1/clip-6/front.mp4', 'ro_usb', 0, 100.0, 7777);",
+    )
+    .unwrap();
+
+    let (status, body) = get_json(&fx.app, "/api/trips/1/clips").await;
+    assert_eq!(status, StatusCode::OK);
+    let items = body.as_array().unwrap();
+    let ids = items
+        .iter()
+        .map(|item| item["id"].as_i64().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec![3, 1, 4]);
+    for item in items {
+        assert!(!item["angles"].as_array().unwrap().is_empty());
+    }
+
+    let (status, body) = get_json(&fx.app, "/api/trips/999/clips").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["error"]["code"], "not_found");
 }
@@ -721,6 +757,7 @@ fn catalog_accepts_current_indexd_schema() {
 /// secret file outside the jail) alive for the test.
 struct MediaFixture {
     _dir: TempDir,
+    db_path: PathBuf,
     app: Router,
 }
 
@@ -757,6 +794,79 @@ impl ReadFileClient for FakeReadFileClient {
 /// Deterministic byte pattern so range slices can be asserted exactly.
 fn pattern(len: usize) -> Vec<u8> {
     (0..len).map(|i| u8::try_from(i % 256).unwrap()).collect()
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn mp4_box(name: &[u8; 4], body: &[u8]) -> Vec<u8> {
+    let size = u32::try_from(8 + body.len()).unwrap();
+    let mut v = Vec::with_capacity(8 + body.len());
+    v.extend_from_slice(&size.to_be_bytes());
+    v.extend_from_slice(name);
+    v.extend_from_slice(body);
+    v
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn mp4_nested_box(name: &[u8; 4], children: &[Vec<u8>]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for child in children {
+        body.extend_from_slice(child);
+    }
+    mp4_box(name, &body)
+}
+
+fn mdhd_v0_body(timescale: u32) -> Vec<u8> {
+    let mut v = vec![0u8; 24];
+    v[12..16].copy_from_slice(&timescale.to_be_bytes());
+    v
+}
+
+fn stts_body_one_entry(count: u32, delta: u32) -> Vec<u8> {
+    let mut v = vec![0u8; 16];
+    v[4..8].copy_from_slice(&1u32.to_be_bytes());
+    v[8..12].copy_from_slice(&count.to_be_bytes());
+    v[12..16].copy_from_slice(&delta.to_be_bytes());
+    v
+}
+
+fn tesla_sei_nal(gear: u8, speed_mps: f32) -> Vec<u8> {
+    let mut proto = vec![0x10, gear, 0x25];
+    proto.extend_from_slice(&speed_mps.to_le_bytes());
+    let payload_size = u8::try_from(proto.len() + 2).unwrap();
+    let mut nal = vec![0x06, 0x05, payload_size, 0x42, 0x69];
+    nal.extend_from_slice(&proto);
+    nal.push(0x80);
+    nal
+}
+
+fn vcl_nal(nal_type: u8) -> Vec<u8> {
+    vec![nal_type, 0x00, 0x00]
+}
+
+fn avcc_nal(nal: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(4 + nal.len());
+    v.extend_from_slice(&u32::try_from(nal.len()).unwrap().to_be_bytes());
+    v.extend_from_slice(nal);
+    v
+}
+
+fn sei_fixture_clip(gear: u8, speed_mps: f32) -> Vec<u8> {
+    let stts = mp4_box(b"stts", &stts_body_one_entry(1, 3000));
+    let stbl = mp4_nested_box(b"stbl", &[stts]);
+    let minf = mp4_nested_box(b"minf", &[stbl]);
+    let mdhd = mp4_box(b"mdhd", &mdhd_v0_body(30_000));
+    let mdia = mp4_nested_box(b"mdia", &[mdhd, minf]);
+    let trak = mp4_nested_box(b"trak", &[mdia]);
+    let moov = mp4_nested_box(b"moov", &[trak]);
+    let mut mdat_body = Vec::new();
+    mdat_body.extend_from_slice(&avcc_nal(&tesla_sei_nal(gear, speed_mps)));
+    mdat_body.extend_from_slice(&avcc_nal(&vcl_nal(0x05)));
+    let mdat = mp4_box(b"mdat", &mdat_body);
+
+    let mut clip = Vec::new();
+    clip.extend_from_slice(&moov);
+    clip.extend_from_slice(&mdat);
+    clip
 }
 
 fn media_content_app(files: &[(&str, &[u8])], create_root: bool) -> (TempDir, Router) {
@@ -809,6 +919,7 @@ fn media_fixture_with_read_client(
     std::fs::create_dir_all(archive.join("p1/clip-13")).unwrap();
     std::fs::create_dir_all(archive.join("p1/clip-17")).unwrap();
     std::fs::create_dir_all(archive.join("p1/clip-18")).unwrap();
+    std::fs::create_dir_all(archive.join("p1/clip-23")).unwrap();
     std::fs::create_dir_all(&cache).unwrap();
 
     // Real archive files.
@@ -822,6 +933,8 @@ fn media_fixture_with_read_client(
     std::fs::write(archive.join("p1/clip-17/cam.mp4"), pattern(20)).unwrap();
     // A 0-byte archive file (empty-file range handling).
     std::fs::write(archive.join("p1/clip-18/empty.mp4"), pattern(0)).unwrap();
+    // Archive file with Tesla-shaped SEI for telemetry endpoint coverage.
+    std::fs::write(archive.join("p1/clip-23/front.mp4"), sei_fixture_clip(1, 12.5)).unwrap();
     // clip 16's archive file is intentionally NOT created (missing-on-disk).
 
     // A secret file OUTSIDE the archive root, targeted by the escape angles.
@@ -858,9 +971,14 @@ fn media_fixture_with_read_client(
         scheduler,
         indexd,
         read_client,
+        Arc::new(UnavailableVolumeStatsClient),
         chime_dir,
     );
-    MediaFixture { _dir: dir, app }
+    MediaFixture {
+        _dir: dir,
+        db_path,
+        app,
+    }
 }
 
 fn seed_media(path: &std::path::Path, big: usize, secret_abs: &str) {
@@ -882,7 +1000,10 @@ fn seed_media(path: &std::path::Path, big: usize, secret_abs: &str) {
             (19, 'clip-19', 1000, 1200, 'p1', 'SavedClips', 0, 60.0, 'present', 0, 0),
             (20, 'clip-20', 1000, 1200, 'slot0', 'RecentClips', 0, 60.0, 'present', 0, 0),
             (21, 'clip-21', 1000, 1200, 'slot0', 'RecentClips', 0, 60.0, 'present', 0, 0),
-            (22, 'clip-22', 1000, 1200, 'slot0', 'RecentClips', 0, 60.0, 'present', 0, 0);
+            (22, 'clip-22', 1000, 1200, 'slot0', 'RecentClips', 0, 60.0, 'present', 0, 0),
+            (23, 'clip-23', 1000, 1200, 'p1', 'SavedClips', 0, 60.0, 'present', 0, 0),
+            (30, 'clip-30', 1000, 1200, 'slot0', 'RecentClips', 0, 60.0, 'present', 0, 0),
+            (31, 'clip-31', 1000, 1200, 'slot0', 'RecentClips', 0, 60.0, 'present', 0, 0);
          INSERT INTO angles (id, clip_id, camera, file_ref, view_kind, offset_ms, duration_s, size_bytes) VALUES
             (10, 10, 'front', 'p1/clip-10/front.mp4', 'archive', 0, 60.0, 100),
             (11, 10, 'back',  'p1/clip-10/back.mp4',  'archive', 0, 60.0, 40),
@@ -892,7 +1013,10 @@ fn seed_media(path: &std::path::Path, big: usize, secret_abs: &str) {
             (16, 15, 'left_repeater', 'p1/clip-10/left.mp4', 'ro_usb', 0, 60.0, 10),
             (17, 16, 'front', 'p1/clip-16/missing.mp4', 'archive', 0, 60.0, 10),
             (19, 18, 'front', 'p1/clip-18/empty.mp4', 'archive', 0, 0.0, 999),
-            (20, 19, 'front', 'p1/clip-19/evil.mp4', 'archive', 0, 60.0, 10);",
+            (20, 19, 'front', 'p1/clip-19/evil.mp4', 'archive', 0, 60.0, 10),
+            (24, 23, 'front', 'p1/clip-23/front.mp4', 'archive', 0, 60.0, 5000),
+            (30, 30, 'front', 'p1/clip-30/front.mp4', 'ro_usb', 0, 60.0, 5000),
+            (31, 31, 'front', 'p1/clip-31/front.mp4', 'ro_usb', 0, 60.0, 300000000);",
     )
     .unwrap();
     // Multi-window non-archive ('live') angles whose stable sizes exceed
@@ -1198,6 +1322,193 @@ async fn stream_defaults_to_front_camera() {
     let (status, _, body) = request(&fx.app, Method::GET, "/api/clips/10/stream", None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body.len(), 100);
+}
+
+#[tokio::test]
+async fn telemetry_unknown_clip_is_404() {
+    let fx = media_fixture();
+    let (status, _, _) = request(&fx.app, Method::GET, "/api/clips/999/telemetry", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn telemetry_non_archive_angle_is_empty_200() {
+    // Non-archive telemetry now tries the read_client path; with the default
+    // unavailable client it fails closed to [].
+    let fx = media_fixture();
+    let (status, _, body) = request(
+        &fx.app,
+        Method::GET,
+        "/api/clips/10/telemetry?camera=left_repeater",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let parsed: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed, json!([]));
+}
+
+#[tokio::test]
+async fn telemetry_ro_usb_with_sei_returns_samples() {
+    let sei = sei_fixture_clip(1, 12.5);
+    let identity = ClipIdentity {
+        first_cluster: 1,
+        total_size: sei.len() as u64,
+        name_hash: 7,
+    };
+    let fake = Arc::new(FakeReadFileClient::with_replies(vec![Ok(ReadFileOk {
+        identity,
+        readable_size: sei.len() as u64,
+        eof: true,
+        bytes: sei.clone(),
+    })]));
+    let fx = media_fixture_with_read_client(fake.clone());
+    // The ro_usb telemetry path anchors the read to the catalog `size_bytes`
+    // (fail-closed on substitution), so align the seeded size with the bytes the
+    // fake serves.
+    {
+        let conn = Connection::open(&fx.db_path).unwrap();
+        conn.execute(
+            "UPDATE angles SET size_bytes = ?1 WHERE id = 30",
+            params![sei.len() as i64],
+        )
+        .unwrap();
+    }
+
+    let (status, _, body) = request(&fx.app, Method::GET, "/api/clips/30/telemetry", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let parsed: Value = serde_json::from_slice(&body).unwrap();
+    let samples = parsed.as_array().unwrap();
+    assert!(!samples.is_empty());
+    assert_eq!(fake.requests()[0].path, "p1/clip-30/front.mp4");
+}
+
+#[tokio::test]
+async fn telemetry_ro_usb_size_mismatch_is_empty() {
+    // Clip 30 is seeded with size_bytes = 5000, but the fake serves a smaller
+    // SEI clip whose byte-count/allocation differ from the catalog. The read
+    // succeeds, yet the size anchor must fail closed with `[]` (the file was
+    // recreated/substituted since ingest) rather than parse a wrong file.
+    let sei = sei_fixture_clip(1, 12.5);
+    assert_ne!(sei.len() as u64, 5000, "fixture must differ from seeded size");
+    let identity = ClipIdentity {
+        first_cluster: 1,
+        total_size: sei.len() as u64,
+        name_hash: 7,
+    };
+    let fake = Arc::new(FakeReadFileClient::with_replies(vec![Ok(ReadFileOk {
+        identity,
+        readable_size: sei.len() as u64,
+        eof: true,
+        bytes: sei.clone(),
+    })]));
+    let fx = media_fixture_with_read_client(fake.clone());
+
+    let (status, _, body) = request(&fx.app, Method::GET, "/api/clips/30/telemetry", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let parsed: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed, json!([]));
+    // The read was attempted (unlike the pre-read size gates) before the anchor
+    // rejected the substituted bytes.
+    assert_eq!(fake.requests()[0].path, "p1/clip-30/front.mp4");
+}
+
+#[tokio::test]
+async fn telemetry_ro_usb_oversize_is_empty() {
+    let fake = Arc::new(FakeReadFileClient::default());
+    let fx = media_fixture_with_read_client(fake.clone());
+
+    let (status, _, body) = request(&fx.app, Method::GET, "/api/clips/31/telemetry", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let parsed: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed, json!([]));
+    assert!(fake.requests().is_empty());
+}
+
+#[tokio::test]
+async fn telemetry_ro_usb_null_size_is_empty() {
+    let fake = Arc::new(FakeReadFileClient::default());
+    let fx = media_fixture_with_read_client(fake.clone());
+
+    let (status, _, body) = request(&fx.app, Method::GET, "/api/clips/22/telemetry", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let parsed: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed, json!([]));
+    assert!(fake.requests().is_empty());
+}
+
+#[tokio::test]
+async fn telemetry_ro_usb_changed_identity_is_empty() {
+    let first = sei_fixture_clip(1, 12.5);
+    let split = first.len() / 2;
+    let identity_a = ClipIdentity {
+        first_cluster: 11,
+        total_size: first.len() as u64,
+        name_hash: 22,
+    };
+    let identity_b = ClipIdentity {
+        first_cluster: 12,
+        total_size: first.len() as u64,
+        name_hash: 23,
+    };
+    let fake = Arc::new(FakeReadFileClient::with_replies(vec![
+        Ok(ReadFileOk {
+            identity: identity_a,
+            readable_size: first.len() as u64,
+            eof: false,
+            bytes: first[..split].to_vec(),
+        }),
+        Ok(ReadFileOk {
+            identity: identity_b,
+            readable_size: first.len() as u64,
+            eof: true,
+            bytes: first[split..].to_vec(),
+        }),
+    ]));
+    let fx = media_fixture_with_read_client(fake);
+
+    let (status, _, body) = request(&fx.app, Method::GET, "/api/clips/30/telemetry", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let parsed: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed, json!([]));
+}
+
+#[tokio::test]
+async fn telemetry_archive_without_sei_is_empty_200() {
+    let fx = media_fixture();
+    let (status, _, body) = request(&fx.app, Method::GET, "/api/clips/10/telemetry", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let parsed: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed, json!([]));
+}
+
+#[tokio::test]
+async fn telemetry_archive_with_sei_returns_samples() {
+    let fx = media_fixture();
+    let (status, _, body) = request(&fx.app, Method::GET, "/api/clips/23/telemetry", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let parsed: Value = serde_json::from_slice(&body).unwrap();
+    let samples = parsed.as_array().unwrap();
+    assert!(!samples.is_empty());
+    let first = samples[0].as_object().unwrap();
+    for key in [
+        "time",
+        "speedMps",
+        "gear",
+        "steeringAngle",
+        "blinkerLeft",
+        "blinkerRight",
+        "brakeApplied",
+        "acceleratorPedalPosition",
+        "autopilotState",
+    ] {
+        assert!(first.contains_key(key), "missing key: {key}");
+    }
+    assert!(!first.contains_key("speed_mps"));
+    assert!(!first.contains_key("steering_angle"));
+    assert_eq!(first.get("gear").and_then(Value::as_u64), Some(1));
+    let speed = first.get("speedMps").and_then(Value::as_f64).unwrap();
+    assert!((speed - 12.5).abs() < 0.001);
 }
 
 #[tokio::test]

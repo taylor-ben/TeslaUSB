@@ -23,6 +23,9 @@ mod serve;
 #[cfg(unix)]
 mod readserve;
 
+#[cfg(unix)]
+mod statserve;
+
 #[cfg(not(unix))]
 fn main() -> ExitCode {
     eprintln!("scannerd: this binary runs on Linux (the Pi) only");
@@ -45,11 +48,11 @@ mod unix_app {
     use scannerd::clip::parse_clip_name;
     use scannerd::error::ScannerError;
     use scannerd::mbr::parse_mbr;
-    use scannerd::mp4probe::{Codec, probe_mp4};
+    use scannerd::mp4probe::{probe_mp4, Codec};
     use scannerd::seiscan::scan_sei;
     use scannerd::stability::{StabilityConfig, StabilityTracker};
     use scannerd::volume::Volume;
-    use scannerd::walk::{FileRecord, walk_volume};
+    use scannerd::walk::{walk_volume, FileRecord};
 
     use crate::io::PreadReader;
 
@@ -85,7 +88,7 @@ mod unix_app {
         let Some(path) = args.get(1) else {
             eprintln!(
                 "usage: scannerd <image-path> [--watch <interval_secs> <iterations>]\n       \
-                 scannerd serve <image-path> [--socket <path>] [--read-socket <path>] [--sample-rate <n>]"
+                scannerd serve <image-path> [--socket <path>] [--read-socket <path>] [--stat-socket <path>] [--sample-rate <n>]"
             );
             return ExitCode::FAILURE;
         };

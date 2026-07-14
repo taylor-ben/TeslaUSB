@@ -57,9 +57,11 @@ use axum::http::header::{
 };
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
+use scannerd::seiwalk::Waypoint;
 use serde::Deserialize;
+use teslausb_core::sei::tesla::{AutopilotState, Gear};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::ReaderStream;
 
@@ -74,9 +76,18 @@ const VIDEO_MIME: &str = "video/mp4";
 
 /// Read/emit chunk size for streamed bodies (bounded memory per connection).
 const STREAM_CHUNK: usize = 256 * 1024;
+/// Maximum clip size eligible for telemetry parse (bounds memory use on Pi).
+const TELEMETRY_MAX_BYTES: u64 = 256 * 1024 * 1024;
+/// Hard cap on emitted telemetry samples — bounds the DTO Vec and the JSON
+/// output so a pathologically dense SEI track cannot exhaust the recording
+/// device's memory. Far above any real clip (~one sample/frame over a ~60 s
+/// segment ≈ a few thousand samples).
+const TELEMETRY_MAX_SAMPLES: usize = 200_000;
 
 /// The `view_kind` value whose `file_ref` resolves to a playable Pi-side path.
 const VIEW_ARCHIVE: &str = "archive";
+/// Telemetry parses are serialized so only one full clip buffer exists at once.
+static TELEMETRY_PARSE_PERMITS: Semaphore = Semaphore::const_new(1);
 
 /// Runtime media configuration shared by the streaming/export handlers.
 #[derive(Clone, Debug)]
@@ -149,6 +160,63 @@ pub(crate) struct StreamQuery {
     camera: Option<String>,
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TelemetryDto {
+    time: f64,
+    speed_mps: f32,
+    gear: u32,
+    steering_angle: f32,
+    blinker_left: bool,
+    blinker_right: bool,
+    brake_applied: bool,
+    accelerator_pedal_position: f32,
+    autopilot_state: u32,
+}
+
+fn fin32(v: f32) -> f32 {
+    if v.is_finite() { v } else { 0.0 }
+}
+
+fn fin64(v: f64) -> f64 {
+    if v.is_finite() { v } else { 0.0 }
+}
+
+fn gear_to_u32(gear: Gear) -> u32 {
+    match gear {
+        Gear::Park => 0,
+        Gear::Drive => 1,
+        Gear::Reverse => 2,
+        Gear::Neutral => 3,
+        Gear::Unknown(v) => v,
+    }
+}
+
+fn autopilot_to_u32(state: AutopilotState) -> u32 {
+    match state {
+        AutopilotState::None => 0,
+        AutopilotState::SelfDriving => 1,
+        AutopilotState::Autosteer => 2,
+        AutopilotState::Tacc => 3,
+        AutopilotState::Unknown(v) => v,
+    }
+}
+
+fn waypoint_to_dto(waypoint: &Waypoint) -> TelemetryDto {
+    let msg = waypoint.message;
+    TelemetryDto {
+        time: fin64(waypoint.timestamp_ms / 1000.0),
+        speed_mps: fin32(msg.vehicle_speed_mps),
+        gear: gear_to_u32(msg.gear_state),
+        steering_angle: fin32(msg.steering_wheel_angle),
+        blinker_left: msg.blinker_on_left,
+        blinker_right: msg.blinker_on_right,
+        brake_applied: msg.brake_applied,
+        accelerator_pedal_position: fin32(msg.accelerator_pedal_position),
+        autopilot_state: autopilot_to_u32(msg.autopilot_state),
+    }
+}
+
 /// Query string for `GET|HEAD /api/media/content?path=`.
 #[derive(Deserialize)]
 pub(crate) struct MediaContentQuery {
@@ -199,6 +267,255 @@ pub(crate) async fn stream(
         Err(ApiError::NotFound) => stream_non_archive_angle(&state, id, &camera, head, &headers).await,
         Err(err) => Err(err),
     }
+}
+
+/// `GET /api/clips/{id}/telemetry?camera=` — parse Tesla SEI telemetry from the
+/// Pi-side archive clip and return HUD samples.
+///
+/// `eprintln!` is used for graceful-degradation breadcrumbs (oversize / read /
+/// parse failures land in `journalctl -u webd`); webd carries no `tracing`/`log`
+/// dependency, matching the existing `media_events.rs` convention.
+#[allow(clippy::print_stderr)]
+pub(crate) async fn telemetry(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<i64>,
+    Query(q): Query<StreamQuery>,
+) -> Result<Response, ApiError> {
+    let camera = q
+        .camera
+        .filter(|c| !c.is_empty())
+        .unwrap_or_else(|| "front".to_owned());
+
+    let catalog = state.catalog.clone();
+    let camera_owned = camera.clone();
+    let source = crate::route::read(catalog, move |conn| {
+        crate::query::angle_source(conn, id, &camera_owned)
+    })
+    .await?;
+    let Some((file_ref, view_kind)) = source else {
+        return Err(ApiError::NotFound);
+    };
+    if view_kind != VIEW_ARCHIVE {
+        return telemetry_non_archive(&state, id, &camera).await;
+    }
+
+    let path = match resolve_archive_path(state.media.archive_root.as_path(), &file_ref).await {
+        Resolved::Ok(path) => path,
+        Resolved::Missing | Resolved::Escaped => return Err(ApiError::NotFound),
+    };
+
+    let metadata = tokio::fs::metadata(&path)
+        .await
+        .map_err(|_| ApiError::NotFound)?;
+    if metadata.len() > TELEMETRY_MAX_BYTES {
+        eprintln!(
+            "webd: telemetry parse skipped for clip {id} camera {camera}: file too large ({})",
+            metadata.len()
+        );
+        return Ok(empty_telemetry_response());
+    }
+
+    let _permit = TELEMETRY_PARSE_PERMITS
+        .acquire()
+        .await
+        .map_err(|_| ApiError::Internal)?;
+
+    let json = match tokio::task::spawn_blocking(move || telemetry_json_blocking(&path, id, &camera))
+        .await
+    {
+        Ok(json) => json,
+        Err(err) => {
+            eprintln!("webd: telemetry parse task failed for clip {id}: {err}");
+            b"[]".to_vec()
+        }
+    };
+
+    Ok(([(CONTENT_TYPE, "application/json")], json).into_response())
+}
+
+/// Telemetry for a non-archive (`ro_usb`) clip: parse SEI from the car-volume
+/// file via the scannerd readfile socket, mirroring `stream_non_archive_angle`'s
+/// read path but for the whole (capped) file. Best-effort — returns an empty
+/// `[]` (never an error) for a missing angle, an unverifiable size, an oversize
+/// clip, or any read/parse failure.
+#[allow(clippy::print_stderr)]
+async fn telemetry_non_archive(state: &AppState, id: i64, camera: &str) -> Result<Response, ApiError> {
+    let catalog = state.catalog.clone();
+    let camera_owned = camera.to_owned();
+    let source = crate::route::read(catalog, move |conn| {
+        crate::query::non_archive_angle_source(conn, id, &camera_owned)
+    })
+    .await?;
+    // No non-archive angle, or a NULL/non-positive (unverifiable) catalog size →
+    // graceful empty, mirroring the streaming path's fail-closed size gate.
+    let Some((file_ref, Some(size))) = source else {
+        return Ok(empty_telemetry_response());
+    };
+    if size <= 0 {
+        return Ok(empty_telemetry_response());
+    }
+    let expected_size = u64::try_from(size).unwrap_or(u64::MAX);
+    if expected_size > TELEMETRY_MAX_BYTES {
+        eprintln!(
+            "webd: telemetry ro_usb skipped for clip {id} camera {camera}: catalog size too large ({size})"
+        );
+        return Ok(empty_telemetry_response());
+    }
+
+    let _permit = TELEMETRY_PARSE_PERMITS
+        .acquire()
+        .await
+        .map_err(|_| ApiError::Internal)?;
+
+    let client = Arc::clone(&state.read_client);
+    let camera_owned = camera.to_owned();
+    let json = match tokio::task::spawn_blocking(move || {
+        telemetry_json_ro_usb_blocking(&*client, &file_ref, expected_size, id, &camera_owned)
+    })
+    .await
+    {
+        Ok(json) => json,
+        Err(err) => {
+            eprintln!("webd: telemetry ro_usb parse task failed for clip {id}: {err}");
+            b"[]".to_vec()
+        }
+    };
+
+    Ok(([(CONTENT_TYPE, "application/json")], json).into_response())
+}
+
+/// A bare `[]` JSON telemetry response — the graceful empty state returned for a
+/// non-archive angle, an oversize clip, or any parse failure.
+fn empty_telemetry_response() -> Response {
+    ([(CONTENT_TYPE, "application/json")], Bytes::from_static(b"[]")).into_response()
+}
+
+/// A `Write` sink that accumulates bytes but fails once it would exceed `cap`,
+/// giving the `ro_usb` telemetry read the same hard memory bound the archive path
+/// gets from `Read::take`.
+struct CappedWriter {
+    buf: Vec<u8>,
+    cap: usize,
+}
+
+impl std::io::Write for CappedWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if self.buf.len().saturating_add(data.len()) > self.cap {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "telemetry read exceeded byte cap",
+            ));
+        }
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// SEI-parse already-read clip bytes into pre-serialised telemetry JSON (always
+/// a valid array; `[]` on parse failure). Sample count is capped at
+/// [`TELEMETRY_MAX_SAMPLES`]. Shared by the archive (fs) and `ro_usb` (`read_client`)
+/// telemetry paths.
+fn parse_sei_to_json(bytes: &[u8]) -> Vec<u8> {
+    let dtos: Vec<TelemetryDto> = match scannerd::seiwalk::walk_clip_waypoints(bytes, 1) {
+        Ok(waypoints) => waypoints
+            .waypoints
+            .iter()
+            .take(TELEMETRY_MAX_SAMPLES)
+            .map(waypoint_to_dto)
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    serde_json::to_vec(&dtos).unwrap_or_else(|_| b"[]".to_vec())
+}
+
+/// Read (hard-capped), SEI-parse and JSON-serialise clip telemetry entirely on a
+/// blocking thread, returning pre-serialised JSON bytes (always a valid array;
+/// `[]` on any failure). Every allocation is bounded so a pathological clip
+/// cannot exhaust the recording device's memory: the file read is capped at
+/// [`TELEMETRY_MAX_BYTES`] regardless of the (advisory) metadata pre-check, the
+/// sample count at [`TELEMETRY_MAX_SAMPLES`], and serialisation runs here (off
+/// the async reactor) rather than in the response path.
+#[allow(clippy::print_stderr)]
+fn telemetry_json_blocking(path: &Path, id: i64, camera: &str) -> Vec<u8> {
+    use std::io::Read;
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) => {
+            eprintln!("webd: telemetry parse read failed for clip {id} camera {camera}: {err}");
+            return b"[]".to_vec();
+        }
+    };
+    // Cap the read at the limit (+1 byte so an at-read-time oversize file is
+    // still detectable): the async metadata check above is advisory only, so
+    // this is the authoritative memory bound on the buffer.
+    let mut bytes = Vec::new();
+    if let Err(err) = file.take(TELEMETRY_MAX_BYTES + 1).read_to_end(&mut bytes) {
+        eprintln!("webd: telemetry parse read failed for clip {id} camera {camera}: {err}");
+        return b"[]".to_vec();
+    }
+    if bytes.len() as u64 > TELEMETRY_MAX_BYTES {
+        eprintln!(
+            "webd: telemetry parse skipped for clip {id} camera {camera}: file too large at read time ({}+ bytes)",
+            bytes.len()
+        );
+        return b"[]".to_vec();
+    }
+    parse_sei_to_json(&bytes)
+}
+
+/// Read (identity-fenced, hard-capped), SEI-parse and JSON-serialise telemetry
+/// for a non-archive (`ro_usb`) clip whose bytes live on the car-visible USB
+/// volume and are read through the scannerd readfile socket. Best-effort: any
+/// read/fence/parse failure yields `[]` (never an error to the client). The
+/// `CappedWriter` bounds the buffer at [`TELEMETRY_MAX_BYTES`] regardless of the
+/// advisory catalog size, so a racing/growing file cannot exhaust memory. The
+/// read is additionally anchored to `expected_size` (the catalog `size_bytes`):
+/// both the file allocation (`identity.total_size`) and the bytes actually read
+/// must equal it, else the file was recreated/resized since ingest and `[]` is
+/// returned rather than telemetry from a substituted file.
+#[allow(clippy::print_stderr)]
+fn telemetry_json_ro_usb_blocking(
+    client: &dyn crate::read_client::ReadFileClient,
+    file_ref: &str,
+    expected_size: u64,
+    id: i64,
+    camera: &str,
+) -> Vec<u8> {
+    let cap = usize::try_from(TELEMETRY_MAX_BYTES).unwrap_or(usize::MAX);
+    let mut writer = CappedWriter {
+        buf: Vec::new(),
+        cap,
+    };
+    let identity = match crate::read_client::read_full_file_to_writer(
+        client,
+        file_ref,
+        MAX_READ_LEN,
+        &mut writer,
+    ) {
+        Ok(identity) => identity,
+        Err(err) => {
+            eprintln!("webd: telemetry ro_usb read failed for clip {id} camera {camera}: {err}");
+            return b"[]".to_vec();
+        }
+    };
+    // Fail closed if the file was recreated/resized since catalog ingest: the
+    // bytes actually read (valid_data_length) AND the file allocation
+    // (`identity.total_size` = data_length) must both equal the catalog
+    // `size_bytes` — the same stable-file anchor the streaming path enforces
+    // before serving bytes, so a substituted file yields `[]` not wrong data.
+    if identity.total_size != expected_size || writer.buf.len() as u64 != expected_size {
+        eprintln!(
+            "webd: telemetry ro_usb size/identity mismatch for clip {id} camera {camera}: expected {expected_size}, read {} bytes, total_size {}",
+            writer.buf.len(),
+            identity.total_size
+        );
+        return b"[]".to_vec();
+    }
+    parse_sei_to_json(&writer.buf)
 }
 
 /// `GET|HEAD /api/media/content?path=` — range-stream a media file from the

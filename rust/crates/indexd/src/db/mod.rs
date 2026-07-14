@@ -9,6 +9,7 @@
 pub mod ingest;
 pub mod migrations;
 pub mod mutations;
+pub mod reads;
 
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};

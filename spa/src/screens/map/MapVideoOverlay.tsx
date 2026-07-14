@@ -10,6 +10,7 @@ interface MapVideoOverlayProps {
   clip: Clip;
   clips: readonly Clip[];
   camera: string;
+  startOffsetSec?: number;
   cloudConnected: boolean;
   clock: string;
   onClose: () => void;
@@ -66,6 +67,7 @@ export function MapVideoOverlay({
   clip,
   clips,
   camera,
+  startOffsetSec,
   cloudConnected,
   clock: _clock,
   onClose,
@@ -103,6 +105,10 @@ export function MapVideoOverlay({
           : ""
         : streamCandidateUrl
       : "";
+  // Telemetry (SEI) is a clip-level property that lives only in the front angle,
+  // so always request it from `front` regardless of the displayed camera. This
+  // keeps the HUD populated when the viewer switches to a non-front camera.
+  const telemetryUrl = api.telemetryUrl(clip.id, "front");
   const canPlayAny = clip.angles.some(isStreamableAngle);
   const clipIndex = clips.findIndex((item) => item.id === clip.id);
   const canPrev = clipIndex > 0;
@@ -189,6 +195,7 @@ export function MapVideoOverlay({
     if (!video || !stage) return;
     const q = (sel: string) => stage.querySelector(sel) as HTMLElement;
     const hud: HudElements = {
+      root: q("#overlayHud"),
       gear: q("#olGear"),
       speed: q("#olSpeedVal"),
       steering: q("#olWheel"),
@@ -208,9 +215,32 @@ export function MapVideoOverlay({
 
   useEffect(() => {
     const ctrl = hudCtrlRef.current;
-    if (!ctrl || !streamUrl) return;
-    void ctrl.loadTelemetry(streamUrl);
-  }, [streamUrl]);
+    if (!ctrl || !telemetryUrl) return;
+    void ctrl.loadTelemetry(telemetryUrl);
+  }, [telemetryUrl]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    const offset = typeof startOffsetSec === "number" ? startOffsetSec : NaN;
+    if (!streamUrl || !Number.isFinite(offset) || offset <= 0) {
+      video.removeAttribute("data-seek-offset");
+      return;
+    }
+    const applySeek = () => {
+      const maxSeek = Math.max(0, (video.duration || offset) - 0.05);
+      video.currentTime = Math.min(offset, maxSeek);
+      video.dataset.seekOffset = String(Math.round(offset));
+    };
+    if (video.readyState >= 1) {
+      applySeek();
+      return;
+    }
+    video.addEventListener("loadedmetadata", applySeek, { once: true });
+    return () => {
+      video.removeEventListener("loadedmetadata", applySeek);
+    };
+  }, [streamUrl, startOffsetSec, clip.id]);
 
   useEffect(() => {
     const onResize = () => {
@@ -388,7 +418,14 @@ export function MapVideoOverlay({
           <div class="oh-gear" id="olGear">P</div>
           <div class="oh-pedal oh-brake" id="olBrake" style="--pedal-fill: 0%;">
             <span class="oh-fill"><i /></span>
-            <span class="oh-lbl">B</span>
+            <svg viewBox="0 0 24 24" width="24" height="24">
+              <path d="M6 7 L18 7 L20 16 Q12 19 4 16 Z" stroke-width="2" stroke-linejoin="round" />
+              <line x1="8" y1="9" x2="8" y2="14" stroke-width="1.5" />
+              <line x1="10" y1="9" x2="10" y2="14" stroke-width="1.5" />
+              <line x1="12" y1="9" x2="12" y2="14" stroke-width="1.5" />
+              <line x1="14" y1="9" x2="14" y2="14" stroke-width="1.5" />
+              <line x1="16" y1="9" x2="16" y2="14" stroke-width="1.5" />
+            </svg>
           </div>
           <span class="oh-blinker left" id="olBlinkerL">◀</span>
           <div class="oh-speed">
@@ -406,9 +443,13 @@ export function MapVideoOverlay({
           </div>
           <div class="oh-pedal oh-throttle" id="olThrottle" style="--pedal-fill: 0%;">
             <span class="oh-fill"><i /></span>
-            <span class="oh-lbl">A</span>
+            <svg viewBox="0 0 24 24" width="24" height="24">
+              <path d="M9 4 L15 4 L16 18 Q12 20 8 18 Z" stroke-width="2" stroke-linejoin="round" />
+              <rect x="9" y="2" width="6" height="2" rx="1" stroke-width="2" />
+            </svg>
           </div>
           <div class="oh-ap" id="olAP2" />
+          <div class="oh-empty-note">No telemetry</div>
         </div>
         {canPlayAny && streamNotice && (
           <div class="video-unavailable-overlay" data-testid="video-stream-unavailable">

@@ -43,6 +43,8 @@ interface MapOverlayState {
   clips: Clip[];
   index: number;
   camera: string;
+  startOffsetSec?: number;
+  seekClipId?: number;
 }
 
 function newPanelTabState<T>(): PanelTabState<T> {
@@ -139,7 +141,7 @@ function toMapTrip(trip: Trip, detail: TripDetail | null): MapTrip {
   const points = detail?.points ?? [];
   const waypoints = points
     .filter((p) => Number.isFinite(p.lat) && Number.isFinite(p.lon))
-    .map((p) => ({ lat: p.lat, lon: p.lon, speed: p.speed ?? 0 }));
+    .map((p) => ({ lat: p.lat, lon: p.lon, speed: p.speed ?? 0, t: p.t }));
   const distanceMi = (trip.distance_m ?? 0) / METERS_PER_MILE;
   const durationMin = Math.max(0, Math.round((trip.ended_at - trip.started_at) / 60));
   return {
@@ -181,6 +183,7 @@ export function TripMap() {
   const watchSeqRef = useRef(0);
   const watchAbortRef = useRef<AbortController | null>(null);
   const routeEventsByTripIdRef = useRef<Map<number, number[]>>(new Map());
+  const tripClipsByTripIdRef = useRef<Map<number, Clip[]>>(new Map());
   const fetchedClockRef = useRef<ClockPref | null>(null);
 
   const [days, setDays] = useState<DaySummary[] | null>(null);
@@ -288,6 +291,67 @@ export function TripMap() {
     })();
   }, []);
 
+  const onRoutePick = useCallback((pick: { tripId: number; t: number; lat: number; lon: number }) => {
+    const seq = ++watchSeqRef.current;
+    const daySeq = seqRef.current;
+    watchAbortRef.current?.abort();
+    const ac = new AbortController();
+    watchAbortRef.current = ac;
+    setClipActionNotice(null);
+    void (async () => {
+      try {
+        let clips = tripClipsByTripIdRef.current.get(pick.tripId);
+        if (!clips) {
+          clips = await api.tripClips(pick.tripId, ac.signal);
+          if (ac.signal.aborted || seq !== watchSeqRef.current || daySeq !== seqRef.current) {
+            return;
+          }
+          tripClipsByTripIdRef.current.set(pick.tripId, clips);
+        }
+        if (!clips.length) {
+          setClipActionNotice("No video available for this spot.");
+          return;
+        }
+        const covering = clips.find(
+          (c) =>
+            c.started_at <= pick.t &&
+            (c.ended_at ?? c.started_at + Math.round(c.duration_s ?? 60)) > pick.t,
+        );
+        const clip =
+          covering ??
+          clips.reduce<Clip | null>((best, c) => {
+            if (!best) return c;
+            return Math.abs(c.started_at - pick.t) < Math.abs(best.started_at - pick.t)
+              ? c
+              : best;
+          }, null);
+        if (!clip) return;
+        const index = clips.indexOf(clip);
+        if (index < 0) return;
+        const clipEnd =
+          clip.ended_at ?? clip.started_at + Math.round(clip.duration_s ?? 60);
+        const startOffsetSec = Math.max(
+          0,
+          Math.min(pick.t - clip.started_at, clipEnd - clip.started_at),
+        );
+        setOverlayState({
+          clips,
+          index,
+          camera: "front",
+          startOffsetSec,
+          seekClipId: clip.id,
+        });
+      } catch {
+        if (ac.signal.aborted || seq !== watchSeqRef.current || daySeq !== seqRef.current) {
+          return;
+        }
+        setClipActionNotice("No video available for this spot.");
+      } finally {
+        if (watchAbortRef.current === ac) watchAbortRef.current = null;
+      }
+    })();
+  }, []);
+
   useEffect(() => {
     setFilters((prev) => ({
       ...prev,
@@ -319,7 +383,7 @@ export function TripMap() {
   //    seed the display unit from prefs, and load the day list. ──
   useEffect(() => {
     if (!mapRef.current) return;
-    const ctrl = new TripMapController(mapRef.current, { onWatchEvent });
+    const ctrl = new TripMapController(mapRef.current, { onWatchEvent, onRoutePick });
     ctrlRef.current = ctrl;
     // map.css carries three global overrides (full-height, no page scroll); we
     // scope them to .mapping-active so they apply ONLY while the map is mounted.
@@ -355,7 +419,7 @@ export function TripMap() {
       ctrl.destroy();
       ctrlRef.current = null;
     };
-  }, [onWatchEvent]);
+  }, [onWatchEvent, onRoutePick]);
 
   // Re-bucket the day list when the clock preference flips (Local uses the
   // browser tz, UTC uses UTC). Skips the initial mount fetch (done above) and
@@ -387,6 +451,7 @@ export function TripMap() {
     watchAbortRef.current?.abort();
     watchAbortRef.current = null;
     routeEventsByTripIdRef.current = new Map();
+    tripClipsByTripIdRef.current = new Map();
     setLoading(true);
 
     (async () => {
@@ -780,7 +845,13 @@ export function TripMap() {
       if (!prev) return prev;
       const nextIndex = Math.max(0, Math.min(prev.clips.length - 1, prev.index + direction));
       if (nextIndex === prev.index) return prev;
-      return { ...prev, index: nextIndex, camera: "front" };
+      return {
+        ...prev,
+        index: nextIndex,
+        camera: "front",
+        startOffsetSec: undefined,
+        seekClipId: undefined,
+      };
     });
   }, []);
 
@@ -791,6 +862,9 @@ export function TripMap() {
   const onOverlayDelete = useCallback(async (clipId: number) => {
     setClipActionNotice(null);
     const removeClip = () => {
+      // The per-trip clip cache may hold the clip we just deleted; drop it so a
+      // later route-pick refetches instead of reopening a now-deleted clip.
+      tripClipsByTripIdRef.current.clear();
       setPanelState((prev) => {
         if (!prev.clips.items) return prev;
         return {
@@ -1340,6 +1414,7 @@ export function TripMap() {
           onNavigate={onOverlayNavigate}
           onCameraChange={onOverlayCameraChange}
           onDeleteClip={onOverlayDelete}
+          startOffsetSec={overlayState.seekClipId === overlayClip.id ? overlayState.startOffsetSec : undefined}
         />
       )}
     </div>

@@ -274,6 +274,30 @@ impl BootContext {
     ) -> Result<Option<String>, DbError> {
         claim_for_delete(conn, &self.boot_id, self.mono_now_ms(), archive_item_id)
     }
+
+    /// Claim an eviction candidate under this boot's lease context, using the
+    /// server wall clock for the recency/suppress comparisons.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if a statement fails.
+    pub fn claim_eviction_candidate(
+        &self,
+        conn: &mut Connection,
+        archive_item_id: i64,
+        recency_floor_epoch: i64,
+        allow_undurable: bool,
+    ) -> Result<Option<String>, DbError> {
+        claim_eviction_candidate(
+            conn,
+            &self.boot_id,
+            self.mono_now_ms(),
+            now_epoch_s(),
+            archive_item_id,
+            recency_floor_epoch,
+            allow_undurable,
+        )
+    }
 }
 
 /// Acquire a lease on one archive item. Granted only if the item exists
@@ -560,6 +584,83 @@ pub fn claim_for_delete(
     Ok(Some(generation))
 }
 
+/// Atomically claim an archive item for eviction, re-checking the FULL
+/// hard-delete allowlist predicate inside one transaction (defense-in-depth
+/// for a permanent-loss op: a stale candidate list can never delete a row
+/// that has since become ineligible). Aborts (returns `None`) on any
+/// unexpired lease OR if the row is not: `LIVE`, `folder_class='RecentClips'`,
+/// `pinned=0`, (`durable=1` OR `allow_undurable`), all linked clips with
+/// `folder_class='RecentClips'` and known (`started_at > 0`) recording time,
+/// and newest linked `started_at < recency_floor_epoch`,
+/// and unsuppressed (`suppress_until` `NULL` or `< now_epoch`). On success
+/// transitions `LIVE -> DELETE_CLAIMED`, records a fresh random `delete_gen`,
+/// and returns it.
+///
+/// # Errors
+///
+/// Returns [`DbError`] if a statement fails.
+pub fn claim_eviction_candidate(
+    conn: &mut Connection,
+    boot_id: &str,
+    mono_now_ms: i64,
+    now_epoch: i64,
+    archive_item_id: i64,
+    recency_floor_epoch: i64,
+    allow_undurable: bool,
+) -> Result<Option<String>, DbError> {
+    let tx = conn.transaction()?;
+    if has_unexpired_lease(&tx, boot_id, mono_now_ms, archive_item_id)? {
+        drop(tx);
+        return Ok(None);
+    }
+    let eligible: bool = tx
+        .query_row(
+            // Fail-closed recency gate on clips.started_at (true recording instant,
+            // epoch-seconds), mirroring list_eviction_candidates: every linked clip
+            // must be RecentClips, non-Sentry, with a known (>0) start, and the
+            // newest must precede recency_floor_epoch (also epoch-seconds).
+            "SELECT EXISTS (
+                 SELECT 1
+                   FROM archive_items AS ai
+                   JOIN archive_item_clips AS aic ON aic.archive_item_id = ai.id
+                   JOIN clips AS c ON c.id = aic.clip_id
+                  WHERE ai.id = ?1
+                    AND ai.delete_state = 'LIVE'
+                    AND ai.folder_class = 'RecentClips'
+                    AND ai.pinned = 0
+                    AND (ai.durable = 1 OR ?2 = 1)
+                    AND (ai.suppress_until IS NULL OR ai.suppress_until < ?4)
+                  GROUP BY ai.id
+                 HAVING MIN(CASE WHEN c.folder_class = 'RecentClips' THEN 1 ELSE 0 END) = 1
+                    AND MAX(c.is_sentry) = 0
+                    AND MIN(CASE WHEN c.started_at > 0 THEN 1 ELSE 0 END) = 1
+                    AND MAX(c.started_at) < ?3
+             )",
+            params![
+                archive_item_id,
+                i64::from(allow_undurable),
+                recency_floor_epoch,
+                now_epoch
+            ],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if !eligible {
+        drop(tx);
+        return Ok(None);
+    }
+    let generation = token::token_128();
+    tx.execute(
+        "UPDATE archive_items
+            SET delete_state = 'DELETE_CLAIMED', delete_gen = ?2, updated_at = ?3
+          WHERE id = ?1",
+        params![archive_item_id, generation, now_epoch],
+    )?;
+    tx.commit()?;
+    Ok(Some(generation))
+}
+
 /// Idempotently set an archive item's `delete_state`. Used by the
 /// `retentiond` single-deleter finishers and the startup recovery matrix
 /// (D3 §4, §4.1); each is safe to re-apply after a crash.
@@ -701,9 +802,9 @@ mod tests {
     use rusqlite::{Connection, params};
 
     use super::{
-        ClipLeaseGrant, LeaseGrant, LeaseKind, ReleaseResult, RenewResult, claim_for_delete,
-        has_unexpired_lease, lease_acquire, lease_acquire_for_clip, lease_release, lease_renew,
-        mark_deleted, mark_deleting, reap_stale_leases, set_durable, set_pref,
+        ClipLeaseGrant, LeaseGrant, LeaseKind, ReleaseResult, RenewResult, claim_eviction_candidate,
+        claim_for_delete, has_unexpired_lease, lease_acquire, lease_acquire_for_clip, lease_release,
+        lease_renew, mark_deleted, mark_deleting, reap_stale_leases, set_durable, set_pref,
         wal_checkpoint_truncate,
     };
     use crate::db::open_in_memory;
@@ -729,6 +830,92 @@ mod tests {
         )
         .unwrap();
         conn.last_insert_rowid()
+    }
+
+    fn insert_eviction_item(
+        conn: &Connection,
+        folder_class: &str,
+        archived_at: i64,
+        durable: i64,
+        pinned: i64,
+        suppress_until: Option<i64>,
+        delete_state: &str,
+    ) -> i64 {
+        let path = format!(
+            "archive/{folder_class}/{archived_at}-{durable}-{pinned}-{}",
+            suppress_until.unwrap_or(-1)
+        );
+        conn.execute(
+            "INSERT INTO archive_items
+               (folder_class, path, size_bytes, file_count, archived_at, delete_state,
+                 durable, pinned, suppress_until, created_at, updated_at)
+             VALUES (?1, ?2, 4096, 1, ?3, ?4, ?5, ?6, ?7, 0, 0)",
+            params![
+               folder_class,
+               path.clone(),
+               archived_at,
+               delete_state,
+               durable,
+                pinned,
+                suppress_until
+            ],
+        )
+        .unwrap();
+        let archive_item_id = conn.last_insert_rowid();
+        insert_clip_for_eviction(conn, archive_item_id, &path, archived_at, folder_class);
+        archive_item_id
+    }
+
+    fn insert_eviction_item_unlinked(
+        conn: &Connection,
+        folder_class: &str,
+        archived_at: i64,
+        durable: i64,
+        pinned: i64,
+        suppress_until: Option<i64>,
+        delete_state: &str,
+    ) -> i64 {
+        conn.execute(
+            "INSERT INTO archive_items
+                (folder_class, path, size_bytes, file_count, archived_at, delete_state,
+                 durable, pinned, suppress_until, created_at, updated_at)
+             VALUES (?1, ?2, 4096, 1, ?3, ?4, ?5, ?6, ?7, 0, 0)",
+            params![
+                folder_class,
+                format!(
+                    "archive/{folder_class}/{archived_at}-{durable}-{pinned}-unlinked-{}",
+                    suppress_until.unwrap_or(-1)
+                ),
+                archived_at,
+                delete_state,
+                durable,
+                pinned,
+                suppress_until
+            ],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn insert_clip_for_eviction(
+        conn: &Connection,
+        archive_item_id: i64,
+        key_suffix: &str,
+        started_at: i64,
+        folder_class: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO clips (canonical_key, started_at, partition, folder_class, created_at, updated_at)
+             VALUES (?1, ?2, 'p', ?3, 0, 0)",
+            params![format!("clip:{key_suffix}"), started_at, folder_class],
+        )
+        .unwrap();
+        let clip_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO archive_item_clips (archive_item_id, clip_id) VALUES (?1, ?2)",
+            params![archive_item_id, clip_id],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -890,6 +1077,198 @@ mod tests {
         let denied =
             lease_acquire(&conn, BOOT, 200_000, item, LeaseKind::Playback, "webd", TTL).unwrap();
         assert!(matches!(denied, LeaseGrant::Denied { .. }));
+    }
+
+    #[test]
+    fn claim_eviction_candidate_claims_eligible_old_durable_row() {
+        let mut conn = open_in_memory().unwrap();
+        let item = insert_eviction_item(&conn, "RecentClips", 100, 1, 0, None, "LIVE");
+
+        let generation = claim_eviction_candidate(&mut conn, BOOT, 1_000, 1_000, item, 500, false)
+            .unwrap();
+        assert!(generation.is_some());
+        let state: String = conn
+            .query_row(
+                "SELECT delete_state FROM archive_items WHERE id = ?1",
+                params![item],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "DELETE_CLAIMED");
+    }
+
+    #[test]
+    fn claim_eviction_candidate_returns_none_with_unexpired_lease() {
+        let mut conn = open_in_memory().unwrap();
+        let item = insert_eviction_item(&conn, "RecentClips", 100, 1, 0, None, "LIVE");
+        lease_acquire(&conn, BOOT, 0, item, LeaseKind::Playback, "webd", TTL).unwrap();
+
+        let generation = claim_eviction_candidate(&mut conn, BOOT, 1_000, 1_000, item, 500, false)
+            .unwrap();
+        assert_eq!(generation, None);
+    }
+
+    #[test]
+    fn claim_eviction_candidate_returns_none_when_too_recent() {
+        let mut conn = open_in_memory().unwrap();
+        let item = insert_eviction_item(&conn, "RecentClips", 500, 1, 0, None, "LIVE");
+
+        let generation = claim_eviction_candidate(&mut conn, BOOT, 1_000, 1_000, item, 500, false)
+            .unwrap();
+        assert_eq!(generation, None);
+    }
+
+    #[test]
+    fn claim_eviction_candidate_honors_allow_undurable_flag() {
+        let mut conn = open_in_memory().unwrap();
+        let item = insert_eviction_item(&conn, "RecentClips", 100, 0, 0, None, "LIVE");
+
+        let denied = claim_eviction_candidate(&mut conn, BOOT, 1_000, 1_000, item, 500, false)
+            .unwrap();
+        assert_eq!(denied, None);
+
+        let claimed = claim_eviction_candidate(&mut conn, BOOT, 1_000, 1_000, item, 500, true)
+            .unwrap();
+        assert!(claimed.is_some());
+    }
+
+    #[test]
+    fn claim_eviction_candidate_returns_none_when_pinned() {
+        let mut conn = open_in_memory().unwrap();
+        let item = insert_eviction_item(&conn, "RecentClips", 100, 1, 1, None, "LIVE");
+
+        let generation = claim_eviction_candidate(&mut conn, BOOT, 1_000, 1_000, item, 500, false)
+            .unwrap();
+        assert_eq!(generation, None);
+    }
+
+    #[test]
+    fn claim_eviction_candidate_returns_none_for_sentry_row() {
+        let mut conn = open_in_memory().unwrap();
+        let item = insert_eviction_item(&conn, "SentryClips", 100, 1, 0, None, "LIVE");
+
+        let generation = claim_eviction_candidate(&mut conn, BOOT, 1_000, 1_000, item, 500, false)
+            .unwrap();
+        assert_eq!(generation, None);
+    }
+
+    #[test]
+    fn claim_eviction_candidate_returns_none_when_suppressed() {
+        let mut conn = open_in_memory().unwrap();
+        let item = insert_eviction_item(&conn, "RecentClips", 100, 1, 0, Some(2_000), "LIVE");
+
+        let generation = claim_eviction_candidate(&mut conn, BOOT, 1_000, 1_000, item, 500, false)
+            .unwrap();
+        assert_eq!(generation, None);
+    }
+
+    #[test]
+    fn claim_eviction_candidate_returns_none_when_not_live() {
+        let mut conn = open_in_memory().unwrap();
+        let item = insert_eviction_item(&conn, "RecentClips", 100, 1, 0, None, "DELETE_CLAIMED");
+
+        let generation = claim_eviction_candidate(&mut conn, BOOT, 1_000, 1_000, item, 500, false)
+            .unwrap();
+        assert_eq!(generation, None);
+    }
+
+    #[test]
+    fn claim_eviction_candidate_excludes_item_with_no_linked_clip() {
+        let mut conn = open_in_memory().unwrap();
+        let item = insert_eviction_item_unlinked(&conn, "RecentClips", 100, 1, 0, None, "LIVE");
+
+        let generation = claim_eviction_candidate(&mut conn, BOOT, 1_000, 1_000, item, 500, false)
+            .unwrap();
+        assert_eq!(generation, None);
+    }
+
+    #[test]
+    fn claim_eviction_candidate_excludes_item_with_zero_started_at() {
+        let mut conn = open_in_memory().unwrap();
+        let item = insert_eviction_item_unlinked(&conn, "RecentClips", 100, 1, 0, None, "LIVE");
+        insert_clip_for_eviction(&conn, item, "zero-started-at", 0, "RecentClips");
+
+        let generation = claim_eviction_candidate(&mut conn, BOOT, 1_000, 1_000, item, 500, false)
+            .unwrap();
+        assert_eq!(generation, None);
+    }
+
+    #[test]
+    fn claim_eviction_candidate_excludes_when_linked_clip_not_recentclips() {
+        let mut conn = open_in_memory().unwrap();
+        let item = insert_eviction_item_unlinked(&conn, "RecentClips", 100, 1, 0, None, "LIVE");
+        insert_clip_for_eviction(&conn, item, "mismatched-folder-class", 100, "SentryClips");
+
+        let generation = claim_eviction_candidate(&mut conn, BOOT, 1_000, 1_000, item, 500, false)
+            .unwrap();
+        assert_eq!(generation, None);
+    }
+
+    #[test]
+    fn claim_eviction_candidate_excludes_stale_archived_at_but_fresh_started_at() {
+        let mut conn = open_in_memory().unwrap();
+        let item = insert_eviction_item_unlinked(&conn, "RecentClips", 100, 1, 0, None, "LIVE");
+        insert_clip_for_eviction(&conn, item, "stale-archived-fresh-started", 9_500, "RecentClips");
+
+        let generation = claim_eviction_candidate(&mut conn, BOOT, 1_000, 1_000, item, 500, false)
+            .unwrap();
+        assert_eq!(generation, None);
+    }
+
+    #[test]
+    fn claim_eviction_candidate_deletes_when_started_at_old_even_if_archived_at_fresh() {
+        let mut conn = open_in_memory().unwrap();
+        let item = insert_eviction_item_unlinked(&conn, "RecentClips", 9_500, 1, 0, None, "LIVE");
+        insert_clip_for_eviction(&conn, item, "fresh-archived-old-started", 100, "RecentClips");
+
+        let generation = claim_eviction_candidate(&mut conn, BOOT, 1_000, 1_000, item, 500, false)
+            .unwrap();
+        assert!(generation.is_some());
+    }
+
+    fn insert_sentry_flagged_recent_clip_for_eviction(
+        conn: &Connection,
+        archive_item_id: i64,
+        key_suffix: &str,
+        started_at: i64,
+    ) {
+        conn.execute(
+            "INSERT INTO clips
+                (canonical_key, started_at, partition, folder_class, is_sentry, created_at, updated_at)
+             VALUES (?1, ?2, 'p', 'RecentClips', 1, 0, 0)",
+            params![format!("clip:{key_suffix}"), started_at],
+        )
+        .unwrap();
+        let clip_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO archive_item_clips (archive_item_id, clip_id) VALUES (?1, ?2)",
+            params![archive_item_id, clip_id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn claim_eviction_candidate_excludes_multiclip_item_when_any_clip_is_fresh() {
+        let mut conn = open_in_memory().unwrap();
+        let item = insert_eviction_item_unlinked(&conn, "RecentClips", 100, 1, 0, None, "LIVE");
+        // Old + fresh segment on one item: MAX(started_at) must keep it ineligible.
+        insert_clip_for_eviction(&conn, item, "multiclip-old", 100, "RecentClips");
+        insert_clip_for_eviction(&conn, item, "multiclip-fresh", 9_500, "RecentClips");
+
+        let generation = claim_eviction_candidate(&mut conn, BOOT, 1_000, 1_000, item, 500, false)
+            .unwrap();
+        assert_eq!(generation, None);
+    }
+
+    #[test]
+    fn claim_eviction_candidate_excludes_item_with_sentry_flagged_recent_clip() {
+        let mut conn = open_in_memory().unwrap();
+        let item = insert_eviction_item_unlinked(&conn, "RecentClips", 100, 1, 0, None, "LIVE");
+        insert_sentry_flagged_recent_clip_for_eviction(&conn, item, "sentry-flagged", 100);
+
+        let generation = claim_eviction_candidate(&mut conn, BOOT, 1_000, 1_000, item, 500, false)
+            .unwrap();
+        assert_eq!(generation, None);
     }
 
     #[test]

@@ -10,13 +10,12 @@
  *  1. `window.__TESLAUSB_HUD_FIXTURE__` — seeded samples injected by the UAT
  *     (the SMPTE test-pattern fixtures carry no embedded SEI), exactly as the
  *     0.4 parity baseline did.
- *  2. Otherwise the streamed MP4's embedded `SeiMetadata` track, parsed by
- *     {@link ./dashcam-mp4} (the production path with real Tesla footage).
+ *  2. Otherwise `/api/clips/:id/telemetry` JSON parsed server-side from the
+ *     archived MP4's embedded SEI track (the production path with real footage).
  *
  * `window.__TESLAUSB_HUD__` exposes the live source, sample count and current
  * HUD state so Playwright can assert on real overlay behaviour, not just DOM.
  */
-import { parseSeiTelemetry } from "./dashcam-mp4";
 import {
   DEFAULT_HUD,
   fixtureTelemetry,
@@ -28,6 +27,7 @@ import {
 
 /** The HUD DOM nodes the controller mutates (owned by the Preact render). */
 export interface HudElements {
+  root?: HTMLElement;
   gear: HTMLElement;
   speed: HTMLElement;
   steering: HTMLElement;
@@ -52,6 +52,7 @@ interface HudHooks {
 export class HudController {
   private readonly video: HTMLVideoElement;
   private readonly hud: HudElements;
+  private readonly root?: HTMLElement;
   private samples: TelemetrySample[] = [];
   private source: TelemetrySource = "none";
   private state: HudState = { ...DEFAULT_HUD };
@@ -64,6 +65,7 @@ export class HudController {
   constructor(video: HTMLVideoElement, hud: HudElements) {
     this.video = video;
     this.hud = hud;
+    this.root = hud.root;
 
     this.hooks = {
       build:
@@ -95,24 +97,28 @@ export class HudController {
 
   /**
    * (Re)load telemetry for the current clip/camera. Uses the seeded fixture if
-   * present, otherwise fetches and parses the streamed MP4's SEI track. Never
+   * present, otherwise fetches telemetry JSON from webd. Never
    * throws — failure leaves the HUD at its neutral default.
    */
-  async loadTelemetry(streamUrl: string): Promise<void> {
+  async loadTelemetry(telemetryUrl: string): Promise<void> {
     const fixture = fixtureTelemetry();
     if (fixture) {
       this.setSamples(fixture, "fixture");
       return;
     }
     try {
-      const resp = await fetch(streamUrl, { headers: { Accept: "video/mp4" } });
+      const resp = await fetch(telemetryUrl, {
+        headers: { Accept: "application/json" },
+      });
       if (!resp.ok) {
         this.setSamples([], "none");
         return;
       }
-      const buf = await resp.arrayBuffer();
-      const parsed = parseSeiTelemetry(buf);
-      this.setSamples(parsed, parsed.length > 0 ? "sei" : "none");
+      const parsed = (await resp.json()) as TelemetrySample[];
+      this.setSamples(
+        Array.isArray(parsed) ? parsed : [],
+        Array.isArray(parsed) && parsed.length > 0 ? "sei" : "none",
+      );
     } catch {
       this.setSamples([], "none");
     }
@@ -123,6 +129,7 @@ export class HudController {
     this.source = samples.length > 0 ? source : "none";
     this.hooks.source = this.source;
     this.hooks.sampleCount = samples.length;
+    this.syncEmptyState();
     this.tick();
   }
 
@@ -132,8 +139,13 @@ export class HudController {
     const sample = this.samples.length > 0 ? sampleAt(this.samples, t) : null;
     this.state = sample ? sampleToHud(sample) : { ...DEFAULT_HUD };
     this.apply(this.state);
+    this.syncEmptyState();
     this.frames++;
     this.hooks.frames = this.frames;
+  }
+
+  private syncEmptyState() {
+    this.root?.classList.toggle("hud-empty", this.source === "none");
   }
 
   private apply(s: HudState) {

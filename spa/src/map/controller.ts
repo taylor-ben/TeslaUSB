@@ -8,8 +8,7 @@
  * It is a faithful port of the legacy `static/js/mapping/*` rendering: speed-
  * bucketed trip polylines on a shared canvas renderer, balloon-pin event
  * markers in a markercluster group, start/end circle markers, and the pixel-
- * space route-disambiguation popup. The video player is a later lane, so a
- * disambiguation "pick" highlights the chosen trip rather than opening video.
+ * space route-disambiguation popup.
  *
  * Parity-neutral SPA adaptations:
  *  - The OSM tile URL is read from `window.__TESLAUSB_TILE_URL__` (default OSM).
@@ -33,6 +32,7 @@ export interface MapWaypoint {
   lat: number;
   lon: number;
   speed: number;
+  t?: number;
 }
 
 /** A trip ready to render: pre-decoded geometry + display metadata. */
@@ -82,6 +82,7 @@ interface RenderInput {
 
 interface TripMapControllerOptions {
   onWatchEvent?: (ev: MapEvent) => void;
+  onRoutePick?: (pick: { tripId: number; t: number; lat: number; lon: number }) => void;
 }
 
 interface Candidate {
@@ -108,8 +109,11 @@ interface MapHooks {
   build: string;
   /** Test hook: run the real disambiguation logic at a coordinate (as if the
    *  user clicked the route there) and return the candidate count. Drives the
-   *  same findCandidates → popup/highlight path the click handler uses. */
+   *  same findCandidates → popup/route-pick path the click handler uses. */
   triggerDisambig: (lat: number, lon: number) => number;
+  /** Test hook: run the route-pick flow at a coordinate and report whether a
+   *  route candidate was found. */
+  triggerRoutePick: (lat: number, lon: number) => boolean;
   /** Test hook: read the ACTUAL visible route polylines from the live Leaflet
    *  layer group (colour + decoded coords), skipping the invisible click
    *  targets. Reflects real rendered geometry, not a controller counter. */
@@ -117,6 +121,9 @@ interface MapHooks {
   /** Test hook: read the ACTUAL event-marker coordinates from the live cluster
    *  group (proves bubbles landed at the expected route coords). */
   eventLatLngs: () => [number, number][];
+  /** Test hook: number of highlight polylines in the disambiguation-pick
+   *  highlight layer (proves a route pick keeps the trip highlighted). */
+  disambigHighlightCount: () => number;
 }
 
 function fmtLocalTime(epochSec: number, clock: ClockPref): string {
@@ -181,10 +188,12 @@ export class TripMapController {
   private disambigPopup: L.Popup | null = null;
   private hooks: MapHooks;
   private readonly onWatchEvent?: (ev: MapEvent) => void;
+  private readonly onRoutePick?: (pick: { tripId: number; t: number; lat: number; lon: number }) => void;
   private readonly watchableEventsById = new Map<number, MapEvent>();
 
   constructor(container: HTMLElement, options: TripMapControllerOptions = {}) {
     this.onWatchEvent = options.onWatchEvent;
+    this.onRoutePick = options.onRoutePick;
     const tileUrl = (window as unknown as { __TESLAUSB_TILE_URL__?: string })
       .__TESLAUSB_TILE_URL__;
 
@@ -192,10 +201,18 @@ export class TripMapController {
     // leaflet.markercluster requires a finite map max-zoom to build its cluster
     // grid. With offline tiles (UAT) there's no tile layer to supply it, so the
     // cluster group would throw "Map has no maxZoom specified" — set it here.
-    this.map = L.map(container, { preferCanvas: true, maxZoom: 19 }).setView(
-      [37.7749, -122.4194],
-      10,
-    );
+    // All vector paths share ONE canvas renderer, pinned as the map's default so
+    // no Path can fall back to a second, lazily-created canvas. With preferCanvas,
+    // a renderer-less Path (e.g. an endpoint circleMarker) would otherwise spawn
+    // its own canvas that stacks on top of the route canvas and swallows
+    // route-area hover/click events — silently breaking route-click. One shared
+    // canvas keeps the interactive route click target on the same hit-test surface.
+    this.canvasRenderer = L.canvas({ padding: 0.2 });
+    this.map = L.map(container, {
+      preferCanvas: true,
+      maxZoom: 19,
+      renderer: this.canvasRenderer,
+    }).setView([37.7749, -122.4194], 10);
 
     // Offline UAT passes `""` to disable tiles entirely (keeps every request
     // same-origin). Any other value (or undefined) uses that URL / the OSM
@@ -211,7 +228,6 @@ export class TripMapController {
       this.hasTileLayer = true;
     }
 
-    this.canvasRenderer = L.canvas({ padding: 0.2 });
     this.tripLayer = L.layerGroup().addTo(this.map);
     this.eventCluster = L.markerClusterGroup({
       maxClusterRadius: 40,
@@ -238,9 +254,16 @@ export class TripMapController {
         if (candidates.length >= 2) {
           this.showDisambigPopup(latlng, candidates);
         } else if (candidates.length === 1) {
-          this.highlightTrip(candidates[0].trip);
+          this.pickRoute(candidates[0].trip, latlng);
         }
         return candidates.length;
+      },
+      triggerRoutePick: (lat: number, lon: number) => {
+        const latlng = L.latLng(lat, lon);
+        const candidates = this.findCandidatesNearClick(latlng);
+        if (!candidates.length) return false;
+        this.pickRoute(candidates[0].trip, latlng);
+        return true;
       },
       visibleRouteLayers: () => {
         const out: { color: string; coords: [number, number][] }[] = [];
@@ -266,6 +289,7 @@ export class TripMapController {
         });
         return out;
       },
+      disambigHighlightCount: () => this.disambigHighlightLayer.getLayers().length,
     };
 
     const win = window as unknown as {
@@ -571,7 +595,7 @@ export class TripMapController {
       if (candidates.length >= 2) {
         this.showDisambigPopup(e.latlng, candidates);
       } else if (candidates.length === 1) {
-        this.highlightTrip(candidates[0].trip);
+        this.pickRoute(candidates[0].trip, e.latlng);
       }
     });
 
@@ -708,6 +732,36 @@ export class TripMapController {
     }).addTo(this.disambigHighlightLayer);
   }
 
+  private nearestWaypoint(trip: MapTrip, latlng: L.LatLng): MapWaypoint | null {
+    let best: MapWaypoint | null = null;
+    let bestDist = Infinity;
+    for (const wp of trip.waypoints) {
+      if (
+        !Number.isFinite(wp.lat) ||
+        !Number.isFinite(wp.lon) ||
+        !Number.isFinite(wp.t)
+      ) {
+        continue;
+      }
+      const dLat = wp.lat - latlng.lat;
+      const dLon = wp.lon - latlng.lng;
+      const distSq = dLat * dLat + dLon * dLon;
+      if (distSq < bestDist) {
+        bestDist = distSq;
+        best = wp;
+      }
+    }
+    return best;
+  }
+
+  private pickRoute(trip: MapTrip, latlng: L.LatLng) {
+    this.highlightTrip(trip);
+    const wp = this.nearestWaypoint(trip, latlng);
+    if (wp && this.onRoutePick && wp.t != null) {
+      this.onRoutePick({ tripId: trip.id, t: wp.t, lat: wp.lat, lon: wp.lon });
+    }
+  }
+
   private showDisambigPopup(latlng: L.LatLng, candidates: Candidate[]) {
     const container = document.createElement("div");
 
@@ -748,8 +802,11 @@ export class TripMapController {
       row.addEventListener("focus", () => this.highlightTrip(c.trip));
       row.addEventListener("click", (ev) => {
         L.DomEvent.stopPropagation(ev);
-        // Video player is a later lane: a pick highlights the chosen trip.
-        this.highlightTrip(c.trip);
+        // Close first: `popupclose` synchronously clears the highlight layer, so
+        // picking (which re-highlights) AFTER the close keeps the chosen trip
+        // highlighted — matching the single-click path — instead of being wiped.
+        this.map.closePopup();
+        this.pickRoute(c.trip, latlng);
       });
       list.appendChild(row);
     }

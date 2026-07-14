@@ -13,7 +13,7 @@
 
 use std::collections::HashSet;
 
-use teslausb_core::fs::exfat::dir_decode::{DecodedExfatEntry, decode_directory_cluster};
+use teslausb_core::fs::exfat::dir_decode::{decode_directory_cluster, DecodedExfatEntry};
 use teslausb_core::fs::exfat::directory::FileTimestamps;
 
 use crate::error::ScannerError;
@@ -307,7 +307,8 @@ pub fn resolve_file_by_components<R: BlockReader + ?Sized>(
 
 /// Decode every entry of a directory given its cluster list, threading
 /// the cross-cluster partial-entry carry and stopping at end-of-dir.
-fn read_directory_entries<R: BlockReader + ?Sized>(
+/// Reused by [`crate::freespace`] to locate the allocation bitmap.
+pub(crate) fn read_directory_entries<R: BlockReader + ?Sized>(
     volume: &Volume<'_, R>,
     clusters: &[u32],
 ) -> Result<Vec<DecodedExfatEntry>, ScannerError> {

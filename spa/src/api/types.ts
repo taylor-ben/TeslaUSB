@@ -228,9 +228,34 @@ export interface FilesystemEntry {
   total_inodes: number;
 }
 
+/**
+ * One of the two USB drives the Tesla sees, from `GET /api/storage` `volumes[]`.
+ * Mirrors `UsbVolumeDto` in `rust/crates/webd/src/sysinfo.rs`. Byte fields are
+ * `null` when their source is unavailable (scannerd's exFAT reader down for the
+ * dashcam volume, or the media mount absent) — never fabricated. `stable` is
+ * false when the figure was measured while the volume was being written (a live
+ * recording drive), so the SPA can label it approximate.
+ */
+export interface UsbVolumeInfo {
+  /** `"dashcam"` (TESLACAM) | `"media"` (MEDIA). Opaque — do not narrow. */
+  role: string;
+  /** `"TESLACAM"` | `"MEDIA"`. */
+  label: string;
+  /** Always `"exfat"`. */
+  fstype: string;
+  total_bytes: number | null;
+  free_bytes: number | null;
+  used_bytes: number | null;
+  /** `"bitmap"` (dashcam allocation-bitmap popcount) | `"statvfs"` (media). */
+  source: string;
+  stable: boolean;
+}
+
 /** `GET /api/storage`. `governor` is null until retentiond is wired in. */
 export interface StorageInfo {
   filesystems: FilesystemEntry[];
+  /** The two USB drives (TESLACAM + MEDIA); empty on an older webd. */
+  volumes: UsbVolumeInfo[];
   governor: unknown | null;
 }
 

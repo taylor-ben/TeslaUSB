@@ -43,4 +43,10 @@ pub enum ScannerError {
     /// count) was exceeded.
     #[error("traversal limit exceeded: {0}")]
     LimitExceeded(&'static str),
+
+    /// A free-space computation hit a structural anomaly in the allocation
+    /// bitmap (missing/duplicate, too small, impossible popcount). The number
+    /// is refused rather than guessed.
+    #[error("free-space error: {0}")]
+    FreeSpace(&'static str),
 }

@@ -59,12 +59,14 @@ pub(crate) fn router(state: AppState, static_dir: PathBuf) -> Router {
         .route("/trips", get(trips))
         .route("/trips/page", get(trips_page))
         .route("/trips/{id}", get(trip_detail))
+        .route("/trips/{id}/clips", get(trip_clips))
         .route("/events", get(events))
         .route("/events/{id}", get(event_detail))
         .route("/media-events", get(media_events_stream))
         .route("/clips", get(clips))
         .route("/clips/{id}", get(clip_detail).delete(delete_clip))
         .route("/clips/{id}/stream", get(crate::media::stream))
+        .route("/clips/{id}/telemetry", get(crate::media::telemetry))
         .route("/clips/{id}/export", get(crate::media::export))
         .route("/media/content", get(crate::media::content))
         .route(
@@ -305,6 +307,14 @@ async fn trip_detail(
     Path(id): Path<i64>,
 ) -> Result<Json<TripDetailDto>, ApiError> {
     let out = read(state.catalog, move |conn| query::get_trip(conn, id)).await?;
+    out.map(Json).ok_or(ApiError::NotFound)
+}
+
+async fn trip_clips(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Vec<ClipDto>>, ApiError> {
+    let out = read(state.catalog, move |conn| query::clips_for_trip(conn, id)).await?;
     out.map(Json).ok_or(ApiError::NotFound)
 }
 

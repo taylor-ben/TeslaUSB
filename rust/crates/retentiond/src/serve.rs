@@ -61,7 +61,10 @@ use crate::recent::{
 };
 use crate::status::{HealthInputs, StorageHealth, assemble};
 use crate::time::Clock;
-use crate::value::{EvictionItem, EvictionPolicy, list_eviction_candidates};
+use crate::value::{
+    EvictionItem, EvictionKind, EvictionPolicy, LossClass, hard_exclusion, list_eviction_candidates,
+    loss_class,
+};
 
 /// Consecutive identical `scannerd` passes a folder's `manifest` must hold before
 /// it is eligible for a verified archive pass. Floored at 2 by [`ManifestTracker`]
@@ -221,6 +224,94 @@ pub struct GovernInput {
     pub samples: Vec<FsSample>,
     /// `disk.img` allocation accounting (the sparse-image guard).
     pub disk_img: DiskImgAccounting,
+}
+
+/// Inputs to one bounded target-drain pass.
+pub struct DrainInput<'a> {
+    /// Path to `statfs(2)` for free/total space (the data filesystem holding the archive).
+    pub data_fs_path: &'a str,
+    /// Dry-run: SELECT + project + record would-evictions with ZERO filesystem/index
+    /// mutation. Free space is *projected* (accumulated would-free bytes) so the loop
+    /// terminates (real free never moves in dry-run).
+    pub dry_run: bool,
+    /// Returns `true` when a cooperative shutdown was requested. Checked between each
+    /// eviction; a `true` value stops the drain cleanly.
+    pub should_stop: &'a dyn Fn() -> bool,
+    /// Pet the process watchdog. Called once per loop iteration so a long drain never
+    /// trips the hardware watchdog.
+    pub pet_watchdog: &'a dyn Fn(),
+}
+
+/// One item evicted (or, in dry-run, that WOULD be evicted) by a drain pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrainRecord {
+    /// Archive-item identity.
+    pub id: ArchiveItemId,
+    /// Absolute archive path of the candidate row.
+    pub source_path: String,
+    /// Candidate row size.
+    pub size_bytes: u64,
+    /// `true` when this is a permanent local-only loss (`loss_class == ClassB`).
+    pub permanent_loss: bool,
+    /// `true` if this record is a dry-run projection (no mutation occurred).
+    pub dry_run: bool,
+}
+
+/// Why a drain pass stopped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DrainStop {
+    /// Free space reached `target_exit_frac`.
+    TargetReached,
+    /// Per-cycle byte cap hit.
+    ByteCapReached,
+    /// Per-cycle count cap hit.
+    CountCapReached,
+    /// Per-cycle wall-clock cap hit.
+    WallClockCapReached,
+    /// A cooperative shutdown was requested.
+    ShutdownRequested,
+    /// The candidate list was exhausted before reaching target.
+    NoSafeCandidate,
+    /// Free space was already at/above `target_exit_frac` on entry (no-op).
+    AlreadyHealthy,
+    /// `bytes_to_free` exceeded `anomaly_free_frac * total` — the whole pass was
+    /// refused to guard against a bad `statfs` reading. No eviction occurred.
+    AnomalyRefused {
+        /// Bytes needed to reach `target_free_frac` from `free_before`.
+        bytes_to_free: u64,
+        /// Total bytes reported by `statfs`.
+        total_bytes: u64,
+    },
+    /// A `run_delete` returned `Failed` (I/O/IPC error mid-protocol). The drain
+    /// halts; startup recovery reconciles the row next boot.
+    DeleteFailed {
+        /// Failure reason returned by the single-delete protocol.
+        reason: String,
+    },
+    /// A post-delete `statfs` re-stat failed after bytes were already freed this
+    /// pass. The drain halts and returns the partial `bytes_freed` so the caller's
+    /// blast-radius budget still observes the deletion (fail-safe accounting).
+    StatCheckFailed {
+        /// The statfs failure reason.
+        reason: String,
+    },
+}
+
+/// Result of one bounded target-drain pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrainOutcome {
+    /// One record per evicted (or would-evict) item, in eviction order.
+    pub records: Vec<DrainRecord>,
+    /// Bytes reclaimed (real) or projected (dry-run).
+    pub bytes_freed: u64,
+    /// Free bytes on the data fs at entry.
+    pub free_before: u64,
+    /// Free bytes after the pass (re-stat in real mode; projected in dry-run).
+    pub free_after: u64,
+    /// Total bytes on the data fs.
+    pub total_bytes: u64,
+    /// Why the pass stopped.
+    pub stop: DrainStop,
 }
 
 // ---------------------------------------------------------------------------
@@ -646,12 +737,179 @@ impl<'a> RetentionLoop<'a> {
         })
     }
 
+    /// Bounded, oldest-first target drain (Hybrid C). Evicts the oldest SAFE items
+    /// (reusing `hard_exclusion` + `delete_request` + crash-safe `run_delete`) until
+    /// free space reaches `target_exit_frac` or a per-cycle cap trips. Re-stats between
+    /// real deletes, pets the watchdog, and honors shutdown between each item. In
+    /// dry-run it selects + records + projects free space with zero mutation.
+    ///
+    /// # Errors
+    /// Propagates a `statfs` or catalog read failure.
+    #[allow(clippy::too_many_lines)]
+    pub fn drain_to_target(&self, input: &DrainInput<'_>) -> io::Result<DrainOutcome> {
+        let stat = self.seams.statfs.statfs(input.data_fs_path)?;
+        let free_before = stat.free_bytes;
+        let total = stat.total_bytes;
+        let cfg = &self.cfg.target_drain;
+        let target_free = frac_bytes(total, cfg.target_free_frac);
+        let exit_free = frac_bytes(total, cfg.target_exit_frac);
+        let anomaly_free = frac_bytes(total, cfg.anomaly_free_frac);
+
+        if free_before >= exit_free {
+            return Ok(DrainOutcome {
+                records: Vec::new(),
+                bytes_freed: 0,
+                free_before,
+                free_after: free_before,
+                total_bytes: total,
+                stop: DrainStop::AlreadyHealthy,
+            });
+        }
+
+        let bytes_to_free = target_free.saturating_sub(free_before);
+        if bytes_to_free > anomaly_free {
+            return Ok(DrainOutcome {
+                records: Vec::new(),
+                bytes_freed: 0,
+                free_before,
+                free_after: free_before,
+                total_bytes: total,
+                stop: DrainStop::AnomalyRefused {
+                    bytes_to_free,
+                    total_bytes: total,
+                },
+            });
+        }
+
+        let items = self.seams.catalog.eviction_items()?;
+        let policy = EvictionPolicy {
+            tier: Tier::Low,
+            allow_emergency_undurable_sentry: self.cfg.allow_emergency_undurable_sentry,
+            local_only_recent_delete_approved: self.cfg.local_only_recent_delete_approved,
+        };
+
+        let mut records = Vec::new();
+        let mut freed = 0u64;
+        let mut count = 0u32;
+        let mut current_free = free_before;
+        let loop_start_ms = self.seams.clock.mono_now().0;
+        let mut stop = None;
+        let count_cap = cfg.per_cycle_evict_count;
+        let byte_cap = cfg.per_cycle_evict_bytes;
+        let wall_cap = wall_ms_to_i64(cfg.per_cycle_wall_ms);
+
+        for item in &items {
+            (input.pet_watchdog)();
+            if current_free >= exit_free {
+                stop = Some(DrainStop::TargetReached);
+                break;
+            }
+            if (input.should_stop)() {
+                stop = Some(DrainStop::ShutdownRequested);
+                break;
+            }
+            if count_cap != 0 && count >= count_cap {
+                stop = Some(DrainStop::CountCapReached);
+                break;
+            }
+            if byte_cap != 0 && freed >= byte_cap {
+                stop = Some(DrainStop::ByteCapReached);
+                break;
+            }
+            if wall_cap != 0
+                && self.seams.clock.mono_now().0.saturating_sub(loop_start_ms) >= wall_cap
+            {
+                stop = Some(DrainStop::WallClockCapReached);
+                break;
+            }
+            if hard_exclusion(item, policy).is_some() {
+                continue;
+            }
+            // Defense-in-depth: the space governor deletes ONLY RecentClips mirror
+            // segments. Never act on an event/other kind even if the catalog yields one.
+            if !matches!(item.kind, EvictionKind::RecentMirror) {
+                continue;
+            }
+
+            let Some(req) = self.seams.catalog.delete_request(item.id)? else {
+                continue;
+            };
+            let permanent_loss = loss_class(item) == LossClass::ClassB;
+
+            if input.dry_run {
+                records.push(DrainRecord {
+                    id: req.id,
+                    source_path: req.source_path.clone(),
+                    size_bytes: req.size_bytes,
+                    permanent_loss,
+                    dry_run: true,
+                });
+                freed = freed.saturating_add(req.size_bytes);
+                count = count.saturating_add(1);
+                current_free = current_free.saturating_add(req.size_bytes);
+                continue;
+            }
+
+            match run_delete(
+                &req,
+                &self.trash_dir,
+                self.seams.fs,
+                self.seams.index,
+                self.seams.rand,
+            ) {
+                DeleteOutcome::Deleted { bytes_freed } => {
+                    records.push(DrainRecord {
+                        id: req.id,
+                        source_path: req.source_path.clone(),
+                        size_bytes: req.size_bytes,
+                        permanent_loss,
+                        dry_run: false,
+                    });
+                    freed = freed.saturating_add(bytes_freed);
+                    count = count.saturating_add(1);
+                    current_free = match self.seams.statfs.statfs(input.data_fs_path) {
+                        Ok(st) => st.free_bytes,
+                        Err(err) => {
+                            stop = Some(DrainStop::StatCheckFailed {
+                                reason: err.to_string(),
+                            });
+                            break;
+                        }
+                    };
+                }
+                DeleteOutcome::Skipped { .. } => continue,
+                DeleteOutcome::Failed { reason } => {
+                    stop = Some(DrainStop::DeleteFailed { reason });
+                    break;
+                }
+            }
+        }
+
+        let stop = stop.unwrap_or({
+            if current_free >= exit_free {
+                DrainStop::TargetReached
+            } else {
+                DrainStop::NoSafeCandidate
+            }
+        });
+
+        Ok(DrainOutcome {
+            records,
+            bytes_freed: freed,
+            free_before,
+            free_after: current_free,
+            total_bytes: total,
+            stop,
+        })
+    }
+
     /// Whether any safe candidate exists at the most permissive policy (the
     /// `has_safe_candidate` signal that gates entry/exit of `Exhausted`).
     fn probe_has_safe_candidate(&self, items: &[EvictionItem]) -> bool {
         let policy = EvictionPolicy {
             tier: Tier::Emergency,
             allow_emergency_undurable_sentry: self.cfg.allow_emergency_undurable_sentry,
+            local_only_recent_delete_approved: self.cfg.local_only_recent_delete_approved,
         };
         !list_eviction_candidates(items, policy).is_empty()
     }
@@ -664,6 +922,7 @@ impl<'a> RetentionLoop<'a> {
         let policy = EvictionPolicy {
             tier,
             allow_emergency_undurable_sentry: self.cfg.allow_emergency_undurable_sentry,
+            local_only_recent_delete_approved: self.cfg.local_only_recent_delete_approved,
         };
         let Some(top) = list_eviction_candidates(items, policy).into_iter().next() else {
             return Ok((Vec::new(), Some("no safe candidate".to_string())));
@@ -753,6 +1012,20 @@ const fn stable_pass_count(stability: ManifestStability) -> u32 {
     }
 }
 
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn frac_bytes(total: u64, frac: f64) -> u64 {
+    (total as f64 * frac.clamp(0.0, 1.0)) as u64
+}
+
+#[allow(clippy::cast_possible_wrap)]
+const fn wall_ms_to_i64(per_cycle_wall_ms: u64) -> i64 {
+    per_cycle_wall_ms as i64
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -764,10 +1037,11 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::collections::{HashMap, HashSet};
     use std::io;
+    use std::rc::Rc;
 
     use super::{
-        Catalog, CycleInputs, EventOutcome, FolderFact, GovernInput, MirrorRow,
-        RecentClipCandidate, RecentFacts, RecoveryRow, RetentionLoop, Seams,
+        Catalog, CycleInputs, DrainInput, DrainStop, EventOutcome, FolderFact, GovernInput,
+        MirrorRow, RecentClipCandidate, RecentFacts, RecoveryRow, RetentionLoop, Seams,
     };
     use crate::archive::{
         ArchiveStore, CarDeleteHandoff, CarDeleteRequest, HandoffOutcome, VerifiedArchivePass,
@@ -909,13 +1183,22 @@ mod tests {
     struct FakeFs {
         existing: RefCell<HashSet<String>>,
         log: RefCell<Vec<String>>,
+        fail_rename: bool,
+        free_bump: Option<(Rc<Cell<u64>>, u64)>,
     }
     impl FakeFs {
         fn new(existing: &[&str]) -> Self {
             Self {
                 existing: RefCell::new(existing.iter().map(|s| (*s).to_string()).collect()),
                 log: RefCell::new(Vec::new()),
+                fail_rename: false,
+                free_bump: None,
             }
+        }
+
+        fn with_free_bump(mut self, free: Rc<Cell<u64>>, bytes: u64) -> Self {
+            self.free_bump = Some((free, bytes));
+            self
         }
     }
     impl ArchiveDeleteOps for FakeFs {
@@ -923,6 +1206,9 @@ mod tests {
             self.existing.borrow().contains(path)
         }
         fn rename_into_trash(&self, src: &str, dst: &str) -> io::Result<()> {
+            if self.fail_rename {
+                return Err(io::Error::other("rename failed"));
+            }
             self.log.borrow_mut().push(format!("rename {src} -> {dst}"));
             let mut e = self.existing.borrow_mut();
             e.remove(src);
@@ -935,7 +1221,59 @@ mod tests {
         fn recursive_delete(&self, path: &str) -> io::Result<()> {
             self.log.borrow_mut().push(format!("rm {path}"));
             self.existing.borrow_mut().remove(path);
+            if let Some((free, bytes)) = &self.free_bump {
+                free.set(free.get().saturating_add(*bytes));
+            }
             Ok(())
+        }
+    }
+
+    struct RisingStatfs {
+        free: Rc<Cell<u64>>,
+        total: u64,
+        calls: RefCell<Vec<String>>,
+    }
+    impl RisingStatfs {
+        fn new(free: Rc<Cell<u64>>, total: u64) -> Self {
+            Self {
+                free,
+                total,
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+    }
+    impl super::Statfs for RisingStatfs {
+        fn statfs(&self, path: &str) -> io::Result<FsStat> {
+            self.calls.borrow_mut().push(path.to_string());
+            Ok(FsStat {
+                dev_id: 1,
+                free_bytes: self.free.get(),
+                total_bytes: self.total,
+                free_inodes: 10_000,
+                total_inodes: 20_000,
+            })
+        }
+    }
+
+    struct SequencedStatfs {
+        responses: RefCell<Vec<io::Result<FsStat>>>,
+        calls: RefCell<Vec<String>>,
+    }
+    impl SequencedStatfs {
+        fn new(responses: Vec<io::Result<FsStat>>) -> Self {
+            Self {
+                responses: RefCell::new(responses),
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+    }
+    impl super::Statfs for SequencedStatfs {
+        fn statfs(&self, path: &str) -> io::Result<FsStat> {
+            self.calls.borrow_mut().push(path.to_string());
+            if self.responses.borrow().is_empty() {
+                return Err(io::Error::other("no stat sequence response"));
+            }
+            self.responses.borrow_mut().remove(0)
         }
     }
 
@@ -1044,16 +1382,64 @@ mod tests {
         }
     }
 
+    fn drain_cfg() -> RetentionConfig {
+        let mut cfg = RetentionConfig {
+            local_only_recent_delete_approved: true,
+            ..RetentionConfig::default()
+        };
+        cfg.target_drain.target_free_frac = 0.60;
+        cfg.target_drain.target_exit_frac = 0.70;
+        cfg.target_drain.per_cycle_evict_bytes = 0;
+        cfg.target_drain.per_cycle_evict_count = 0;
+        cfg.target_drain.per_cycle_wall_ms = 0;
+        cfg.target_drain.anomaly_free_frac = 0.95;
+        cfg
+    }
+
+    fn recent_mirror_items_with_reqs(ids: &[i64], size_bytes: u64) -> (Vec<EvictionItem>, HashMap<i64, DeleteRequest>) {
+        let mut items = Vec::with_capacity(ids.len());
+        let mut reqs = HashMap::new();
+        for id in ids {
+            items.push(evic(
+                *id,
+                EvictionKind::RecentMirror,
+                Durability::Undurable,
+            ));
+            reqs.insert(
+                *id,
+                DeleteRequest {
+                    id: ArchiveItemId(*id),
+                    source_path: format!("archive/{id}"),
+                    size_bytes,
+                },
+            );
+        }
+        (items, reqs)
+    }
+
     fn data_sample(free: u64) -> FsSample {
         FsSample {
             role: FsRole::Data,
-            stat: FsStat {
-                dev_id: 1,
-                free_bytes: free,
-                total_bytes: 256 * GB,
-                free_inodes: 1_000_000,
-                total_inodes: 1_000_000,
-            },
+            stat: stat(free, 256 * GB),
+        }
+    }
+
+    fn stat(free_bytes: u64, total_bytes: u64) -> FsStat {
+        FsStat {
+            dev_id: 1,
+            free_bytes,
+            total_bytes,
+            free_inodes: 1_000_000,
+            total_inodes: 1_000_000,
+        }
+    }
+
+    fn fixed_statfs(path: &str, free_bytes: u64, total_bytes: u64) -> FakeStatfs {
+        let mut stats = HashMap::new();
+        stats.insert(path.to_string(), stat(free_bytes, total_bytes));
+        FakeStatfs {
+            stats,
+            calls: RefCell::new(Vec::new()),
         }
     }
 
@@ -1327,6 +1713,412 @@ mod tests {
         assert_eq!(out.evicted[0].bytes_freed, 60);
         // The single-deleter protocol ran through claim → mark_deleted.
         assert!(h.index.log.borrow().contains(&"mark_deleting".to_string()));
+    }
+
+    #[test]
+    fn drain_already_healthy_is_noop() {
+        let mut h = harness();
+        h.statfs = fixed_statfs("/data", 800, 1_000);
+        let cfg = drain_cfg();
+        let rl = RetentionLoop::new(&cfg, h.seams(), "trash");
+        let should_stop = || false;
+        let pet_watchdog = || {};
+        let out = rl
+            .drain_to_target(&DrainInput {
+                data_fs_path: "/data",
+                dry_run: false,
+                should_stop: &should_stop,
+                pet_watchdog: &pet_watchdog,
+            })
+            .unwrap();
+        assert_eq!(out.stop, DrainStop::AlreadyHealthy);
+        assert!(out.records.is_empty());
+        assert_eq!(out.bytes_freed, 0);
+        assert!(h.fs.log.borrow().is_empty());
+        assert!(h.index.log.borrow().is_empty());
+    }
+
+    #[test]
+    fn drain_reaches_target_and_stops() {
+        let cfg = drain_cfg();
+        let clock = FakeClock(Cell::new(1_000_000));
+        let store = FakeStore::new(&[]);
+        let handoff = FakeHandoff {
+            outcome: HandoffOutcome::Done,
+            seen: RefCell::new(Vec::new()),
+        };
+        let free = Rc::new(Cell::new(100));
+        let statfs = RisingStatfs::new(free.clone(), 1_000);
+        let fs = FakeFs::new(&[]).with_free_bump(free.clone(), 150);
+        let index = FakeIndex::new(ClaimResult::Claimed);
+        let (eviction, delete_reqs) = recent_mirror_items_with_reqs(&[1, 2, 3, 4], 150);
+        let catalog = FakeCatalog {
+            recovery: Vec::new(),
+            eviction,
+            delete_reqs,
+            recorded: RefCell::new(Vec::new()),
+            recent_marked: RefCell::new(Vec::new()),
+        };
+        let rand = SeqRand(Cell::new(0));
+        let rl = RetentionLoop::new(
+            &cfg,
+            Seams {
+                clock: &clock,
+                store: &store,
+                handoff: &handoff,
+                statfs: &statfs,
+                fs: &fs,
+                index: &index,
+                catalog: &catalog,
+                rand: &rand,
+            },
+            "trash",
+        );
+        let should_stop = || false;
+        let pet_watchdog = || {};
+        let out = rl
+            .drain_to_target(&DrainInput {
+                data_fs_path: "/data",
+                dry_run: false,
+                should_stop: &should_stop,
+                pet_watchdog: &pet_watchdog,
+            })
+            .unwrap();
+        let ids: Vec<_> = out.records.iter().map(|r| r.id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                ArchiveItemId(1),
+                ArchiveItemId(2),
+                ArchiveItemId(3),
+                ArchiveItemId(4)
+            ]
+        );
+        assert_eq!(out.stop, DrainStop::TargetReached);
+        assert!(out.free_after >= 700);
+    }
+
+    #[test]
+    fn drain_respects_count_cap() {
+        let mut h = harness();
+        h.statfs = fixed_statfs("/data", 100, 1_000);
+        let mut cfg = drain_cfg();
+        cfg.target_drain.target_free_frac = 0.95;
+        cfg.target_drain.target_exit_frac = 0.95;
+        cfg.target_drain.per_cycle_evict_count = 2;
+        let (eviction, delete_reqs) = recent_mirror_items_with_reqs(&[1, 2, 3, 4], 100);
+        h.catalog.eviction = eviction;
+        h.catalog.delete_reqs = delete_reqs;
+        let rl = RetentionLoop::new(&cfg, h.seams(), "trash");
+        let should_stop = || false;
+        let pet_watchdog = || {};
+        let out = rl
+            .drain_to_target(&DrainInput {
+                data_fs_path: "/data",
+                dry_run: false,
+                should_stop: &should_stop,
+                pet_watchdog: &pet_watchdog,
+            })
+            .unwrap();
+        assert_eq!(out.records.len(), 2);
+        assert_eq!(out.stop, DrainStop::CountCapReached);
+    }
+
+    #[test]
+    fn drain_respects_byte_cap() {
+        let mut h = harness();
+        h.statfs = fixed_statfs("/data", 100, 1_000);
+        let mut cfg = drain_cfg();
+        cfg.target_drain.target_free_frac = 0.95;
+        cfg.target_drain.target_exit_frac = 0.95;
+        cfg.target_drain.per_cycle_evict_bytes = 250;
+        let (eviction, delete_reqs) = recent_mirror_items_with_reqs(&[1, 2, 3, 4], 100);
+        h.catalog.eviction = eviction;
+        h.catalog.delete_reqs = delete_reqs;
+        let rl = RetentionLoop::new(&cfg, h.seams(), "trash");
+        let should_stop = || false;
+        let pet_watchdog = || {};
+        let out = rl
+            .drain_to_target(&DrainInput {
+                data_fs_path: "/data",
+                dry_run: false,
+                should_stop: &should_stop,
+                pet_watchdog: &pet_watchdog,
+            })
+            .unwrap();
+        assert_eq!(out.stop, DrainStop::ByteCapReached);
+        assert_eq!(out.records.len(), 3);
+        assert!(out.bytes_freed >= 250);
+    }
+
+    #[test]
+    fn drain_anomaly_refuses() {
+        let mut h = harness();
+        h.statfs = fixed_statfs("/data", 0, 1_000);
+        let mut cfg = drain_cfg();
+        cfg.target_drain.target_free_frac = 0.90;
+        cfg.target_drain.target_exit_frac = 0.95;
+        cfg.target_drain.anomaly_free_frac = 0.10;
+        let (eviction, delete_reqs) = recent_mirror_items_with_reqs(&[1, 2], 100);
+        h.catalog.eviction = eviction;
+        h.catalog.delete_reqs = delete_reqs;
+        let rl = RetentionLoop::new(&cfg, h.seams(), "trash");
+        let should_stop = || false;
+        let pet_watchdog = || {};
+        let out = rl
+            .drain_to_target(&DrainInput {
+                data_fs_path: "/data",
+                dry_run: false,
+                should_stop: &should_stop,
+                pet_watchdog: &pet_watchdog,
+            })
+            .unwrap();
+        assert_eq!(
+            out.stop,
+            DrainStop::AnomalyRefused {
+                bytes_to_free: 900,
+                total_bytes: 1_000
+            }
+        );
+        assert!(out.records.is_empty());
+        assert!(h.fs.log.borrow().is_empty());
+        assert!(h.index.log.borrow().is_empty());
+    }
+
+    #[test]
+    fn drain_dry_run_projects_without_mutation() {
+        let mut h = harness();
+        h.statfs = fixed_statfs("/data", 100, 1_000);
+        let mut cfg = drain_cfg();
+        cfg.target_drain.target_free_frac = 0.40;
+        cfg.target_drain.target_exit_frac = 0.50;
+        let (eviction, delete_reqs) = recent_mirror_items_with_reqs(&[1, 2, 3], 150);
+        h.catalog.eviction = eviction;
+        h.catalog.delete_reqs = delete_reqs;
+        let rl = RetentionLoop::new(&cfg, h.seams(), "trash");
+        let should_stop = || false;
+        let pet_watchdog = || {};
+        let out = rl
+            .drain_to_target(&DrainInput {
+                data_fs_path: "/data",
+                dry_run: true,
+                should_stop: &should_stop,
+                pet_watchdog: &pet_watchdog,
+            })
+            .unwrap();
+        assert_eq!(out.stop, DrainStop::TargetReached);
+        assert_eq!(out.records.len(), 3);
+        assert!(out.records.iter().all(|r| r.dry_run));
+        assert_eq!(out.bytes_freed, 450);
+        assert_eq!(out.free_after, 550);
+        assert!(h.fs.log.borrow().is_empty());
+        assert!(h.index.log.borrow().is_empty());
+    }
+
+    #[test]
+    fn drain_skips_hard_excluded_then_evicts_next() {
+        let mut h = harness();
+        h.statfs = fixed_statfs("/data", 100, 1_000);
+        let mut cfg = drain_cfg();
+        cfg.target_drain.target_free_frac = 0.95;
+        cfg.target_drain.target_exit_frac = 0.95;
+        let mut first = evic(1, EvictionKind::RecentMirror, Durability::Undurable);
+        first.pinned = true;
+        let second = evic(2, EvictionKind::RecentMirror, Durability::Undurable);
+        h.catalog.eviction = vec![first, second];
+        h.catalog.delete_reqs.insert(
+            1,
+            DeleteRequest {
+                id: ArchiveItemId(1),
+                source_path: "archive/1".to_string(),
+                size_bytes: 100,
+            },
+        );
+        h.catalog.delete_reqs.insert(
+            2,
+            DeleteRequest {
+                id: ArchiveItemId(2),
+                source_path: "archive/2".to_string(),
+                size_bytes: 100,
+            },
+        );
+        let rl = RetentionLoop::new(&cfg, h.seams(), "trash");
+        let should_stop = || false;
+        let pet_watchdog = || {};
+        let out = rl
+            .drain_to_target(&DrainInput {
+                data_fs_path: "/data",
+                dry_run: false,
+                should_stop: &should_stop,
+                pet_watchdog: &pet_watchdog,
+            })
+            .unwrap();
+        let ids: Vec<_> = out.records.iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![ArchiveItemId(2)]);
+        assert!(!ids.contains(&ArchiveItemId(1)));
+    }
+
+    #[test]
+    fn drain_shutdown_stops_cleanly() {
+        let mut h = harness();
+        h.statfs = fixed_statfs("/data", 100, 1_000);
+        let mut cfg = drain_cfg();
+        cfg.target_drain.target_free_frac = 0.95;
+        cfg.target_drain.target_exit_frac = 0.95;
+        let (eviction, delete_reqs) = recent_mirror_items_with_reqs(&[1, 2], 100);
+        h.catalog.eviction = eviction;
+        h.catalog.delete_reqs = delete_reqs;
+        let rl = RetentionLoop::new(&cfg, h.seams(), "trash");
+        let pet_count = Cell::new(0u32);
+        let should_stop = || pet_count.get() > 0;
+        let pet_watchdog = || pet_count.set(pet_count.get().saturating_add(1));
+        let out = rl
+            .drain_to_target(&DrainInput {
+                data_fs_path: "/data",
+                dry_run: false,
+                should_stop: &should_stop,
+                pet_watchdog: &pet_watchdog,
+            })
+            .unwrap();
+        assert_eq!(out.stop, DrainStop::ShutdownRequested);
+        assert!(out.records.len() <= 1);
+    }
+
+    #[test]
+    fn drain_stops_on_delete_failed() {
+        let mut h = harness();
+        h.statfs = fixed_statfs("/data", 100, 1_000);
+        let mut cfg = drain_cfg();
+        cfg.target_drain.target_free_frac = 0.95;
+        cfg.target_drain.target_exit_frac = 0.95;
+        let (eviction, delete_reqs) = recent_mirror_items_with_reqs(&[1, 2], 100);
+        h.catalog.eviction = eviction;
+        h.catalog.delete_reqs = delete_reqs;
+        h.fs.fail_rename = true;
+        let rl = RetentionLoop::new(&cfg, h.seams(), "trash");
+        let should_stop = || false;
+        let pet_watchdog = || {};
+        let out = rl
+            .drain_to_target(&DrainInput {
+                data_fs_path: "/data",
+                dry_run: false,
+                should_stop: &should_stop,
+                pet_watchdog: &pet_watchdog,
+            })
+            .unwrap();
+        assert!(matches!(out.stop, DrainStop::DeleteFailed { .. }));
+        assert!(out.records.is_empty());
+        let claim_calls = h
+            .index
+            .log
+            .borrow()
+            .iter()
+            .filter(|entry| entry.as_str() == "claim")
+            .count();
+        assert_eq!(claim_calls, 1);
+    }
+
+    #[test]
+    fn drain_post_delete_statfs_error_returns_partial_bytes_freed() {
+        let cfg = drain_cfg();
+        let clock = FakeClock(Cell::new(1_000_000));
+        let store = FakeStore::new(&[]);
+        let handoff = FakeHandoff {
+            outcome: HandoffOutcome::Done,
+            seen: RefCell::new(Vec::new()),
+        };
+        let statfs = SequencedStatfs::new(vec![
+            Ok(stat(100, 1_000)),
+            Ok(stat(150, 1_000)),
+            Err(io::Error::other("post-delete restat failed")),
+        ]);
+        let fs = FakeFs::new(&[]);
+        let index = FakeIndex::new(ClaimResult::Claimed);
+        let (eviction, delete_reqs) = recent_mirror_items_with_reqs(&[1, 2], 100);
+        let catalog = FakeCatalog {
+            recovery: Vec::new(),
+            eviction,
+            delete_reqs,
+            recorded: RefCell::new(Vec::new()),
+            recent_marked: RefCell::new(Vec::new()),
+        };
+        let rand = SeqRand(Cell::new(0));
+        let rl = RetentionLoop::new(
+            &cfg,
+            Seams {
+                clock: &clock,
+                store: &store,
+                handoff: &handoff,
+                statfs: &statfs,
+                fs: &fs,
+                index: &index,
+                catalog: &catalog,
+                rand: &rand,
+            },
+            "trash",
+        );
+        let should_stop = || false;
+        let pet_watchdog = || {};
+        let out = rl
+            .drain_to_target(&DrainInput {
+                data_fs_path: "/data",
+                dry_run: false,
+                should_stop: &should_stop,
+                pet_watchdog: &pet_watchdog,
+            })
+            .unwrap();
+        assert!(matches!(out.stop, DrainStop::StatCheckFailed { .. }));
+        assert!(out.bytes_freed > 0);
+        assert_eq!(out.records.len(), 2);
+    }
+
+    #[test]
+    fn drain_skips_non_recent_mirror_items() {
+        let mut h = harness();
+        h.statfs = fixed_statfs("/data", 100, 1_000);
+        let mut cfg = drain_cfg();
+        cfg.target_drain.target_free_frac = 0.95;
+        cfg.target_drain.target_exit_frac = 0.95;
+        h.catalog.eviction = vec![
+            evic(
+                10,
+                EvictionKind::Event {
+                    folder: FolderClass::SavedClips,
+                },
+                Durability::Durable,
+            ),
+            evic(20, EvictionKind::RecentMirror, Durability::Durable),
+        ];
+        h.catalog.delete_reqs.insert(
+            10,
+            DeleteRequest {
+                id: ArchiveItemId(10),
+                source_path: "archive/10".to_string(),
+                size_bytes: 100,
+            },
+        );
+        h.catalog.delete_reqs.insert(
+            20,
+            DeleteRequest {
+                id: ArchiveItemId(20),
+                source_path: "archive/20".to_string(),
+                size_bytes: 100,
+            },
+        );
+        let rl = RetentionLoop::new(&cfg, h.seams(), "trash");
+        let should_stop = || false;
+        let pet_watchdog = || {};
+        let out = rl
+            .drain_to_target(&DrainInput {
+                data_fs_path: "/data",
+                dry_run: false,
+                should_stop: &should_stop,
+                pet_watchdog: &pet_watchdog,
+            })
+            .unwrap();
+        let ids: Vec<_> = out.records.iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![ArchiveItemId(20)]);
+        assert!(!ids.contains(&ArchiveItemId(10)));
     }
 
     #[test]

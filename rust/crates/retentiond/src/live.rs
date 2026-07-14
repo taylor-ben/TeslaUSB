@@ -9,16 +9,24 @@ use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read};
 use std::path::{Component, Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::{cell::RefCell, collections::HashMap};
 
 use retentiond::archive::ArchiveStore;
-use retentiond::delete::RandGen;
+use retentiond::delete::{ArchiveDeleteOps, ClaimResult, DeleteRequest, IndexClient, RandGen};
 use retentiond::durability::{canonicalize_under_root, make_temp_path, sync_dir, sync_dir_chain};
 use retentiond::governor::Statfs;
 use retentiond::io::{ContentHash, FileIdentity, FsStat};
+use retentiond::lease::DeleteState;
 use retentiond::read_client::{MAX_READ_LEN, ReadFileClient, read_full_file_to_writer};
+use retentiond::serve::{Catalog, RecoveryRow};
 use retentiond::time::{BootId, Clock, MonoMs};
+use retentiond::value::{EvictionItem, EvictionKind, Recency};
+use retentiond::{durability::Durability, io::ArchiveItemId};
 use sha2::{Digest, Sha256};
+
+use retentiond::index_delete_client::{DeleteWireRequest, DeleteWireResponse, IndexDeleteClient};
 
 pub(crate) struct LiveClock;
 
@@ -284,6 +292,330 @@ impl ArchiveStore for LiveArchiveStore {
     }
 }
 
+/// Live `indexd` delete-state transition client for the single-deleter protocol.
+pub(crate) struct LiveIndexClient {
+    client: Rc<IndexDeleteClient>,
+}
+
+impl LiveIndexClient {
+    /// Build a live delete-state transition client.
+    #[must_use]
+    pub(crate) fn new(client: Rc<IndexDeleteClient>) -> Self {
+        Self { client }
+    }
+}
+
+impl IndexClient for LiveIndexClient {
+    fn claim_archive_delete(&self, id: ArchiveItemId) -> ClaimResult {
+        let req = DeleteWireRequest::ClaimEvictionCandidate {
+            id: id.0,
+            recency_floor_epoch: self.client.recency_floor_epoch(),
+            allow_undurable: self.client.allow_undurable(),
+        };
+        match self.client.send_delete_request(&req) {
+            Ok(DeleteWireResponse::Claimed {}) => ClaimResult::Claimed,
+            Ok(DeleteWireResponse::ClaimDenied { reason }) => ClaimResult::Denied { reason },
+            Ok(DeleteWireResponse::NotFound {}) => ClaimResult::NotFound,
+            Ok(DeleteWireResponse::Error { message } | DeleteWireResponse::Rejected { message }) => {
+                ClaimResult::Denied { reason: message }
+            }
+            Ok(other) => ClaimResult::Denied {
+                reason: format!("unexpected claim response: {other:?}"),
+            },
+            Err(err) => ClaimResult::Denied {
+                reason: format!("claim transport failure: {err}"),
+            },
+        }
+    }
+
+    fn mark_deleting(&self, id: ArchiveItemId) -> io::Result<()> {
+        expect_acked(
+            self.client
+                .send_delete_request(&DeleteWireRequest::MarkArchiveDeleting { id: id.0 })?,
+            "mark_archive_deleting",
+        )
+    }
+
+    fn mark_deleted(&self, id: ArchiveItemId, bytes_freed: u64) -> io::Result<()> {
+        let bytes_freed = match i64::try_from(bytes_freed) {
+            Ok(value) => value,
+            Err(_) => i64::MAX,
+        };
+        expect_acked(
+            self.client
+                .send_delete_request(&DeleteWireRequest::MarkArchiveDeleted {
+                    id: id.0,
+                    bytes_freed,
+                })?,
+            "mark_archive_deleted",
+        )
+    }
+
+    fn release_delete_claim(&self, id: ArchiveItemId) -> io::Result<()> {
+        expect_acked(
+            self.client
+                .send_delete_request(&DeleteWireRequest::ReleaseArchiveDeleteClaim { id: id.0 })?,
+            "release_archive_delete_claim",
+        )
+    }
+
+    fn quarantine(&self, id: ArchiveItemId, reason: &str) -> io::Result<()> {
+        expect_acked(
+            self.client
+                .send_delete_request(&DeleteWireRequest::QuarantineArchiveItem {
+                    id: id.0,
+                    reason: reason.to_owned(),
+                })?,
+            "quarantine_archive_item",
+        )
+    }
+}
+
+fn expect_acked(response: DeleteWireResponse, op: &str) -> io::Result<()> {
+    match response {
+        DeleteWireResponse::Acked {} => Ok(()),
+        DeleteWireResponse::Error { message } => {
+            Err(io::Error::other(format!("indexd {op} error: {message}")))
+        }
+        DeleteWireResponse::Rejected { message } => {
+            Err(io::Error::other(format!("indexd {op} rejected: {message}")))
+        }
+        other => Err(io::Error::other(format!(
+            "unexpected indexd {op} response: {other:?}"
+        ))),
+    }
+}
+
+/// Live `Catalog` seam backed by `indexd` delete-path verbs.
+///
+/// The same shared [`IndexDeleteClient`] instance is used by both
+/// [`LiveCatalog`] and [`LiveIndexClient`] so `set_cycle_context(...)` applies to
+/// list and claim paths together.
+pub(crate) struct LiveCatalog {
+    client: Rc<IndexDeleteClient>,
+    archive_root: PathBuf,
+    trash_dir: String,
+    delete_cache: RefCell<HashMap<i64, (String, u64)>>,
+}
+
+impl LiveCatalog {
+    /// Build a live governor delete-path catalog seam.
+    #[must_use]
+    pub(crate) fn new(
+        client: Rc<IndexDeleteClient>,
+        archive_root: impl Into<PathBuf>,
+        trash_dir: impl Into<String>,
+    ) -> Self {
+        Self {
+            client,
+            archive_root: archive_root.into(),
+            trash_dir: trash_dir.into(),
+            delete_cache: RefCell::new(HashMap::new()),
+        }
+    }
+}
+
+impl Catalog for LiveCatalog {
+    fn record_verified_pass(
+        &self,
+        _folder_key: &str,
+        _pass: &retentiond::archive::VerifiedArchivePass,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "LiveCatalog is the governor delete-path seam; verified-pass/mirror bookkeeping is owned by the phase-1 archive driver",
+        ))
+    }
+
+    fn eviction_items(&self) -> io::Result<Vec<EvictionItem>> {
+        let rows = self.client.list_eviction_candidates()?;
+        let mut out = Vec::new();
+        let mut cache = self.delete_cache.borrow_mut();
+        cache.clear();
+        for row in rows {
+            if row.folder_class != "RecentClips" {
+                continue;
+            }
+            if validate_source_rel_path(&row.path).is_err() {
+                continue;
+            }
+            let abs = jailed_join(&self.archive_root, &row.path)?;
+            let size = u64::try_from(row.size_bytes).ok().map_or(0, |value| value);
+            cache.insert(row.id, (abs.to_string_lossy().into_owned(), size));
+            out.push(EvictionItem {
+                id: ArchiveItemId(row.id),
+                kind: EvictionKind::RecentMirror,
+                durability: Durability::Undurable,
+                sentry_flood: false,
+                size,
+                recency: Recency::VeryOld,
+                user_save: false,
+                impact_event: false,
+                has_telemetry: false,
+                event_adjacent: false,
+                duplicate_cluster: false,
+                user_marked_disposable: false,
+                pinned: false,
+                leased: false,
+                in_grace: false,
+                quarantined: false,
+                inside_disk_img: false,
+            });
+        }
+        Ok(out)
+    }
+
+    fn delete_request(&self, id: ArchiveItemId) -> io::Result<Option<DeleteRequest>> {
+        let cache = self.delete_cache.borrow();
+        if let Some((source_path, size_bytes)) = cache.get(&id.0) {
+            return Ok(Some(DeleteRequest {
+                id,
+                source_path: source_path.clone(),
+                size_bytes: *size_bytes,
+            }));
+        }
+        Ok(None)
+    }
+
+    fn recovery_rows(&self) -> io::Result<Vec<RecoveryRow>> {
+        let rows = self.client.list_recovery_rows()?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            validate_source_rel_path(&row.path)?;
+            let source_path = jailed_join(&self.archive_root, &row.path)?
+                .to_string_lossy()
+                .into_owned();
+            let delete_state = parse_delete_state(&row.delete_state)?;
+            let trash_path = if let Some(delete_gen) = row.delete_gen {
+                let gen_token = u128::from_str_radix(&delete_gen, 16).map_err(|err| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid delete_gen hex for id {}: {err}", row.id),
+                    )
+                })?;
+                retentiond::delete::trash_path(&self.trash_dir, ArchiveItemId(row.id), gen_token)
+            } else {
+                String::new()
+            };
+            let size_bytes = u64::try_from(row.size_bytes).ok().map_or(0, |value| value);
+            out.push(RecoveryRow {
+                id: ArchiveItemId(row.id),
+                delete_state,
+                source_path,
+                trash_path,
+                size_bytes,
+            });
+        }
+        Ok(out)
+    }
+
+    fn mark_recent_archived(&self, _key: &str) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "LiveCatalog is the governor delete-path seam; verified-pass/mirror bookkeeping is owned by the phase-1 archive driver",
+        ))
+    }
+}
+
+fn parse_delete_state(raw: &str) -> io::Result<DeleteState> {
+    match raw {
+        "LIVE" => Ok(DeleteState::Live),
+        "DELETE_CLAIMED" => Ok(DeleteState::DeleteClaimed),
+        "DELETING" => Ok(DeleteState::Deleting),
+        "DELETED" => Ok(DeleteState::Deleted),
+        "DELETE_FAILED" => Ok(DeleteState::DeleteFailed),
+        "QUARANTINED" => Ok(DeleteState::Quarantined),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unknown delete_state: {raw}"),
+        )),
+    }
+}
+
+/// Live filesystem delete ops for the crash-safe single-deleter protocol.
+pub(crate) struct LiveArchiveDeleteOps {
+    archive_root: PathBuf,
+}
+
+impl LiveArchiveDeleteOps {
+    /// Build a live archive delete-ops seam.
+    #[must_use]
+    pub(crate) fn new(archive_root: impl Into<PathBuf>) -> Self {
+        Self {
+            archive_root: archive_root.into(),
+        }
+    }
+}
+
+impl ArchiveDeleteOps for LiveArchiveDeleteOps {
+    fn exists(&self, path: &str) -> bool {
+        fs::symlink_metadata(path).is_ok()
+    }
+
+    fn rename_into_trash(&self, src: &str, dst: &str) -> io::Result<()> {
+        let src_path = validate_delete_path_in_jail(&self.archive_root, Path::new(src))?;
+        let dst_path = validate_delete_path_in_jail(&self.archive_root, Path::new(dst))?;
+        fs::rename(src_path, dst_path)
+    }
+
+    fn fsync_parent(&self, path: &str) -> io::Result<()> {
+        let path = validate_delete_path_in_jail(&self.archive_root, Path::new(path))?;
+        let parent = path.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("path has no parent for fsync: {}", path.display()),
+            )
+        })?;
+        validate_archive_parent_path(&self.archive_root, parent)?;
+        File::open(parent)?.sync_all()
+    }
+
+    fn recursive_delete(&self, path: &str) -> io::Result<()> {
+        let path = validate_delete_path_in_jail(&self.archive_root, Path::new(path))?;
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_dir() {
+            fs::remove_dir_all(path)
+        } else {
+            fs::remove_file(path)
+        }
+    }
+}
+
+fn validate_delete_path_in_jail(root: &Path, path: &Path) -> io::Result<PathBuf> {
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path must be absolute: {}", path.display()),
+        ));
+    }
+    let rel = path.strip_prefix(root).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "path is outside archive root (root={}, path={})",
+                root.display(),
+                path.display()
+            ),
+        )
+    })?;
+    for component in rel.components() {
+        if !matches!(component, Component::Normal(_)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("path escapes archive root: {}", path.display()),
+            ));
+        }
+    }
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path has no parent: {}", path.display()),
+        )
+    })?;
+    validate_archive_parent_path(root, parent)?;
+    Ok(path.to_path_buf())
+}
+
 fn validate_source_rel_path(rel: &str) -> io::Result<()> {
     if rel.is_empty() || rel.as_bytes().contains(&0) || rel.contains('\\') {
         return Err(io::Error::new(
@@ -471,6 +803,527 @@ mod tests {
         let dir = std::env::temp_dir().join(name);
         fs::create_dir_all(&dir).expect("create temp dir");
         dir
+    }
+
+    #[cfg(all(test, unix))]
+    #[allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
+    mod delete_path_tests {
+        use std::fs;
+        use std::io::{self, Read, Write};
+        use std::os::unix::net::UnixListener;
+        use std::path::PathBuf;
+        use std::rc::Rc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::thread;
+
+        use super::super::{LiveArchiveDeleteOps, LiveCatalog, LiveIndexClient};
+        use retentiond::index_delete_client::{
+            DeleteWireResponse, EvictionCandidateWire, IndexDeleteClient, RecoveryRowWire,
+        };
+        use retentiond::delete::IndexClient;
+        use retentiond::io::ArchiveItemId;
+        use retentiond::lease::DeleteState;
+        use retentiond::serve::Catalog;
+        use retentiond::value::EvictionKind;
+        use retentiond::{delete::ArchiveDeleteOps, durability::Durability};
+
+        static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+        const MAX_REQUEST_FRAME: u32 = 64 * 1024;
+
+        fn read_frame(stream: &mut impl Read, cap: u32) -> io::Result<Vec<u8>> {
+            let mut len_buf = [0_u8; 4];
+            stream.read_exact(&mut len_buf)?;
+            let len = u32::from_le_bytes(len_buf);
+            if len > cap {
+                return Err(io::Error::other("frame too large"));
+            }
+            let mut payload = vec![0_u8; len as usize];
+            stream.read_exact(&mut payload)?;
+            Ok(payload)
+        }
+
+        fn write_frame(stream: &mut impl Write, payload: &[u8], cap: u32) -> io::Result<()> {
+            if payload.len() > cap as usize {
+                return Err(io::Error::other("frame too large"));
+            }
+            let len = u32::try_from(payload.len())
+                .map_err(|_| io::Error::other("frame exceeds u32 length"))?;
+            stream.write_all(&len.to_le_bytes())?;
+            stream.write_all(payload)?;
+            stream.flush()
+        }
+
+        fn new_temp_dir() -> PathBuf {
+            let unique = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let name = format!("retentiond-live-delete-{}-{unique}", std::process::id());
+            let dir = std::env::temp_dir().join(name);
+            fs::create_dir_all(&dir).expect("create temp dir");
+            dir
+        }
+
+        #[test]
+        fn claim_maps_claimed() {
+            let temp_dir = new_temp_dir();
+            let socket_path = temp_dir.join("indexd.sock");
+            let listener = UnixListener::bind(&socket_path).expect("bind listener");
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let _payload = read_frame(&mut stream, MAX_REQUEST_FRAME).expect("read request");
+                let payload = serde_json::to_vec(&DeleteWireResponse::Claimed {}).expect("encode");
+                write_frame(&mut stream, &payload, MAX_REQUEST_FRAME).expect("write response");
+            });
+            let shared = Rc::new(IndexDeleteClient::new(socket_path));
+            let client = LiveIndexClient::new(shared);
+            assert_eq!(
+                client.claim_archive_delete(ArchiveItemId(7)),
+                retentiond::delete::ClaimResult::Claimed
+            );
+            server.join().expect("join");
+            let _ = fs::remove_dir_all(temp_dir);
+        }
+
+        #[test]
+        fn claim_maps_denied() {
+            let temp_dir = new_temp_dir();
+            let socket_path = temp_dir.join("indexd.sock");
+            let listener = UnixListener::bind(&socket_path).expect("bind listener");
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let _payload = read_frame(&mut stream, MAX_REQUEST_FRAME).expect("read request");
+                let payload = serde_json::to_vec(&DeleteWireResponse::ClaimDenied {
+                    reason: "leased".to_owned(),
+                })
+                .expect("encode");
+                write_frame(&mut stream, &payload, MAX_REQUEST_FRAME).expect("write response");
+            });
+            let shared = Rc::new(IndexDeleteClient::new(socket_path));
+            let client = LiveIndexClient::new(shared);
+            assert_eq!(
+                client.claim_archive_delete(ArchiveItemId(7)),
+                retentiond::delete::ClaimResult::Denied {
+                    reason: "leased".to_owned()
+                }
+            );
+            server.join().expect("join");
+            let _ = fs::remove_dir_all(temp_dir);
+        }
+
+        #[test]
+        fn claim_maps_notfound() {
+            let temp_dir = new_temp_dir();
+            let socket_path = temp_dir.join("indexd.sock");
+            let listener = UnixListener::bind(&socket_path).expect("bind listener");
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let _payload = read_frame(&mut stream, MAX_REQUEST_FRAME).expect("read request");
+                let payload = serde_json::to_vec(&DeleteWireResponse::NotFound {}).expect("encode");
+                write_frame(&mut stream, &payload, MAX_REQUEST_FRAME).expect("write response");
+            });
+            let shared = Rc::new(IndexDeleteClient::new(socket_path));
+            let client = LiveIndexClient::new(shared);
+            assert_eq!(
+                client.claim_archive_delete(ArchiveItemId(7)),
+                retentiond::delete::ClaimResult::NotFound
+            );
+            server.join().expect("join");
+            let _ = fs::remove_dir_all(temp_dir);
+        }
+
+        #[test]
+        fn claim_transport_error_fails_closed() {
+            let temp_dir = new_temp_dir();
+            let socket_path = temp_dir.join("indexd.sock");
+            let listener = UnixListener::bind(&socket_path).expect("bind listener");
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let _payload = read_frame(&mut stream, MAX_REQUEST_FRAME).expect("read request");
+                drop(stream);
+            });
+            let shared = Rc::new(IndexDeleteClient::new(socket_path));
+            let client = LiveIndexClient::new(shared);
+            let got = client.claim_archive_delete(ArchiveItemId(7));
+            match got {
+                retentiond::delete::ClaimResult::Denied { .. } => {}
+                other => panic!("expected denied, got {other:?}"),
+            }
+            server.join().expect("join");
+            let _ = fs::remove_dir_all(temp_dir);
+        }
+
+        #[test]
+        fn claim_sends_cycle_context() {
+            let temp_dir = new_temp_dir();
+            let socket_path = temp_dir.join("indexd.sock");
+            let listener = UnixListener::bind(&socket_path).expect("bind listener");
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let payload = read_frame(&mut stream, MAX_REQUEST_FRAME).expect("read request");
+                let req_json = String::from_utf8(payload).expect("utf8");
+                assert_eq!(
+                    req_json,
+                    "{\"cmd\":\"claim_eviction_candidate\",\"id\":7,\"recency_floor_epoch\":12345,\"allow_undurable\":true}"
+                );
+                let payload = serde_json::to_vec(&DeleteWireResponse::Claimed {}).expect("encode");
+                write_frame(&mut stream, &payload, MAX_REQUEST_FRAME).expect("write response");
+            });
+            let shared = Rc::new(IndexDeleteClient::new(socket_path));
+            shared.set_cycle_context(12345, true);
+            let client = LiveIndexClient::new(shared);
+            assert_eq!(
+                client.claim_archive_delete(ArchiveItemId(7)),
+                retentiond::delete::ClaimResult::Claimed
+            );
+            server.join().expect("join");
+            let _ = fs::remove_dir_all(temp_dir);
+        }
+
+        #[test]
+        fn mark_deleting_deleted_release_quarantine_ack_ok_else_err() {
+            let temp_dir = new_temp_dir();
+            let socket_path = temp_dir.join("indexd.sock");
+            let listener = UnixListener::bind(&socket_path).expect("bind listener");
+            let server = thread::spawn(move || {
+                let ack = serde_json::to_vec(&DeleteWireResponse::Acked {}).expect("encode");
+                let err = serde_json::to_vec(&DeleteWireResponse::Error {
+                    message: "nope".to_owned(),
+                })
+                .expect("encode");
+
+                let (mut stream, _) = listener.accept().expect("accept 1");
+                let p1 = read_frame(&mut stream, MAX_REQUEST_FRAME).expect("read 1");
+                assert_eq!(
+                    String::from_utf8(p1).expect("utf8"),
+                    "{\"cmd\":\"mark_archive_deleting\",\"id\":7}"
+                );
+                write_frame(&mut stream, &ack, MAX_REQUEST_FRAME).expect("write 1");
+
+                let (mut stream, _) = listener.accept().expect("accept 2");
+                let p2 = read_frame(&mut stream, MAX_REQUEST_FRAME).expect("read 2");
+                assert_eq!(
+                    String::from_utf8(p2).expect("utf8"),
+                    "{\"cmd\":\"mark_archive_deleted\",\"id\":7,\"bytes_freed\":99}"
+                );
+                write_frame(&mut stream, &ack, MAX_REQUEST_FRAME).expect("write 2");
+
+                let (mut stream, _) = listener.accept().expect("accept 3");
+                let p3 = read_frame(&mut stream, MAX_REQUEST_FRAME).expect("read 3");
+                assert_eq!(
+                    String::from_utf8(p3).expect("utf8"),
+                    "{\"cmd\":\"release_archive_delete_claim\",\"id\":7}"
+                );
+                write_frame(&mut stream, &ack, MAX_REQUEST_FRAME).expect("write 3");
+
+                let (mut stream, _) = listener.accept().expect("accept 4");
+                let p4 = read_frame(&mut stream, MAX_REQUEST_FRAME).expect("read 4");
+                assert_eq!(
+                    String::from_utf8(p4).expect("utf8"),
+                    "{\"cmd\":\"quarantine_archive_item\",\"id\":7,\"reason\":\"boom\"}"
+                );
+                write_frame(&mut stream, &err, MAX_REQUEST_FRAME).expect("write 4");
+            });
+            let shared = Rc::new(IndexDeleteClient::new(socket_path));
+            let client = LiveIndexClient::new(shared);
+            assert!(client.mark_deleting(ArchiveItemId(7)).is_ok());
+            assert!(client.mark_deleted(ArchiveItemId(7), 99).is_ok());
+            assert!(client.release_delete_claim(ArchiveItemId(7)).is_ok());
+            assert!(client.quarantine(ArchiveItemId(7), "boom").is_err());
+            server.join().expect("join");
+            let _ = fs::remove_dir_all(temp_dir);
+        }
+
+        #[test]
+        fn eviction_items_maps_and_orders() {
+            let temp_dir = new_temp_dir();
+            let archive_root = temp_dir.join("archive");
+            fs::create_dir_all(&archive_root).expect("archive root");
+            let socket_path = temp_dir.join("indexd.sock");
+            let listener = UnixListener::bind(&socket_path).expect("bind listener");
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let payload = read_frame(&mut stream, MAX_REQUEST_FRAME).expect("read request");
+                assert_eq!(
+                    String::from_utf8(payload).expect("utf8"),
+                    "{\"cmd\":\"list_eviction_candidates\",\"recency_floor_epoch\":9223372036854775807,\"allow_undurable\":false,\"limit\":256}"
+                );
+                let response = DeleteWireResponse::EvictionCandidates {
+                    items: vec![
+                        EvictionCandidateWire {
+                            id: 11,
+                            path: "RecentClips/older/1".to_owned(),
+                            size_bytes: 10,
+                            archived_at: 1,
+                            folder_class: "RecentClips".to_owned(),
+                        },
+                        EvictionCandidateWire {
+                            id: 99,
+                            path: "SentryClips/skip/2".to_owned(),
+                            size_bytes: 20,
+                            archived_at: 2,
+                            folder_class: "SentryClips".to_owned(),
+                        },
+                        EvictionCandidateWire {
+                            id: 12,
+                            path: "RecentClips/older/3".to_owned(),
+                            size_bytes: 30,
+                            archived_at: 3,
+                            folder_class: "RecentClips".to_owned(),
+                        },
+                    ],
+                };
+                let encoded = serde_json::to_vec(&response).expect("encode");
+                write_frame(&mut stream, &encoded, MAX_REQUEST_FRAME).expect("write response");
+            });
+            let shared = Rc::new(IndexDeleteClient::new(socket_path));
+            let catalog = LiveCatalog::new(shared, &archive_root, "/archive/.retention-trash");
+            let items = catalog.eviction_items().expect("eviction items");
+            assert_eq!(items.len(), 2);
+            assert_eq!(items[0].id, ArchiveItemId(11));
+            assert_eq!(items[1].id, ArchiveItemId(12));
+            assert_eq!(items[0].kind, EvictionKind::RecentMirror);
+            assert_eq!(items[1].kind, EvictionKind::RecentMirror);
+            assert_eq!(items[0].durability, Durability::Undurable);
+            assert_eq!(items[1].durability, Durability::Undurable);
+            let req1 = catalog
+                .delete_request(ArchiveItemId(11))
+                .expect("delete request")
+                .expect("exists");
+            let req2 = catalog
+                .delete_request(ArchiveItemId(12))
+                .expect("delete request")
+                .expect("exists");
+            assert_eq!(
+                req1.source_path,
+                archive_root.join("RecentClips/older/1").to_string_lossy()
+            );
+            assert_eq!(
+                req2.source_path,
+                archive_root.join("RecentClips/older/3").to_string_lossy()
+            );
+            assert!(catalog
+                .delete_request(ArchiveItemId(99))
+                .expect("delete request")
+                .is_none());
+            server.join().expect("join");
+            let _ = fs::remove_dir_all(temp_dir);
+        }
+
+        #[test]
+        fn eviction_items_rejects_escaping_path() {
+            let temp_dir = new_temp_dir();
+            let archive_root = temp_dir.join("archive");
+            fs::create_dir_all(&archive_root).expect("archive root");
+            let socket_path = temp_dir.join("indexd.sock");
+            let listener = UnixListener::bind(&socket_path).expect("bind listener");
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let _payload = read_frame(&mut stream, MAX_REQUEST_FRAME).expect("read request");
+                let response = DeleteWireResponse::EvictionCandidates {
+                    items: vec![EvictionCandidateWire {
+                        id: 21,
+                        path: "../etc/x".to_owned(),
+                        size_bytes: 10,
+                        archived_at: 1,
+                        folder_class: "RecentClips".to_owned(),
+                    }],
+                };
+                let encoded = serde_json::to_vec(&response).expect("encode");
+                write_frame(&mut stream, &encoded, MAX_REQUEST_FRAME).expect("write response");
+            });
+            let shared = Rc::new(IndexDeleteClient::new(socket_path));
+            let catalog = LiveCatalog::new(shared, &archive_root, "/archive/.retention-trash");
+            let items = catalog.eviction_items().expect("eviction items");
+            assert!(items.is_empty());
+            assert!(catalog
+                .delete_request(ArchiveItemId(21))
+                .expect("delete request")
+                .is_none());
+            server.join().expect("join");
+            let _ = fs::remove_dir_all(temp_dir);
+        }
+
+        #[test]
+        fn delete_request_miss_is_none() {
+            let temp_dir = new_temp_dir();
+            let archive_root = temp_dir.join("archive");
+            fs::create_dir_all(&archive_root).expect("archive root");
+            let socket_path = temp_dir.join("indexd.sock");
+            let listener = UnixListener::bind(&socket_path).expect("bind listener");
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let _payload = read_frame(&mut stream, MAX_REQUEST_FRAME).expect("read request");
+                let response = DeleteWireResponse::EvictionCandidates { items: vec![] };
+                let encoded = serde_json::to_vec(&response).expect("encode");
+                write_frame(&mut stream, &encoded, MAX_REQUEST_FRAME).expect("write response");
+            });
+            let shared = Rc::new(IndexDeleteClient::new(socket_path));
+            let catalog = LiveCatalog::new(shared, &archive_root, "/archive/.retention-trash");
+            let _ = catalog.eviction_items().expect("seed cache");
+            assert!(catalog
+                .delete_request(ArchiveItemId(404))
+                .expect("delete request")
+                .is_none());
+            server.join().expect("join");
+            let _ = fs::remove_dir_all(temp_dir);
+        }
+
+        #[test]
+        fn recovery_rows_maps_state_and_trash() {
+            let temp_dir = new_temp_dir();
+            let archive_root = temp_dir.join("archive");
+            fs::create_dir_all(&archive_root).expect("archive root");
+            let socket_path = temp_dir.join("indexd.sock");
+            let listener = UnixListener::bind(&socket_path).expect("bind listener");
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let payload = read_frame(&mut stream, MAX_REQUEST_FRAME).expect("read request");
+                assert_eq!(String::from_utf8(payload).expect("utf8"), "{\"cmd\":\"list_recovery_rows\"}");
+                let response = DeleteWireResponse::RecoveryRows {
+                    rows: vec![RecoveryRowWire {
+                        id: 5,
+                        delete_state: "DELETING".to_owned(),
+                        path: "RecentClips/older/5".to_owned(),
+                        size_bytes: 42,
+                        delete_gen: Some("0000000000000000000000000000000f".to_owned()),
+                    }],
+                };
+                let encoded = serde_json::to_vec(&response).expect("encode");
+                write_frame(&mut stream, &encoded, MAX_REQUEST_FRAME).expect("write response");
+            });
+            let shared = Rc::new(IndexDeleteClient::new(socket_path));
+            let catalog = LiveCatalog::new(shared, &archive_root, "/archive/.retention-trash");
+            let rows = catalog.recovery_rows().expect("recovery rows");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].delete_state, DeleteState::Deleting);
+            assert_eq!(rows[0].source_path, archive_root.join("RecentClips/older/5").to_string_lossy());
+            assert_eq!(
+                rows[0].trash_path,
+                "/archive/.retention-trash/5.0000000000000000000000000000000f.deleting"
+            );
+            server.join().expect("join");
+            let _ = fs::remove_dir_all(temp_dir);
+
+            let temp_dir = new_temp_dir();
+            let archive_root = temp_dir.join("archive");
+            fs::create_dir_all(&archive_root).expect("archive root");
+            let socket_path = temp_dir.join("indexd.sock");
+            let listener = UnixListener::bind(&socket_path).expect("bind listener");
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let _payload = read_frame(&mut stream, MAX_REQUEST_FRAME).expect("read request");
+                let response = DeleteWireResponse::RecoveryRows {
+                    rows: vec![RecoveryRowWire {
+                        id: 6,
+                        delete_state: "UNKNOWN_STATE".to_owned(),
+                        path: "RecentClips/older/6".to_owned(),
+                        size_bytes: 1,
+                        delete_gen: None,
+                    }],
+                };
+                let encoded = serde_json::to_vec(&response).expect("encode");
+                write_frame(&mut stream, &encoded, MAX_REQUEST_FRAME).expect("write response");
+            });
+            let shared = Rc::new(IndexDeleteClient::new(socket_path));
+            let catalog = LiveCatalog::new(shared, &archive_root, "/archive/.retention-trash");
+            assert!(catalog.recovery_rows().is_err());
+            server.join().expect("join");
+            let _ = fs::remove_dir_all(temp_dir);
+        }
+
+        #[test]
+        fn rename_into_trash_moves_within_jail() {
+            let temp_dir = new_temp_dir();
+            let archive_root = temp_dir.join("archive");
+            fs::create_dir_all(archive_root.join("src")).expect("src dir");
+            fs::create_dir_all(archive_root.join("trash")).expect("trash dir");
+            let src = archive_root.join("src/a.txt");
+            let dst = archive_root.join("trash/a.txt");
+            fs::write(&src, b"x").expect("write src");
+
+            let ops = LiveArchiveDeleteOps::new(&archive_root);
+            ops.rename_into_trash(
+                src.to_string_lossy().as_ref(),
+                dst.to_string_lossy().as_ref(),
+            )
+            .expect("rename");
+            assert!(!src.exists());
+            assert!(dst.exists());
+            let _ = fs::remove_dir_all(temp_dir);
+        }
+
+        #[test]
+        fn rename_rejects_outside_root() {
+            let temp_dir = new_temp_dir();
+            let archive_root = temp_dir.join("archive");
+            let outside = temp_dir.join("outside");
+            fs::create_dir_all(archive_root.join("src")).expect("src dir");
+            fs::create_dir_all(&outside).expect("outside dir");
+            let src = archive_root.join("src/a.txt");
+            let dst = outside.join("a.txt");
+            fs::write(&src, b"x").expect("write src");
+
+            let ops = LiveArchiveDeleteOps::new(&archive_root);
+            assert!(ops
+                .rename_into_trash(src.to_string_lossy().as_ref(), dst.to_string_lossy().as_ref())
+                .is_err());
+            assert!(src.exists());
+            assert!(!dst.exists());
+            let _ = fs::remove_dir_all(temp_dir);
+        }
+
+        #[test]
+        fn recursive_delete_file_and_dir() {
+            let temp_dir = new_temp_dir();
+            let archive_root = temp_dir.join("archive");
+            fs::create_dir_all(archive_root.join("dir/sub")).expect("dir");
+            let file = archive_root.join("dir/file.txt");
+            let dir = archive_root.join("dir/sub");
+            fs::write(&file, b"x").expect("file");
+
+            let ops = LiveArchiveDeleteOps::new(&archive_root);
+            ops.recursive_delete(file.to_string_lossy().as_ref())
+                .expect("delete file");
+            assert!(!file.exists());
+            ops.recursive_delete(dir.to_string_lossy().as_ref())
+                .expect("delete dir");
+            assert!(!dir.exists());
+            let _ = fs::remove_dir_all(temp_dir);
+        }
+
+        #[test]
+        fn recursive_delete_rejects_escape() {
+            let temp_dir = new_temp_dir();
+            let archive_root = temp_dir.join("archive");
+            let outside = temp_dir.join("outside");
+            fs::create_dir_all(&archive_root).expect("archive");
+            fs::create_dir_all(&outside).expect("outside");
+            let target = outside.join("file.txt");
+            fs::write(&target, b"x").expect("file");
+            let ops = LiveArchiveDeleteOps::new(&archive_root);
+            assert!(ops
+                .recursive_delete(target.to_string_lossy().as_ref())
+                .is_err());
+            assert!(target.exists());
+            let _ = fs::remove_dir_all(temp_dir);
+        }
+
+        #[test]
+        fn exists_true_false() {
+            let temp_dir = new_temp_dir();
+            let archive_root = temp_dir.join("archive");
+            fs::create_dir_all(&archive_root).expect("archive");
+            let file = archive_root.join("exists.txt");
+            fs::write(&file, b"x").expect("file");
+            let missing = archive_root.join("missing.txt");
+            let ops = LiveArchiveDeleteOps::new(&archive_root);
+            assert!(ops.exists(file.to_string_lossy().as_ref()));
+            assert!(!ops.exists(missing.to_string_lossy().as_ref()));
+            let _ = fs::remove_dir_all(temp_dir);
+        }
     }
 
     fn hash_bytes(bytes: &[u8]) -> ContentHash {

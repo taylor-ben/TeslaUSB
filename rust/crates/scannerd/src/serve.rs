@@ -48,12 +48,13 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use scannerd::produce::{DEFAULT_SEI_SAMPLE_RATE, ImageSource, produce};
-use scannerd::proto::{Request, read_request, write_batch};
+use scannerd::produce::{produce, ImageSource, DEFAULT_SEI_SAMPLE_RATE};
+use scannerd::proto::{read_request, write_batch, Request};
 use scannerd::stability::{StabilityConfig, StabilityTracker};
 
 use crate::io::PreadReader;
 use crate::readserve;
+use crate::statserve;
 
 /// Default control-socket path (matches the `gadgetd` runtime layout).
 const DEFAULT_SOCKET: &str = "/run/teslausb/scannerd.sock";
@@ -68,7 +69,8 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Parse `scannerd serve <teslacam-image> [--media <media-image>]
-/// [--socket <path>] [--read-socket <path>] [--sample-rate <n>]`
+/// [--socket <path>] [--read-socket <path>] [--stat-socket <path>]
+/// [--sample-rate <n>]`
 /// and run the daemon.
 ///
 /// The first positional argument is the **`TeslaCam`** (dashcam) image; its
@@ -82,7 +84,7 @@ pub fn run_serve(args: &[String]) -> ExitCode {
     let Some(teslacam) = args.get(2) else {
         eprintln!(
             "usage: scannerd serve <teslacam-image> [--media <media-image>] \
-             [--socket <path>] [--read-socket <path>] [--sample-rate <n>]"
+             [--socket <path>] [--read-socket <path>] [--stat-socket <path>] [--sample-rate <n>]"
         );
         return ExitCode::FAILURE;
     };
@@ -90,6 +92,8 @@ pub fn run_serve(args: &[String]) -> ExitCode {
     let socket = arg_value(args, "--socket").unwrap_or_else(|| DEFAULT_SOCKET.to_owned());
     let read_socket = arg_value(args, "--read-socket")
         .unwrap_or_else(|| readserve::DEFAULT_READ_SOCKET.to_owned());
+    let stat_socket = arg_value(args, "--stat-socket")
+        .unwrap_or_else(|| statserve::DEFAULT_STAT_SOCKET.to_owned());
     let sample_rate = arg_value(args, "--sample-rate")
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(DEFAULT_SEI_SAMPLE_RATE);
@@ -133,6 +137,14 @@ pub fn run_serve(args: &[String]) -> ExitCode {
         Ok(handle) => handle,
         Err(e) => {
             eprintln!("scannerd serve: cannot start read socket {read_socket}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let _stat_thread = match statserve::start(Arc::clone(&teslacam_reader), Path::new(&stat_socket))
+    {
+        Ok(handle) => handle,
+        Err(e) => {
+            eprintln!("scannerd serve: cannot start stat socket {stat_socket}: {e}");
             return ExitCode::FAILURE;
         }
     };

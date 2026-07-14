@@ -150,7 +150,13 @@ fn frame_cap_usize(cap: u32) -> Result<usize, RegisterError> {
     usize::try_from(cap).map_err(|_| RegisterError::Decode("frame cap overflow".to_owned()))
 }
 
-fn read_frame(stream: &mut impl Read, cap: u32) -> Result<Vec<u8>, RegisterError> {
+/// Read one framed payload (4-byte little-endian length + JSON payload).
+///
+/// # Errors
+///
+/// Returns [`RegisterError`] when I/O fails, the frame is torn, or its length
+/// exceeds `cap`.
+pub(crate) fn read_frame(stream: &mut impl Read, cap: u32) -> Result<Vec<u8>, RegisterError> {
     let mut len_buf = [0_u8; 4];
     stream.read_exact(&mut len_buf)?;
     let len_u32 = u32::from_le_bytes(len_buf);
@@ -166,7 +172,16 @@ fn read_frame(stream: &mut impl Read, cap: u32) -> Result<Vec<u8>, RegisterError
     Ok(payload)
 }
 
-fn write_frame(stream: &mut impl Write, payload: &[u8], cap: u32) -> Result<(), RegisterError> {
+/// Write one framed payload (4-byte little-endian length + JSON payload).
+///
+/// # Errors
+///
+/// Returns [`RegisterError`] when framing bounds are exceeded or write fails.
+pub(crate) fn write_frame(
+    stream: &mut impl Write,
+    payload: &[u8],
+    cap: u32,
+) -> Result<(), RegisterError> {
     let cap_len = frame_cap_usize(cap)?;
     if payload.len() > cap_len {
         return Err(RegisterError::FrameTooLarge {
@@ -238,7 +253,8 @@ pub fn decode_response_frame(frame: &[u8]) -> Result<RegistrationOk, RegisterErr
 }
 
 #[cfg(unix)]
-const IO_TIMEOUT_SECS: u64 = 5;
+/// Per-request socket I/O timeout for `indexd` control RPCs.
+pub(crate) const IO_TIMEOUT_SECS: u64 = 5;
 
 /// Live Unix-domain-socket `indexd` register client.
 #[cfg(unix)]

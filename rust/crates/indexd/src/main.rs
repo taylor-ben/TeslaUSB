@@ -292,7 +292,7 @@ mod unix_app {
         let conn = Arc::new(Mutex::new(conn));
 
         // Single-writer hygiene: reap leases stranded by a previous boot.
-        let boot = BootContext::new();
+        let boot = Arc::new(BootContext::new());
         let reaped = {
             let locked = conn
                 .lock()
@@ -305,7 +305,7 @@ mod unix_app {
             boot.boot_id()
         );
 
-        let _server_thread = server::spawn(&conn, &indexd_socket_path, IO_TIMEOUT)
+        let _server_thread = server::spawn(&conn, &boot, &indexd_socket_path, IO_TIMEOUT)
             .map_err(|e| format!("binding {}: {e}", indexd_socket_path.display()))?;
 
         let socket_display = scannerd_socket_path.display().to_string();

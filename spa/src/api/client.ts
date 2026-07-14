@@ -39,6 +39,7 @@ import type {
   TripDetail,
   TripsPageParams,
 } from "./types";
+import type { TelemetrySample } from "../player/telemetry";
 
 /** An error from a webd API call (non-2xx, network, or malformed body). */
 export class ApiError extends Error {
@@ -210,6 +211,9 @@ export const api = {
   trip: (id: number, signal?: AbortSignal) =>
     getJson<TripDetail>(`/api/trips/${id}`, signal),
 
+  tripClips: (id: number, signal?: AbortSignal) =>
+    getJson<Clip[]>(`/api/trips/${id}/clips`, signal),
+
   events: (params: EventsParams = {}, signal?: AbortSignal) =>
     getJson<Page<EventItem>>(`/api/events${qs({ ...params })}`, signal),
 
@@ -271,6 +275,14 @@ export const api = {
   // streaming. They are NOT fetched through getJson (the bytes aren't JSON).
   streamUrl: (id: number, camera?: string) =>
     `/api/clips/${id}/stream${qs({ camera })}`,
+
+  telemetryUrl: (id: number, camera?: string) =>
+    `/api/clips/${id}/telemetry${qs({ camera })}`,
+
+  clipTelemetry: (clipId: number, camera = "front") =>
+    getJson<TelemetrySample[]>(
+      `/api/clips/${clipId}/telemetry?camera=${encodeURIComponent(camera)}`,
+    ),
 
   exportUrl: (id: number) => `/api/clips/${id}/export`,
 

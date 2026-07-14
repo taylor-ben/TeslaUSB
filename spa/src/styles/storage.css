@@ -142,9 +142,87 @@
   font-size: var(--text-sm);
 }
 
+/* Recording-safety banner — the one loss-critical status, colour-coded by the
+ * SD card's free fraction (ok / warn / crit / unknown). */
+.storage-page .storage-banner {
+  display: flex; align-items: flex-start; gap: var(--space-3);
+  padding: var(--space-4) var(--space-6);
+  border: 1px solid var(--border-color);
+  border-left-width: 4px;
+  border-radius: var(--radius-lg);
+  background: var(--bg-secondary);
+  box-shadow: var(--shadow-lg);
+}
+.storage-page .storage-banner-icon { display: inline-flex; flex-shrink: 0; margin-top: 2px; }
+.storage-page .storage-banner-text { display: grid; gap: var(--space-1, 4px); }
+.storage-page .storage-banner-title { font-size: var(--text-xl); font-weight: 700; color: var(--text-primary); }
+.storage-page .storage-banner-detail { font-size: var(--text-sm); color: var(--text-secondary); }
+.storage-page .storage-banner-ok      { border-left-color: #2ea043; background: rgba(46, 160, 67, 0.10); }
+.storage-page .storage-banner-warn    { border-left-color: #d29922; background: rgba(210, 153, 34, 0.12); }
+.storage-page .storage-banner-crit    { border-left-color: #f85149; background: rgba(248, 81, 73, 0.12); }
+.storage-page .storage-banner-unknown { border-left-color: var(--border-input); }
+.storage-page .storage-banner-ok   .storage-banner-icon { color: #2ea043; }
+.storage-page .storage-banner-warn .storage-banner-icon { color: #d29922; }
+.storage-page .storage-banner-crit .storage-banner-icon { color: #f85149; }
+
+/* Big free-of-total figure used by the SD-card and per-drive capacity cards. */
+.storage-page .cap-figure { display: flex; align-items: baseline; gap: var(--space-2); flex-wrap: wrap; }
+.storage-page .cap-figure-value { font-size: var(--text-3xl); font-weight: 700; color: var(--text-primary); line-height: 1.1; }
+.storage-page .cap-figure-label { font-size: var(--text-sm); color: var(--text-secondary); }
+
+/* SD-card composition bar: dashcam buffer | media library | system & archived | free. */
+.storage-page .comp-bar {
+  display: flex; width: 100%; height: 28px;
+  border-radius: var(--radius-md); overflow: hidden;
+  border: 1px solid var(--border-input); background: var(--form-input-bg);
+}
+.storage-page .comp-seg { height: 100%; min-width: 0; }
+.storage-page .comp-dashcam { background: #6e7681; }
+.storage-page .comp-media   { background: #a371f7; }
+.storage-page .comp-system  { background: #2f81f7; }
+.storage-page .comp-free    { background: transparent; }
+.storage-page .comp-legend {
+  display: flex; gap: var(--space-2) var(--space-4); flex-wrap: wrap;
+  font-size: var(--text-sm); color: var(--text-secondary);
+}
+.storage-page .comp-legend-item { display: inline-flex; align-items: center; gap: var(--space-2); }
+.storage-page .comp-swatch { width: 12px; height: 12px; border-radius: 3px; display: inline-block; flex-shrink: 0; }
+.storage-page i.comp-swatch.comp-free { border: 1px solid var(--border-input); }
+
+/* Two USB-drive capacity cards, side by side on desktop, stacked on mobile. */
+.storage-page .cap-card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
+  gap: var(--space-6);
+}
+
+/* Collapsible device-health & diagnostics section (folds the legacy cards). */
+.storage-page .storage-details {
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-lg);
+  background: var(--bg-secondary);
+  box-shadow: var(--shadow-lg);
+  overflow: hidden;
+}
+.storage-page .storage-details-summary {
+  display: flex; align-items: center; gap: var(--space-2);
+  padding: var(--space-4) var(--space-6);
+  cursor: pointer; user-select: none;
+  color: var(--text-primary); font-size: var(--text-xl); font-weight: 600;
+  list-style: none;
+}
+.storage-page .storage-details-summary::-webkit-details-marker { display: none; }
+.storage-page .storage-details[open] .storage-details-summary { border-bottom: 1px solid var(--border-color); }
+.storage-page .storage-details-body { display: grid; gap: var(--space-6); padding: var(--space-6); }
+
 @media (max-width: 48rem) {
   .storage-page .storage-header,
   .storage-page .storage-card { padding: var(--space-4); }
   .storage-page .storage-dl { grid-template-columns: 1fr; gap: var(--space-1, 4px) 0; }
   .storage-page .storage-dl dt { margin-top: var(--space-2); }
+  .storage-page .storage-banner,
+  .storage-page .storage-details-summary,
+  .storage-page .storage-details-body { padding: var(--space-4); }
+  .storage-page .cap-card-grid { gap: var(--space-4); }
+  .storage-page .cap-figure-value { font-size: var(--text-2xl, var(--text-xl)); }
 }

@@ -25,6 +25,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::stats_client::{VolumeStatsClient, VolumeStatsOutcome};
+
 /// Free-fraction at or above which a filesystem is healthy.
 const DISK_OK_FRAC: f64 = 0.15;
 /// Free-fraction at or above which a filesystem is merely warned (below =
@@ -150,6 +152,8 @@ pub struct SysPaths {
     pub worker_health_file: PathBuf,
     /// `indexd` heartbeat path.
     pub indexer_health_file: PathBuf,
+    /// Read-only mount of the MEDIA exFAT volume.
+    pub media_ro_mount: PathBuf,
 }
 
 /// One `{severity, message}` row of `GET /api/system/health`.
@@ -271,6 +275,26 @@ pub struct FilesystemDto {
     pub total_inodes: u64,
 }
 
+/// One of the two USB drives the car sees (TESLACAM / MEDIA), reported with
+/// honest optionality: fields are `null` when their source is unavailable.
+#[derive(Debug, Serialize)]
+pub struct UsbVolumeDto {
+    /// "dashcam" | "media".
+    pub role: &'static str,
+    /// "TESLACAM" | "MEDIA".
+    pub label: &'static str,
+    /// Always "exfat".
+    pub fstype: &'static str,
+    /// Usable capacity.
+    pub total_bytes: Option<u64>,
+    pub free_bytes: Option<u64>,
+    pub used_bytes: Option<u64>,
+    /// "bitmap" (dashcam) | "statvfs" (media).
+    pub source: &'static str,
+    /// Freshness of the figure.
+    pub stable: bool,
+}
+
 /// `GET /api/storage`: the filesystems `webd` can `statvfs` directly. The
 /// governor tier is owned by `retentiond`; while that service is not wired in,
 /// `governor` is `null` (not fabricated).
@@ -278,6 +302,8 @@ pub struct FilesystemDto {
 pub struct Storage {
     /// The probed filesystems (root + the data/archive root).
     pub filesystems: Vec<FilesystemDto>,
+    /// TESLACAM + MEDIA logical volumes.
+    pub volumes: Vec<UsbVolumeDto>,
     /// Reserved for the `retentiond` governor tier; currently always `null`.
     pub governor: Option<serde_json::Value>,
 }
@@ -664,7 +690,11 @@ fn filesystem_dto(probe: &dyn SystemProbe, path: &Path) -> Option<FilesystemDto>
 /// Compose `GET /api/storage` from the probe (root + the data root, deduped by
 /// mount point).
 #[must_use]
-pub fn storage(probe: &dyn SystemProbe, paths: &SysPaths) -> Storage {
+pub fn storage(
+    probe: &dyn SystemProbe,
+    paths: &SysPaths,
+    stats: &dyn VolumeStatsClient,
+) -> Storage {
     let candidates = [Path::new("/"), paths.archive_root.as_path()];
     let mut filesystems: Vec<FilesystemDto> = Vec::new();
     for path in candidates {
@@ -674,8 +704,53 @@ pub fn storage(probe: &dyn SystemProbe, paths: &SysPaths) -> Storage {
             }
         }
     }
+    let dashcam = match stats.volume_stats() {
+        Ok(VolumeStatsOutcome::Stats(v)) => UsbVolumeDto {
+            role: "dashcam",
+            label: "TESLACAM",
+            fstype: "exfat",
+            total_bytes: Some(v.total_bytes),
+            free_bytes: Some(v.free_bytes),
+            used_bytes: Some(v.used_bytes),
+            source: "bitmap",
+            stable: v.stable,
+        },
+        Ok(VolumeStatsOutcome::Unavailable) | Err(_) => UsbVolumeDto {
+            role: "dashcam",
+            label: "TESLACAM",
+            fstype: "exfat",
+            total_bytes: None,
+            free_bytes: None,
+            used_bytes: None,
+            source: "bitmap",
+            stable: false,
+        },
+    };
+    let media = probe.statvfs(paths.media_ro_mount.as_path()).map_or(
+        UsbVolumeDto {
+            role: "media",
+            label: "MEDIA",
+            fstype: "exfat",
+            total_bytes: None,
+            free_bytes: None,
+            used_bytes: None,
+            source: "statvfs",
+            stable: false,
+        },
+        |fs| UsbVolumeDto {
+            role: "media",
+            label: "MEDIA",
+            fstype: "exfat",
+            total_bytes: Some(fs.total_bytes),
+            free_bytes: Some(fs.free_bytes),
+            used_bytes: Some(fs.used_bytes()),
+            source: "statvfs",
+            stable: true,
+        },
+    );
     Storage {
         filesystems,
+        volumes: vec![dashcam, media],
         governor: None,
     }
 }
@@ -792,6 +867,9 @@ mod tests {
         clippy::indexing_slicing
     )]
     use super::*;
+    use crate::stats_client::{
+        VolumeStats, VolumeStatsClient, VolumeStatsError, VolumeStatsOutcome,
+    };
     use std::collections::HashMap;
 
     #[derive(Default)]
@@ -841,6 +919,22 @@ mod tests {
             archive_root: PathBuf::from("/data/teslausb/archive"),
             worker_health_file: PathBuf::from("/run/teslausb/retentiond.health.json"),
             indexer_health_file: PathBuf::from("/run/teslausb/indexd.health.json"),
+            media_ro_mount: PathBuf::from("/run/teslausb/media-ro"),
+        }
+    }
+
+    struct FakeStatsClient {
+        outcome: Option<VolumeStatsOutcome>,
+    }
+
+    impl VolumeStatsClient for FakeStatsClient {
+        fn volume_stats(&self) -> Result<VolumeStatsOutcome, VolumeStatsError> {
+            self.outcome.ok_or_else(|| {
+                VolumeStatsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "stats unavailable",
+                ))
+            })
         }
     }
 
@@ -1177,9 +1271,66 @@ tmpfs /run tmpfs rw 0 0
             }),
             ..FakeProbe::default()
         };
-        let s = storage(&probe, &paths());
+        let stats = FakeStatsClient {
+            outcome: Some(VolumeStatsOutcome::Unavailable),
+        };
+        let s = storage(&probe, &paths(), &stats);
         assert_eq!(s.filesystems.len(), 1);
+        assert_eq!(s.volumes.len(), 2);
         assert!(s.governor.is_none());
+    }
+
+    #[test]
+    fn storage_reports_dashcam_bitmap_and_media_statvfs() {
+        let probe = FakeProbe {
+            stat: Some(FsStat {
+                free_bytes: 400,
+                total_bytes: 1_000,
+                free_inodes: 1,
+                total_inodes: 2,
+            }),
+            mount: Some(MountInfo {
+                device: "/dev/root".to_owned(),
+                fstype: "ext4".to_owned(),
+                mount: "/".to_owned(),
+            }),
+            ..FakeProbe::default()
+        };
+        let stats = FakeStatsClient {
+            outcome: Some(VolumeStatsOutcome::Stats(VolumeStats {
+                cluster_count: 10,
+                bytes_per_cluster: 512,
+                total_bytes: 5_120,
+                used_bytes: 2_048,
+                free_bytes: 3_072,
+                used_clusters: 4,
+                free_clusters: 6,
+                stable: true,
+            })),
+        };
+        let s = storage(&probe, &paths(), &stats);
+        assert_eq!(s.volumes.len(), 2);
+        assert_eq!(s.volumes[0].label, "TESLACAM");
+        assert_eq!(s.volumes[0].source, "bitmap");
+        assert_eq!(s.volumes[0].free_bytes, Some(3_072));
+        assert!(s.volumes[0].stable);
+        assert_eq!(s.volumes[1].label, "MEDIA");
+        assert_eq!(s.volumes[1].source, "statvfs");
+        assert_eq!(s.volumes[1].used_bytes, Some(600));
+        assert!(s.volumes[1].stable);
+    }
+
+    #[test]
+    fn storage_leaves_volume_bytes_unknown_when_sources_unavailable() {
+        let probe = FakeProbe::default();
+        let stats = FakeStatsClient {
+            outcome: Some(VolumeStatsOutcome::Unavailable),
+        };
+        let s = storage(&probe, &paths(), &stats);
+        assert_eq!(s.volumes.len(), 2);
+        assert!(s.volumes.iter().all(|v| v.total_bytes.is_none()));
+        assert!(!s.volumes[0].stable);
+        assert!(!s.volumes[1].stable);
     }
 
     #[test]

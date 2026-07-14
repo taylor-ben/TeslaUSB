@@ -35,11 +35,6 @@ const HUD_FIXTURE_A = [
   { time: 2.5, speedMps: 8.9, gear: 1, steeringAngle: 10, blinkerLeft: false, blinkerRight: false, brakeApplied: true, acceleratorPedalPosition: 0, autopilotState: 0 },
 ];
 
-const HUD_FIXTURE_B = [
-  { time: 0, speedMps: 0, gear: 0, steeringAngle: 0, blinkerLeft: false, blinkerRight: false, brakeApplied: true, acceleratorPedalPosition: 0, autopilotState: 0 },
-  { time: 1, speedMps: 31.3, gear: 2, steeringAngle: -12, blinkerLeft: true, blinkerRight: false, brakeApplied: false, acceleratorPedalPosition: 0.2, autopilotState: 2 },
-];
-
 interface HudFixtureSample {
   time: number;
   speedMps: number;
@@ -245,6 +240,38 @@ async function gotoMap(page: Page) {
       .__TESLAUSB_MAP_HOOKS__;
     return !!h && h.tripCount > 0;
   });
+}
+
+/**
+ * Project a fixed lat/lon to a container pixel, polling until `fitBounds`
+ * settles (two consecutive projections agree) so a REAL mouse click lands on
+ * the intended route pixel instead of a mid-animation location.
+ */
+async function settledRoutePixel(
+  page: Page,
+  lat: number,
+  lon: number,
+): Promise<{ x: number; y: number }> {
+  let prev: { x: number; y: number } | null = null;
+  for (let i = 0; i < 30; i += 1) {
+    const p = await page.evaluate(
+      ({ la, lo }) => {
+        const pt = (
+          window as unknown as {
+            __TESLAUSB_MAP__: {
+              latLngToContainerPoint: (ll: [number, number]) => { x: number; y: number };
+            };
+          }
+        ).__TESLAUSB_MAP__.latLngToContainerPoint([la, lo]);
+        return { x: Math.round(pt.x), y: Math.round(pt.y) };
+      },
+      { la: lat, lo: lon },
+    );
+    if (prev && prev.x === p.x && prev.y === p.y) return p;
+    prev = p;
+    await page.waitForTimeout(50);
+  }
+  return prev as { x: number; y: number };
 }
 
 async function openEventMarkerPopup(page: Page, expectedText?: RegExp) {
@@ -1797,6 +1824,116 @@ test.describe("trip map UAT", () => {
     await expect(page).toHaveURL(/\/$/);
   });
 
+  test("map route click opens the overlay seeked to that spot", async ({
+    page,
+    probe,
+  }) => {
+    await gotoMap(page);
+    const picked = await page.evaluate(
+      () =>
+        (
+          window as unknown as {
+            __TESLAUSB_MAP_HOOKS__?: { triggerRoutePick: (lat: number, lon: number) => boolean };
+          }
+        ).__TESLAUSB_MAP_HOOKS__!.triggerRoutePick(37.79, -122.42),
+    );
+    expect(picked).toBe(true);
+
+    const video = page.locator("[data-testid=vp-overlay-video]");
+    await expect(video).toBeVisible();
+    await expect(video).toHaveAttribute("src", /\/api\/clips\/1\/stream/);
+    await expect
+      .poll(() => video.getAttribute("data-seek-offset"))
+      .toBe("180");
+
+    const origin = new URL(loadState().baseURL).origin;
+    const non2xx = probe.responses.filter(
+      (resp) =>
+        new URL(resp.url).origin === origin &&
+        (resp.status < 200 || resp.status >= 300),
+    );
+    expect(non2xx, `unexpected non-2xx: ${JSON.stringify(non2xx)}`).toEqual([]);
+    assertCleanConsole(probe);
+  });
+
+  test("map route REAL DOM click reaches the handler on one shared canvas", async ({
+    page,
+    probe,
+  }) => {
+    await gotoMap(page);
+
+    // Regression guard for the "hand cursor, no route click" bug: `preferCanvas`
+    // + a renderer-less Path makes Leaflet lazily create a SECOND overlay canvas
+    // that stacks over the route canvas and swallows route-area mouse events. All
+    // vector paths now share one renderer → exactly one overlay canvas, so real
+    // clicks reach the route. The triggerRoutePick hook bypasses the DOM/canvas
+    // mouse pipeline entirely, so only a real click can catch this regression.
+    const canvasCount = await page.evaluate(
+      () => document.querySelectorAll(".leaflet-overlay-pane canvas").length,
+    );
+    expect(canvasCount, "exactly one shared overlay canvas").toBe(1);
+
+    // A REAL DOM mouse click (not the hook) on the trip1∩trip2 overlap must open
+    // the disambiguation popup — proof the click traversed Leaflet's canvas
+    // hit-testing and fired the route clickTarget handler.
+    const pt = await settledRoutePixel(page, SHARED_SEG_LAT, SHARED_SEG_LON);
+    await page.locator("#map").click({ position: { x: pt.x, y: pt.y } });
+
+    const rows = page.locator(".disambig-popup .disambig-row");
+    await expect(rows.first()).toBeVisible();
+    expect(await rows.count()).toBeGreaterThanOrEqual(2);
+    await rows.first().click();
+
+    // …and the pick plays through to the on-map overlay video.
+    const video = page.locator("[data-testid=vp-overlay-video]");
+    await expect(video).toBeVisible();
+    await expect(video).toHaveAttribute("src", /\/api\/clips\/\d+\/stream/);
+
+    const origin = new URL(loadState().baseURL).origin;
+    const non2xx = probe.responses.filter(
+      (resp) =>
+        new URL(resp.url).origin === origin &&
+        (resp.status < 200 || resp.status >= 300),
+    );
+    expect(non2xx, `unexpected non-2xx: ${JSON.stringify(non2xx)}`).toEqual([]);
+    assertCleanConsole(probe);
+  });
+
+  test("map route disambiguation pick plays the clip", async ({ page }) => {
+    await gotoMap(page);
+    const candidates = await page.evaluate(
+      ({ lat, lon }) =>
+        (
+          window as unknown as {
+            __TESLAUSB_MAP_HOOKS__?: { triggerDisambig: (a: number, b: number) => number };
+          }
+        ).__TESLAUSB_MAP_HOOKS__!.triggerDisambig(lat, lon),
+      { lat: SHARED_SEG_LAT, lon: SHARED_SEG_LON },
+    );
+    expect(candidates).toBeGreaterThanOrEqual(2);
+
+    const rows = page.locator(".disambig-popup .disambig-row");
+    await expect(rows.first()).toBeVisible();
+    expect(await rows.count()).toBeGreaterThanOrEqual(2);
+    await rows.first().click();
+
+    const video = page.locator("[data-testid=vp-overlay-video]");
+    await expect(video).toBeVisible();
+    await expect(video).toHaveAttribute("src", /\/api\/clips\/\d+\/stream/);
+
+    // Picking a row must keep the chosen trip highlighted (the popup close must
+    // not wipe it): the disambiguation highlight layer still holds its polyline.
+    const highlightCount = await page.evaluate(
+      () =>
+        (
+          window as unknown as {
+            __TESLAUSB_MAP_HOOKS__?: { disambigHighlightCount: () => number };
+          }
+        ).__TESLAUSB_MAP_HOOKS__!.disambigHighlightCount(),
+    );
+    expect(highlightCount).toBeGreaterThanOrEqual(1);
+  });
+
   test("map→video — clip rows open the inline overlay player", async ({
     page,
   }) => {
@@ -2198,7 +2335,13 @@ test.describe("trip map UAT", () => {
     await expect(page.locator("[data-testid=video-overlay]")).toHaveCount(0);
 
     const non2xx = probe.responses.filter((resp) => {
-      if (new URL(resp.url).pathname === "/api/clips/701/stream" && resp.status === 404) {
+      const path = new URL(resp.url).pathname;
+      if (path === "/api/clips/701/stream" && resp.status === 404) {
+        return false;
+      }
+      // Clips without SEI telemetry return 404; HudController.loadTelemetry
+      // handles it by showing an empty HUD. Expected, mirrors the console gate.
+      if (/^\/api\/clips\/\d+\/telemetry$/.test(path) && resp.status === 404) {
         return false;
       }
       return resp.status < 200 || resp.status >= 300;
@@ -2287,15 +2430,18 @@ test.describe("trip map UAT", () => {
     );
     await seekAndAssertOverlayHud(page, 1.6, HUD_FIXTURE_A);
 
-    await page.evaluate((fixture) => {
-      (window as unknown as { __TESLAUSB_HUD_FIXTURE__?: unknown }).__TESLAUSB_HUD_FIXTURE__ = fixture;
-    }, HUD_FIXTURE_B);
+    // Switching camera must NOT reload the HUD. SEI telemetry is a clip-level
+    // property parsed from the front angle and is camera-independent (it is the
+    // car's own state — speed/gear/steering/pedals — not the picture). The
+    // <video> src switches to the back angle, but the overlay keeps the same
+    // clip-level telemetry (still FIXTURE_A) so the HUD stays populated on any
+    // camera.
     await page.locator("[data-testid=vp-overlay-cam-back]").click();
     await expect(page.locator("[data-testid=vp-overlay-video]")).toHaveAttribute(
       "src",
       /\/api\/clips\/811\/stream\?camera=back/,
     );
-    await seekAndAssertOverlayHud(page, 1.6, HUD_FIXTURE_B);
+    await seekAndAssertOverlayHud(page, 1.6, HUD_FIXTURE_A);
 
     assertCleanConsole(probe);
   });

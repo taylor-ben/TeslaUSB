@@ -199,6 +199,43 @@ impl Default for LeaseConfig {
     }
 }
 
+/// Target-based bounded drain: cap the archive filesystem at a used ceiling by
+/// evicting oldest `RecentClips` until a free-space target is reached, with
+/// per-cycle safety caps. CALIBRATION-GATED (Task 2.7 / storage.md §7).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TargetDrainConfig {
+    /// Free-space fraction the drain aims to restore (enter/act below this).
+    pub target_free_frac: f64,
+    /// Free-space fraction at which the drain stops (>= `target_free_frac`; hysteresis).
+    pub target_exit_frac: f64,
+    /// Never evict anything archived within this many seconds (recency floor).
+    pub recency_floor_secs: i64,
+    /// Per-cycle byte cap (bounds a single drain pass; crash-safety on power-cut).
+    pub per_cycle_evict_bytes: u64,
+    /// Per-cycle count cap.
+    pub per_cycle_evict_count: u32,
+    /// Per-cycle wall-clock cap in milliseconds.
+    pub per_cycle_wall_ms: u64,
+    /// Refuse the whole drain cycle if bytes-to-free exceeds this fraction of
+    /// total (guards a bad statfs reading from mass deletion).
+    pub anomaly_free_frac: f64,
+}
+
+impl Default for TargetDrainConfig {
+    fn default() -> Self {
+        // CALIBRATION-GATED provisional values (470GB card, keep ~15% free).
+        Self {
+            target_free_frac: 0.15,
+            target_exit_frac: 0.17,
+            recency_floor_secs: 604_800, // 7 days
+            per_cycle_evict_bytes: 8 << 30,
+            per_cycle_evict_count: 256,
+            per_cycle_wall_ms: 5_000,
+            anomaly_free_frac: 0.25,
+        }
+    }
+}
+
 /// Top-level retention configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct RetentionConfig {
@@ -206,12 +243,18 @@ pub struct RetentionConfig {
     pub governor: GovernorConfig,
     /// `RecentClips` mirror policy.
     pub recent: RecentMirrorConfig,
+    /// Target-based bounded drain configuration.
+    pub target_drain: TargetDrainConfig,
     /// Lease TTL/heartbeat.
     pub lease: LeaseConfig,
     /// Whether the operator opted in to Emergency eviction of **undurable**
     /// `SentryClips` (Class-B, permanent loss). **Off by default**; undurable
     /// `SavedClips` is never included regardless.
     pub allow_emergency_undurable_sentry: bool,
+    /// Operator opt-in for permanent LOCAL-ONLY eviction of **undurable**
+    /// `RecentClips` (the Pi archive is the only copy when `uploadd` is off).
+    /// **Off by default** — no permanent `RecentClips` loss without explicit consent.
+    pub local_only_recent_delete_approved: bool,
 }
 
 #[cfg(test)]
@@ -248,5 +291,23 @@ mod tests {
     #[test]
     fn emergency_undurable_sentry_is_off_by_default() {
         assert!(!RetentionConfig::default().allow_emergency_undurable_sentry);
+    }
+
+    #[test]
+    fn target_drain_defaults_are_sane() {
+        let cfg = RetentionConfig::default().target_drain;
+        assert!(
+            cfg.target_exit_frac >= cfg.target_free_frac,
+            "hysteresis requires exit >= enter"
+        );
+        assert!(cfg.recency_floor_secs > 0);
+        assert!(cfg.per_cycle_evict_bytes > 0);
+        assert!(cfg.per_cycle_evict_count > 0);
+        assert!(cfg.anomaly_free_frac > cfg.target_free_frac);
+    }
+
+    #[test]
+    fn local_only_recent_delete_approved_is_off_by_default() {
+        assert!(!RetentionConfig::default().local_only_recent_delete_approved);
     }
 }

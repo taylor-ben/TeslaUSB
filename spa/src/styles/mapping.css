@@ -960,36 +960,87 @@ body.mapping-active .main-content {
 }
 .overlay-hud {
     position: absolute;
-    left: 0;
-    right: 0;
-    bottom: 8px;
+    top: 12px;
+    left: 50%;
+    transform: translateX(-50%);
     display: grid;
-    grid-template-columns: auto auto auto 1fr auto auto auto auto;
+    grid-template-columns: auto 1fr 32px 3ch 32px 1fr auto;
+    grid-template-rows: auto auto;
+    grid-template-areas:
+        "gear . left speed right . wheel"
+        "brake . autopilot autopilot autopilot . throttle";
+    column-gap: 8px;
+    row-gap: 8px;
     align-items: center;
-    gap: 8px;
-    padding: 0 10px;
+    width: max-content;
+    max-width: calc(100% - 16px);
+    padding: 6px 10px 8px;
+    border-radius: 18px;
+    backdrop-filter: blur(14px);
+    background: rgba(10, 10, 12, 0.38);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
     color: var(--mapping-white);
+    z-index: 20;
     pointer-events: none;
     text-shadow: 0 1px 2px rgba(0,0,0,0.6);
 }
+.overlay-hud .oh-empty-note {
+    display: none;
+}
+.overlay-hud.hud-empty > :not(.oh-empty-note) {
+    display: none;
+}
+.overlay-hud.hud-empty .oh-empty-note {
+    display: block;
+    grid-column: 1 / -1;
+    font-size: 0.75rem;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    opacity: 0.9;
+}
 .oh-gear {
-    font-weight: 700;
-    font-size: 0.8125rem;
+    grid-area: gear;
+    font-size: 12px;
+    font-weight: 800;
+    padding: 6px 12px;
+    border-radius: 999px;
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    color: rgba(255, 255, 255, 0.95);
+    justify-self: center;
 }
 .oh-pedal {
-    width: 22px;
-    height: 34px;
-    border-radius: 6px;
-    border: 1px solid rgba(255,255,255,0.75);
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    border: 2px solid rgba(255, 255, 255, 0.25);
     position: relative;
     overflow: hidden;
+    justify-self: center;
     display: flex;
-    align-items: flex-end;
+    align-items: center;
     justify-content: center;
+}
+.oh-pedal.oh-brake {
+    grid-area: brake;
+    --pedal-color: rgba(255, 90, 90, 0.75);
+}
+.oh-pedal.oh-throttle {
+    grid-area: throttle;
+    --pedal-color: rgba(120, 255, 120, 0.7);
+}
+.oh-pedal::before {
+    content: "";
+    position: absolute;
+    inset: 4px;
+    border-radius: 50%;
+    background: rgba(0, 0, 0, 0.4);
 }
 .oh-fill {
     position: absolute;
-    inset: 0;
+    inset: 4px;
+    overflow: hidden;
+    border-radius: 50%;
 }
 .oh-fill i {
     position: absolute;
@@ -997,24 +1048,32 @@ body.mapping-active .main-content {
     right: 0;
     bottom: 0;
     height: var(--pedal-fill, 0%);
-    background: rgba(255,255,255,0.35);
+    background: var(--pedal-color);
 }
-.oh-lbl {
+.oh-pedal svg {
     position: relative;
-    z-index: 1;
-    font-size: 0.625rem;
-    font-weight: 700;
-    margin-bottom: 3px;
+    z-index: 2;
+    stroke: rgba(136, 136, 136, 0.9);
+    fill: none;
+    width: 24px;
+    height: 24px;
 }
 .oh-blinker {
-    width: 24px;
-    height: 18px;
+    width: 32px;
+    height: 24px;
     display: grid;
     place-items: center;
-    border-radius: 8px;
-    border: 1px solid rgba(255,255,255,0.2);
-    font-size: 0.75rem;
-    opacity: 0.35;
+    border-radius: 10px;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    font-size: 14px;
+    opacity: 0.4;
+    transform: translateY(16px);
+}
+.oh-blinker.left {
+    grid-area: left;
+}
+.oh-blinker.right {
+    grid-area: right;
 }
 .oh-blinker.active {
     opacity: 1;
@@ -1031,39 +1090,53 @@ body.mapping-active .main-content {
     }
 }
 .oh-speed {
-    display: inline-flex;
-    align-items: baseline;
-    gap: 4px;
-    justify-self: center;
+    grid-area: speed;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    line-height: 1;
     font-weight: 700;
+    transform: translateY(16px);
 }
 .oh-speed-val {
-    font-size: 1rem;
+    font-size: 28px;
+    font-weight: 800;
+    font-variant-numeric: tabular-nums;
+    color: rgba(255, 255, 255, 0.95);
 }
 .oh-speed-unit {
-    font-size: 0.625rem;
-    text-transform: uppercase;
-    opacity: 0.9;
+    font-size: 12px;
+    opacity: 0.8;
+    margin-top: 4px;
+    color: rgba(255, 255, 255, 0.95);
 }
 .oh-wheel {
-    width: 26px;
-    height: 26px;
+    grid-area: wheel;
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    display: grid;
+    place-items: center;
+    border: 1px solid rgba(255, 255, 255, 0.18);
 }
 .oh-wheel svg {
-    width: 100%;
-    height: 100%;
+    width: 26px;
+    height: 26px;
     transform: rotate(var(--wheel-rotation, 0deg));
     transition: transform 0.05s linear;
 }
 .oh-ap {
+    grid-area: autopilot;
     text-align: center;
     font-size: 11px;
     font-weight: 600;
     letter-spacing: 0.3px;
-    color: rgba(52,199,89,1);
+    color: rgba(52, 199, 89, 1);
     opacity: 0;
     max-height: 0;
     line-height: 1;
+    align-self: center;
+    transform: translateY(8px);
     transition: opacity 0.25s ease, max-height 0.25s ease;
 }
 .oh-ap.active {
@@ -1136,8 +1209,10 @@ body.mapping-active .main-content {
         gap: 6px;
     }
     .overlay-hud {
+        top: 8px;
         gap: 6px;
-        padding: 0 8px;
+        padding: 6px 8px;
+        max-width: calc(100% - 12px);
     }
     .video-overlay-info {
         flex-wrap: wrap;

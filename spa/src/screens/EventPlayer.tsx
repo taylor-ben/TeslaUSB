@@ -216,6 +216,7 @@ export function EventPlayer() {
   const currentAngle = clip?.angles.find((a) => a.camera === camera);
   const streamCandidateUrl =
     clip && isStreamableAngle(currentAngle) ? api.streamUrl(clip.id, camera) : "";
+  const telemetryUrl = clip ? api.telemetryUrl(clip.id, camera) : "";
   const shouldProbeStream = !!currentAngle && !isDownloadableAngle(currentAngle);
   // Archive angles are always servable, so point <video> at them synchronously
   // (no probe, no extra render round-trip — preserves the original timing the
@@ -490,9 +491,8 @@ export function EventPlayer() {
     return () => ac.abort();
   }, [currentEvent?.id, directClipId]);
 
-  // ── (Re)load HUD telemetry when the streamed clip/camera changes, but only
-  //    while the overlay is on (matches the legacy "load SEI on toggle" path
-  //    and avoids fetching the whole MP4 when the HUD is hidden). ──
+  // ── (Re)load HUD telemetry when the clip/camera changes, but only while the
+  //    overlay is on (avoids telemetry fetches when the HUD is hidden). ──
   useEffect(() => {
     if (!clip) {
       setProbedStreamUrl("");
@@ -542,9 +542,9 @@ export function EventPlayer() {
 
   useEffect(() => {
     const ctrl = ctrlRef.current;
-    if (!ctrl || !streamUrl || !hudOn) return;
-    void ctrl.loadTelemetry(streamUrl);
-  }, [streamUrl, hudOn]);
+    if (!ctrl || !telemetryUrl || !hudOn) return;
+    void ctrl.loadTelemetry(telemetryUrl);
+  }, [telemetryUrl, hudOn]);
 
   // ── Seek to the event moment once the (re)loaded video has metadata. Without
   //    this the player always started at 0 and ignored front_frame_offset_ms,
