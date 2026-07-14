@@ -476,6 +476,91 @@ test.describe("event-player UAT", () => {
     assertCleanConsole(probe);
   });
 
+  // ── Gate 1b: the HUD telemetry is ALWAYS sourced from the FRONT angle, and it
+  //    stays populated when a non-front camera (whose own SEI may be empty) is
+  //    displayed. Drives the REAL fetch path (NO seeded fixture ⇒ the controller
+  //    actually fetches) and route-mocks the telemetry endpoint: front → samples,
+  //    every other camera → []. The pre-fix per-camera code would refetch
+  //    camera=<non-front>, receive [], and BLANK the HUD — so this fails on the
+  //    old behaviour and passes on always-front. ──
+  test("telemetry HUD always loads from the front angle across camera switches", async ({
+    page,
+    probe,
+  }) => {
+    const telemetryCameras: string[] = [];
+    await page.route(/\/api\/clips\/\d+\/telemetry/, async (route) => {
+      const cam = new URL(route.request().url()).searchParams.get("camera") ?? "";
+      telemetryCameras.push(cam);
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: cam === "front" ? JSON.stringify(HUD_FIXTURE) : "[]",
+      });
+    });
+
+    // HUD ON, but WITHOUT the __TESLAUSB_HUD_FIXTURE__ short-circuit ⇒ the
+    // controller genuinely fetches telemetry (the path under test).
+    await page.addInitScript(() => {
+      try {
+        localStorage.setItem("seiOverlayEnabled", "true");
+      } catch {
+        /* ignore */
+      }
+    });
+    await page.goto("/events", { waitUntil: "load" });
+    await expect(page.locator("[data-screen=event-player]")).toBeVisible();
+    await expect(page.locator("#mainVideo")).toHaveAttribute("src", /\/api\/clips\/\d+\/stream/);
+    await expect(page.locator(".camera-option[data-camera=front]")).toHaveClass(/active/);
+
+    await decodeVideo(page);
+    // Telemetry-driven off the front-sourced NETWORK samples: the front angle has
+    // zero self-offset, so the fixture oracle holds exactly at t=2.0 (50 mph).
+    await seekAndAssertHud(page, 2.0);
+    expect(telemetryCameras.length, "front telemetry must have been fetched").toBeGreaterThan(0);
+    expect(
+      telemetryCameras.every((c) => c === "front"),
+      `all telemetry must be camera=front (saw ${JSON.stringify(telemetryCameras)})`,
+    ).toBe(true);
+    // Console clean for the telemetry/HUD path this change touches (asserted before
+    // the camera switch, whose media-src swap can legitimately abort the old load).
+    assertCleanConsole(probe);
+
+    // Switch to a streamable NON-front camera (its telemetry mock returns []).
+    const nonFront = await page
+      .locator(".camera-option:not(.unavailable):not(.download-option)[data-camera]")
+      .evaluateAll((els) =>
+        els
+          .map((el) => (el as HTMLElement).dataset.camera ?? "")
+          .filter((c) => c.length > 0 && c !== "front"),
+      );
+    expect(nonFront.length, "seeded clip must expose a non-front streamable camera").toBeGreaterThan(0);
+    const other = nonFront[0];
+    await page.locator(`.camera-option[data-camera="${other}"]`).click();
+    await expect(page.locator(`.camera-option[data-camera="${other}"]`)).toHaveClass(/active/);
+    await expect(page.locator("#mainVideo")).toHaveAttribute("src", new RegExp(`camera=${other}`));
+    await decodeVideo(page); // the switched camera actually decodes
+
+    // Give any (incorrect) per-camera telemetry refetch a chance to land, then
+    // assert the invariant: telemetry was NEVER refetched for the non-front camera
+    // and the HUD did NOT blank (still SEI-sourced with all samples retained).
+    await page.waitForTimeout(400);
+    expect(
+      telemetryCameras.includes(other),
+      `telemetry must NOT be refetched per-camera (saw ${JSON.stringify(telemetryCameras)})`,
+    ).toBe(false);
+    expect(telemetryCameras.every((c) => c === "front")).toBe(true);
+    const hud = await page.evaluate(() => {
+      const h = (window as unknown as { __TESLAUSB_HUD__?: { source: string; sampleCount: number } })
+        .__TESLAUSB_HUD__;
+      return h ? { source: h.source, sampleCount: h.sampleCount } : null;
+    });
+    expect(hud, "controller handle must exist").not.toBeNull();
+    expect(hud!.source, "HUD must stay SEI-sourced after switching to a non-front camera").toBe("sei");
+    expect(hud!.sampleCount, "front telemetry must be retained across the switch").toBe(HUD_FIXTURE.length);
+    // No real JS exception from the offset-alignment effect during the switch.
+    expect(probe.pageErrors, `pageerror(s): ${JSON.stringify(probe.pageErrors)}`).toEqual([]);
+  });
+
   // ── Gate 2: wiring proof (the freshly-built bundle is what executed) ─────
   test("wiring proof — served HTML loads the hashed bundle that actually ran", async ({
     page,

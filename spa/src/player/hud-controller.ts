@@ -55,6 +55,10 @@ export class HudController {
   private readonly root?: HTMLElement;
   private samples: TelemetrySample[] = [];
   private source: TelemetrySource = "none";
+  /** Seconds added to video.currentTime before sampling telemetry, so a single
+   *  front-sourced telemetry track lines up with a non-front camera that starts
+   *  at a different clip offset. 0 for the front camera. */
+  private timeOffsetSec = 0;
   private state: HudState = { ...DEFAULT_HUD };
   private frames = 0;
   private rafId = 0;
@@ -124,6 +128,16 @@ export class HudController {
     }
   }
 
+  /**
+   * Shift the telemetry clock by `sec` (video-seconds) so front-sourced samples
+   * line up with a non-front camera whose file starts at a different clip offset.
+   * Pass 0 for the front camera. Applies immediately (no reload required).
+   */
+  setTimeOffset(sec: number): void {
+    this.timeOffsetSec = Number.isFinite(sec) ? sec : 0;
+    this.tick();
+  }
+
   private setSamples(samples: TelemetrySample[], source: TelemetrySource) {
     this.samples = samples;
     this.source = samples.length > 0 ? source : "none";
@@ -135,7 +149,7 @@ export class HudController {
 
   private tick() {
     if (this.destroyed) return;
-    const t = this.video.currentTime || 0;
+    const t = (this.video.currentTime || 0) + this.timeOffsetSec;
     const sample = this.samples.length > 0 ? sampleAt(this.samples, t) : null;
     this.state = sample ? sampleToHud(sample) : { ...DEFAULT_HUD };
     this.apply(this.state);

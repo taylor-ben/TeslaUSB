@@ -127,6 +127,20 @@ function eventSeekSeconds(
   return Math.max(0, (canonicalMs - target.offset_ms) / 1000);
 }
 
+/** Seconds to shift the front-sourced telemetry clock so it lines up with the
+ *  displayed `camera`'s own video time. Front SEI timestamps are relative to the
+ *  front file's start; each angle begins at its own `offset_ms` within the clip,
+ *  so a non-front camera's `currentTime` maps to front-telemetry time via
+ *  `(camera.offset_ms − front.offset_ms)`. Returns 0 for the front camera, or when
+ *  either angle is missing. */
+function frontTelemetryOffsetSeconds(clip: Clip | null, camera: string): number {
+  if (!clip) return 0;
+  const front = clip.angles.find((a) => a.camera === "front");
+  const target = clip.angles.find((a) => a.camera === camera);
+  if (!front || !target) return 0;
+  return (target.offset_ms - front.offset_ms) / 1000;
+}
+
 interface DeepLink {
   eventId: number | null;
   clipId: number | null;
@@ -216,7 +230,12 @@ export function EventPlayer() {
   const currentAngle = clip?.angles.find((a) => a.camera === camera);
   const streamCandidateUrl =
     clip && isStreamableAngle(currentAngle) ? api.streamUrl(clip.id, camera) : "";
-  const telemetryUrl = clip ? api.telemetryUrl(clip.id, camera) : "";
+  // Telemetry is ALWAYS sourced from the front angle: vehicle state (speed, gear,
+  // steering, …) is camera-independent and the Tesla SEI track only lives in the
+  // front clip, so the HUD stays populated even when a non-front camera (which may
+  // carry no SEI) is displayed. Non-front time alignment is handled by the
+  // controller's setTimeOffset effect below. Mirrors MapVideoOverlay's always-front.
+  const telemetryUrl = clip ? api.telemetryUrl(clip.id, "front") : "";
   const shouldProbeStream = !!currentAngle && !isDownloadableAngle(currentAngle);
   // Archive angles are always servable, so point <video> at them synchronously
   // (no probe, no extra render round-trip — preserves the original timing the
@@ -545,6 +564,13 @@ export function EventPlayer() {
     if (!ctrl || !telemetryUrl || !hudOn) return;
     void ctrl.loadTelemetry(telemetryUrl);
   }, [telemetryUrl, hudOn]);
+
+  // ── Keep the front-sourced telemetry clock aligned to the displayed camera:
+  //    a non-front angle can start at a different clip offset than front, so the
+  //    HUD must sample front telemetry at currentTime + (camera−front) offset. ──
+  useEffect(() => {
+    ctrlRef.current?.setTimeOffset(frontTelemetryOffsetSeconds(clip, camera));
+  }, [camera, clip?.id]);
 
   // ── Seek to the event moment once the (re)loaded video has metadata. Without
   //    this the player always started at 0 and ignored front_frame_offset_ms,

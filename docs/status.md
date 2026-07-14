@@ -102,11 +102,16 @@
 >    **clip-level / always-front** (`api.telemetryUrl(clip.id, "front")`) — car state is
 >    camera-independent and SEI lives in the front angle, so the HUD must stay populated
 >    + unchanged on a camera switch. Updated the test to assert that; removed the
->    now-unused `HUD_FIXTURE_B`. **Follow-up (device-verifiable):** `EventPlayer.tsx`
->    still loads telemetry **per-camera** (`api.telemetryUrl(clip.id, camera)`) —
->    inconsistent with the map overlay's always-front. If non-front angles lack SEI its
->    HUD would blank on camera switch; align it to always-front after confirming on-device
->    whether non-front carries SEI.
+>    now-unused `HUD_FIXTURE_B`. **Follow-up — DONE 2026-07-14 (`ep-hud-frontonly`, uncommitted):** `EventPlayer.tsx`
+>    now loads telemetry **always-front** (`api.telemetryUrl(clip.id, "front")`), matching
+>    the map overlay, so the HUD no longer blanks when a non-front angle (which may lack
+>    SEI) is displayed. Added a per-camera time offset in `HudController.setTimeOffset`
+>    (`currentTime + (camera.offset_ms − front.offset_ms)`) so front telemetry stays aligned
+>    to the shown camera's clock. Regression guard: new UAT `event-player.spec.ts` "telemetry
+>    HUD always loads from the front angle across camera switches" — route-mocks front→samples
+>    / non-front→[], asserts every telemetry request is `camera=front` and the HUD stays
+>    SEI-sourced after a camera switch (verified failing on the old per-camera code). Full
+>    `event-player` + `trip-map` UAT green both viewports; `tsc` clean.
 > 2. **Offer GPT-5.5 pre-deploy review** (doubt-driven) of the endpoint (80 MB read /
 >    recording-path angle), then reconcile.
 > 3. **Deploy under the hardware-test skill** — cross-build the `webd` aarch64 binary
