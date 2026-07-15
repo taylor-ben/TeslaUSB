@@ -66,8 +66,6 @@ const TIMEZONES = [
 // "—" state rather than a fabricated value.
 const SUBSYSTEMS = [
   { key: "gadget", label: "USB Gadget" },
-  { key: "teslafat_0", label: "TeslaCam (exFAT)" },
-  { key: "teslafat_1", label: "Media (exFAT)" },
   { key: "worker", label: "Background Worker" },
   { key: "indexer", label: "Video Indexer" },
   { key: "disk", label: "SD Card" },
@@ -594,8 +592,7 @@ export function MediaHub() {
         </details>
 
         {/* Storage Health — from /api/storage/health. Capacity-derived severity
-            + summary; wear-telemetry fields (fs/io errors, TRIM) stay "—" because
-            SD cards expose none. */}
+            + summary with best-effort wear telemetry probes. */}
         <details class="settings-section" id="storage-health-section">
           <summary>Storage Health</summary>
           <div class="section-content" id="storage-health-card">
@@ -619,12 +616,6 @@ export function MediaHub() {
               <dd>{storage?.mount ?? "—"}</dd>
               <dt>Filesystem errors</dt>
               <dd>{storage?.fs_errors == null ? "—" : String(storage.fs_errors)}</dd>
-              <dt>I/O errors (24 h)</dt>
-              <dd>
-                {storage?.io_errors_24h == null
-                  ? "—"
-                  : String(storage.io_errors_24h)}
-              </dd>
               <dt>TRIM</dt>
               <dd>{storage?.trim ?? "—"}</dd>
             </dl>

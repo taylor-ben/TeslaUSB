@@ -1881,6 +1881,35 @@ LUNs) is the single make-or-break that still needs the car.**
 
 ### 4.12 Storage Health — `Requirements.md` §4.12
 
+> **2026-07-15 — governor-aware severity + retention headroom shipped (commit `a1bbd71`,
+> live-verified).** SD-card severity is now governor-aware: when the retention governor is
+> `armed`, the intentional ring-buffer steady-state (~10% free) reads **Healthy** instead of a
+> false "Degraded", and the Settings "Retention headroom" card renders live free%/target/
+> last-drain/mode from `/api/storage .governor`. webd `classify_archive_frac` (sysinfo.rs) +
+> SPA `StorageHealth.tsx`; retentiond deletion daemon untouched.
+>
+> **2026-07-15 — the "—" detail rows resolved (wired where a real source exists, removed where
+> none does), live-verified on device.** Per operator directive ("wire them up if the data is
+> available or can be made available; remove if no data can be determined"), webd runs as root and
+> reads file-based sources only (no shell-out):
+> - Storage health → **Filesystem errors**: **WIRED** to `/sys/fs/ext4/<dev>/errors_count` (ext4
+>   cumulative FS-error count; `0` = healthy). Live device shows `0`.
+> - Storage health → **TRIM**: **WIRED** to `/sys/class/block/<dev>/../queue/discard_max_bytes`
+>   (discard support) + `fstrim.timer` enablement. Live device shows **"Enabled (scheduled)"**.
+> - Storage health → **I/O errors (24h)**: **REMOVED**. No persistent block-layer error counter
+>   exists in sysfs; only fragile timestamped `dmesg` parsing could approximate it → not reliable →
+>   dropped from the payload (`StorageHealth.io_errors_24h` field gone).
+> - Subsystem status → **TeslaCam (exFAT)** / **Media (exFAT)**: **REMOVED**. Volume *capacity* is
+>   already shown by the dedicated TeslaCam/Media cards (`/api/storage` `volumes[]`); the only unique
+>   health signal (VolumeFlags dirty/media-failure bit) needs MBR partition-table parsing and is
+>   semantically noisy on the live-mounted cam volume (the car sets the dirty bit during normal
+>   writes) → no *reliable* unique signal → dropped from `STORAGE_SUBSYSTEMS`.
+> - Both consumers updated in lockstep: `StorageHealth.tsx` (Storage screen) **and** `MediaHub.tsx`
+>   (Settings screen). webd `sysinfo.rs` adds pure `parse_count`/`trim_status`/`wear_telemetry`
+>   helpers + 3 unit tests (369 webd tests green). Deployed webd `10f217e3` + SPA `index-CFH0gTZu.js`
+>   under dead-man rails; retentiond untouched (MainPID unchanged). Live Playwright both viewports +
+>   Settings: `files/telemetry-live-{desktop-1280,mobile-375,settings-375}.png`, console 0/0.
+
 - [ ] View health: mount status, FS error counts, SMART/health severity, alerts. **(partial:
   Linux/Pi-gated probes — A5; archive-worker progress-freshness subsystem landed +
   live-verified 2026-06-26 — webd emits a `worker` block ("Idle, queue empty" /

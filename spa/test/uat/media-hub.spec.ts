@@ -68,7 +68,6 @@ const STORAGE_FIXTURE = {
   used_bytes: 15032385536,
   total_bytes: 68719476736,
   fs_errors: null,
-  io_errors_24h: null,
   trim: null,
 };
 // USB-gadget status fixture. Field names mirror webd's /api/gadget/status DTO.
@@ -178,15 +177,15 @@ test.describe("settings dashboard UAT", () => {
 
     // System Health — open. overall + the four probed subsystem rows come from
     // the fixture; Video Indexer comes from the real catalog (seed = 30 clips);
-    // the remaining five subsystems have no probe data and degrade to "—".
+    // the remaining two subsystems have no probe data and degrade to "—".
     const sh = page.locator("#system-health-section");
     await expect(sh).toHaveAttribute("open", "");
     await expect(page.locator("#system-health-overall-text")).toHaveText("Healthy");
     await expect(
       sh.locator("#system-health-overall .health-dot.health-dot-ok"),
     ).toBeVisible();
-    // 9 subsystem rows × 3 grid cells = 27 direct children.
-    await expect(page.locator("#system-health-rows > div")).toHaveCount(27);
+    // 7 subsystem rows × 3 grid cells = 21 direct children.
+    await expect(page.locator("#system-health-rows > div")).toHaveCount(21);
     const shText = await page.locator("#system-health-rows").innerText();
     expect(shText).toContain("USB Gadget");
     expect(shText).toContain("USB gadget configured (attached)"); // probe message
@@ -197,8 +196,8 @@ test.describe("settings dashboard UAT", () => {
     // Video Indexer carries REAL catalog data in the baseline's exact phrasing.
     expect(shText).toMatch(/\d+ clips indexed; newest is \d+ d old/);
     expect(shText).not.toContain("Indexer healthy");
-    // The four unprobed subsystems degrade to "—" — none is fabricated.
-    expect((shText.match(/—/g) ?? []).length).toBe(4);
+    // The two unprobed subsystems degrade to "—" — none is fabricated.
+    expect((shText.match(/—/g) ?? []).length).toBe(2);
     const indexerLabel = sh.locator("#system-health-rows > div", {
       hasText: "Video Indexer",
     });
@@ -266,7 +265,7 @@ test.describe("settings dashboard UAT", () => {
     await expect(ap).toContainText("AP status unavailable");
 
     // Storage Health — severity/summary/device/fs/mount from the fixture; the
-    // wear-telemetry rows (fs errors, I/O errors, TRIM) stay "—" (SD exposes
+    // wear-telemetry rows (fs errors, TRIM) stay "—" (SD exposes little stable
     // none — never fabricated).
     await expect(page.locator("#storage-health-summary")).toHaveText(
       "50.0 GB free of 64.0 GB",
@@ -275,7 +274,6 @@ test.describe("settings dashboard UAT", () => {
       "/dev/mmcblk0p2",
       "ext4",
       "/data",
-      "—",
       "—",
       "—",
     ]);

@@ -39,6 +39,7 @@ const GIB: f64 = (1u64 << 30) as f64;
 const GOVERNOR_MAX_AGE_SECS: i64 = 3600;
 /// Tolerated positive clock skew when validating governor timestamps.
 const GOVERNOR_MAX_SKEW_SECS: i64 = 300;
+const FSTRIM_TIMER_WANTS: &str = "/etc/systemd/system/timers.target.wants/fstrim.timer";
 
 /// Severity ladder shared by every health block; the string form matches the
 /// SPA's `SEV_COLORS` keys (`ok|warn|error|unknown`).
@@ -335,8 +336,9 @@ struct GovernorDto {
 }
 
 /// `GET /api/storage/health`: the data filesystem's capacity plus the
-/// device/fs/mount facts. Wear telemetry (fs errors, I/O errors, TRIM) is not
-/// available read-only from SD cards and is reported as `null`.
+/// device/fs/mount facts. Wear telemetry is read-only and best-effort:
+/// ext4 `errors_count` for filesystem errors and block discard support +
+/// `fstrim.timer` enablement for TRIM status.
 #[derive(Debug, Serialize)]
 pub struct StorageHealth {
     /// Capacity-derived severity.
@@ -353,11 +355,11 @@ pub struct StorageHealth {
     pub used_bytes: Option<u64>,
     /// Total bytes, or `null`.
     pub total_bytes: Option<u64>,
-    /// Filesystem error count — not available read-only (`null`).
+    /// ext4 filesystem error count from `/sys/fs/ext4/<dev>/errors_count`
+    /// (`null` when unreadable or non-ext4).
     pub fs_errors: Option<u64>,
-    /// I/O errors in the last 24h — not available read-only (`null`).
-    pub io_errors_24h: Option<u64>,
-    /// TRIM status — not available read-only (`null`).
+    /// TRIM status from `/sys/class/block/<dev>/../queue/discard_max_bytes`
+    /// and whether `fstrim.timer` is enabled (`null` when unreadable).
     pub trim: Option<String>,
 }
 
@@ -374,7 +376,6 @@ impl StorageHealth {
             used_bytes: None,
             total_bytes: None,
             fs_errors: None,
-            io_errors_24h: None,
             trim: None,
         }
     }
@@ -415,6 +416,44 @@ fn classify_archive_frac(frac: f64, gov: Option<&GovernorDto>) -> Severity {
         }
         _ => classify_frac(frac),
     }
+}
+
+/// Parse a small unsigned sysfs counter value.
+fn parse_count(raw: &str) -> Option<u64> {
+    raw.trim().parse::<u64>().ok()
+}
+
+/// Human TRIM status from discard support + fstrim.timer enablement.
+fn trim_status(discard_max_bytes: Option<u64>, fstrim_timer_enabled: bool) -> &'static str {
+    match discard_max_bytes {
+        Some(n) if n > 0 => {
+            if fstrim_timer_enabled {
+                "Enabled (scheduled)"
+            } else {
+                "Supported"
+            }
+        }
+        _ => "Not supported",
+    }
+}
+
+/// Pure derivation of (fs_errors, trim) from raw sysfs strings already read by
+/// the probe.
+fn wear_telemetry(
+    fstype: &str,
+    errors_count_raw: Option<String>,
+    discard_max_raw: Option<String>,
+    fstrim_timer_enabled: bool,
+) -> (Option<u64>, Option<String>) {
+    let fs_errors = if fstype == "ext4" {
+        errors_count_raw.as_deref().and_then(parse_count)
+    } else {
+        None
+    };
+    let trim = discard_max_raw
+        .as_deref()
+        .map(|raw| trim_status(parse_count(raw), fstrim_timer_enabled).to_owned());
+    (fs_errors, trim)
 }
 
 /// Build the `disk` (SD Card) block from a `statvfs` of the data root.
@@ -862,6 +901,23 @@ pub fn storage_health(probe: &dyn SystemProbe, paths: &SysPaths) -> StorageHealt
     };
     let gov = read_governor_dto(probe, paths);
     let mount = probe.mount_for(root);
+    let (fs_errors, trim) = match mount.as_ref() {
+        Some(m) => {
+            let dev_base = Path::new(&m.device)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            let errors_raw = probe.read_file_string(Path::new(&format!(
+                "/sys/fs/ext4/{dev_base}/errors_count"
+            )));
+            let discard_raw = probe.read_file_string(Path::new(&format!(
+                "/sys/class/block/{dev_base}/../queue/discard_max_bytes"
+            )));
+            let timer_enabled = probe.read_file_string(Path::new(FSTRIM_TIMER_WANTS)).is_some();
+            wear_telemetry(&m.fstype, errors_raw, discard_raw, timer_enabled)
+        }
+        None => (None, None),
+    };
     let sev = classify_archive_frac(fs.free_frac(), gov.as_ref());
     StorageHealth {
         severity: sev.as_str(),
@@ -875,9 +931,8 @@ pub fn storage_health(probe: &dyn SystemProbe, paths: &SysPaths) -> StorageHealt
         mount: mount.map(|m| m.mount),
         used_bytes: Some(fs.used_bytes()),
         total_bytes: Some(fs.total_bytes),
-        fs_errors: None,
-        io_errors_24h: None,
-        trim: None,
+        fs_errors,
+        trim,
     }
 }
 
@@ -1092,6 +1147,40 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(classify_archive_frac(0.10, Some(&dryrun)), Severity::Warn);
+    }
+
+    #[test]
+    fn parse_count_parses_uints() {
+        assert_eq!(parse_count("0"), Some(0));
+        assert_eq!(parse_count(" 3\n"), Some(3));
+        assert_eq!(parse_count("x"), None);
+        assert_eq!(parse_count(""), None);
+    }
+
+    #[test]
+    fn trim_status_matrix() {
+        assert_eq!(trim_status(Some(171966464), true), "Enabled (scheduled)");
+        assert_eq!(trim_status(Some(171966464), false), "Supported");
+        assert_eq!(trim_status(Some(0), true), "Not supported");
+        assert_eq!(trim_status(None, true), "Not supported");
+    }
+
+    #[test]
+    fn wear_telemetry_derives_fields() {
+        assert_eq!(
+            wear_telemetry(
+                "ext4",
+                Some("3".to_owned()),
+                Some("171966464".to_owned()),
+                true
+            ),
+            (Some(3), Some("Enabled (scheduled)".to_owned()))
+        );
+        assert_eq!(wear_telemetry("vfat", Some("5".to_owned()), None, false), (None, None));
+        assert_eq!(
+            wear_telemetry("ext4", None, Some("0".to_owned()), true),
+            (None, Some("Not supported".to_owned()))
+        );
     }
 
     #[test]

@@ -277,7 +277,7 @@ export interface StorageInfo {
   governor: GovernorInfo | null;
 }
 
-/** `GET /api/storage/health`. Wear telemetry is null (SD cards expose none). */
+/** `GET /api/storage/health`. Wear telemetry is best-effort read-only probes. */
 export interface StorageHealth {
   severity: string;
   summary: string;
@@ -287,7 +287,6 @@ export interface StorageHealth {
   used_bytes: number | null;
   total_bytes: number | null;
   fs_errors: number | null;
-  io_errors_24h: number | null;
   trim: string | null;
 }
 

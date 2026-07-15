@@ -121,7 +121,6 @@ const STORAGE_HEALTH_FIXTURE = {
   used_bytes: 376 * GIB,
   total_bytes: 470 * GIB,
   fs_errors: null,
-  io_errors_24h: null,
   trim: null,
 };
 
@@ -139,7 +138,6 @@ const SYS_HEALTH_FIXTURE = {
   subsystems: {
     disk: { severity: "ok", message: "94.0 GB free of 470.0 GB (80%)" },
     storage_writable: { severity: "ok", message: "archive root writable" },
-    teslafat_0: { severity: "warn", message: "TeslaCam exFAT inactive" },
     gadget: { severity: "ok", message: "USB gadget configured (attached)" },
   },
 };
@@ -272,7 +270,6 @@ test.describe("storage health UAT", () => {
       "470 GB",
       "\u2014",
       "\u2014",
-      "\u2014",
     ]);
 
     // Filesystems — one row per mounted filesystem (2). The primary volume is
@@ -282,13 +279,10 @@ test.describe("storage health UAT", () => {
       page.locator('#filesystems-list .fs-item[data-fs-mount="/mnt/teslausb"]'),
     ).toContainText("80%");
 
-    // Subsystem status — storage-relevant rows; teslafat_1 has no probe data in
-    // the fixture so it degrades to "—" while the others carry live messages.
+    // Subsystem status — storage-relevant rows from /api/system/health.
     const subText = await page.locator("#storage-subsystems-grid").innerText();
     expect(subText).toContain("archive root writable");
-    expect(subText).toContain("TeslaCam exFAT inactive");
     expect(subText).toContain("USB gadget configured (attached)");
-    expect(subText).toContain("\u2014"); // teslafat_1 (Media) unprobed → degraded
 
     // Live resources — mem/swap/load/uptime; swap is null ⇒ "—".
     await expect(page.locator("#storage-metric-mem .storage-metric-value")).toHaveText("50%");

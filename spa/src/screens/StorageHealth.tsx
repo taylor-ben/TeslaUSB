@@ -541,8 +541,6 @@ export function StorageHealth() {
   const STORAGE_SUBSYSTEMS = [
     { key: "disk", label: "SD Card" },
     { key: "storage_writable", label: "Storage Roots" },
-    { key: "teslafat_0", label: "TeslaCam (exFAT)" },
-    { key: "teslafat_1", label: "Media (exFAT)" },
     { key: "gadget", label: "USB Gadget" },
   ];
 
@@ -612,8 +610,6 @@ export function StorageHealth() {
           <dd>{humanBytes(health?.total_bytes)}</dd>
           <dt>Filesystem errors</dt>
           <dd>{health?.fs_errors != null ? String(health.fs_errors) : DASH}</dd>
-          <dt>I/O errors (24h)</dt>
-          <dd>{health?.io_errors_24h != null ? String(health.io_errors_24h) : DASH}</dd>
           <dt>TRIM</dt>
           <dd>{health?.trim ?? DASH}</dd>
         </dl>
