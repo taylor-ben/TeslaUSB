@@ -52,11 +52,16 @@ const HEALTH_FIXTURE = {
   },
 };
 const METRICS_FIXTURE = {
+  hostname: "cybertruck",
+  ip_address: "192.168.1.42",
+  platform: "Raspberry Pi Zero 2 W Rev 1.0",
   uptime_s: 123456,
   load: { one: 0.15, five: 0.22, fifteen: 0.18 },
   mem: { total_bytes: 536870912, available_bytes: 268435456, used_pct: 50 },
   swap: null,
   cpu_temp_c: 47.2,
+  cpu_times: { total: 1000000, idle: 800000 },
+  sd_io: { read_bytes: 1048576, write_bytes: 2097152 },
   updated_at: 1700000000,
 };
 const STORAGE_FIXTURE = {
@@ -152,7 +157,24 @@ test.describe("settings dashboard UAT", () => {
     page,
     probe,
   }, testInfo) => {
+    const json = (body: unknown) => ({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(body),
+    });
     await routeSystemProbes(page);
+    let mtick = 0;
+    await page.route("**/api/system/metrics", (r) => {
+      mtick += 1;
+      r.fulfill(
+        json({
+          ...METRICS_FIXTURE,
+          // Δidle/Δtotal = 100000/200000 = 0.5 → CPU 50%
+          cpu_times: { total: 1000000 + mtick * 200000, idle: 800000 + mtick * 100000 },
+          sd_io: { read_bytes: 1048576 + mtick * 2097152, write_bytes: 2097152 + mtick * 1048576 },
+        }),
+      );
+    });
     await gotoDashboard(page);
 
     // App shell (base.html parity): brand + toast region.
@@ -218,12 +240,11 @@ test.describe("settings dashboard UAT", () => {
       "Idle, queue empty",
     );
 
-    // Live Metrics — open; load/mem/uptime from the fixture, CPU + SD/USB I/O
-    // and the (null) swap stay "—" (webd does not sample those — not fabricated).
+    // Live Metrics — open; load/mem/uptime from fixture, CPU/SD from polling deltas.
     const lm = page.locator("#live-metrics-section");
     await expect(lm).toHaveAttribute("open", "");
     const tiles = page.locator("#live-metrics-grid .metric-tile");
-    await expect(tiles).toHaveCount(7);
+    await expect(tiles).toHaveCount(6);
     await expect(page.locator("#metric-load .metric-value")).toHaveText(
       "0.15 / 0.22 / 0.18",
     );
@@ -231,9 +252,10 @@ test.describe("settings dashboard UAT", () => {
     await expect(page.locator("#metric-mem .metric-detail")).toHaveText(
       "256 MB / 512 MB",
     );
-    await expect(page.locator("#metric-cpu .metric-value")).toHaveText("—");
+    await expect(page.locator("#metric-cpu .metric-value")).toHaveText("50%");
     await expect(page.locator("#metric-temp .metric-value")).toHaveText("47.2 \u00b0C");
     await expect(page.locator("#metric-swap .metric-value")).toHaveText("—");
+    await expect(page.locator("#metric-sd .metric-value")).toHaveText(/\/s/);
     await expect(page.locator("#live-metrics-foot")).toContainText("Updated");
     await expect(page.locator("#live-metrics-uptime")).toHaveText("up 1d 10h 17m");
 
@@ -278,13 +300,15 @@ test.describe("settings dashboard UAT", () => {
       "—",
     ]);
 
-    // System — Uptime + Memory now come from the metrics fixture; Hostname / IP
-    // / Platform remain unknown in the read-only build (not fabricated).
+    // System — Hostname / IP / Platform / Uptime / Memory now come live from
+    // the metrics fixture (webd reads them on-device); rendered, not fabricated.
     const sys = page.locator("details.settings-section", {
       has: page.locator("summary", { hasText: /^System$/ }),
     });
-    await expect(sys.locator("strong")).toHaveText("—"); // Hostname value
+    await expect(sys.locator("strong")).toHaveText("cybertruck"); // Hostname value
     await expect(sys.locator("code")).toHaveText("B-1");
+    await expect(sys).toContainText("192.168.1.42");
+    await expect(sys).toContainText("Raspberry Pi Zero 2 W Rev 1.0");
     await expect(sys).toContainText("up 1d 10h 17m");
     await expect(sys).toContainText("256 MB / 512 MB");
 

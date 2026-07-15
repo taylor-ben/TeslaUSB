@@ -1909,6 +1909,40 @@ LUNs) is the single make-or-break that still needs the car.**
 >   helpers + 3 unit tests (369 webd tests green). Deployed webd `10f217e3` + SPA `index-CFH0gTZu.js`
 >   under dead-man rails; retentiond untouched (MainPID unchanged). Live Playwright both viewports +
 >   Settings: `files/telemetry-live-{desktop-1280,mobile-375,settings-375}.png`, console 0/0.
+>
+> **2026-07-15 — Settings "System" card `—` rows wired, live-verified on device.** Same
+> operator directive; the three previously-hardcoded `—` rows now render real file-based facts
+> from webd `/api/system/metrics` (webd runs as root, reads sysfs/proc directly, no shell-out):
+> - **Hostname** → `/proc/sys/kernel/hostname`. Live device shows `cybertruckusb`.
+> - **Platform** → `/sys/firmware/devicetree/base/model` (device-tree board model). Live device
+>   shows `Raspberry Pi Zero 2 W Rev 1.0`. Honest `null` on non-device-tree hosts.
+> - **IP Address** → best-effort default-route source address via a UDP-connect trick (no packet
+>   sent, works offline, fails closed to `null`). Live device shows `10.0.0.224`.
+> webd `sysinfo.rs` adds `SystemProbe::primary_ipv4()` + `clean_host_string` helper + 3 fields on
+> `SystemMetrics` + 3 unit tests (372 webd tests green); SPA `MediaHub.tsx` binds the rows; `types.ts`
+> + `media-hub.spec.ts` updated. Deployed webd `a11ecd27` + SPA `index-ERm6gBN5.js` under dead-man
+> rails; retentiond untouched (MainPID unchanged 48669). Live Playwright both viewports:
+> `files/syscard-live-{desktop-1280,mobile-375}.png`, console 0/0.
+>
+> **2026-07-15 — Settings "Live Metrics" card wired to live CPU% + SD Card I/O with near-real-time
+> polling, live-verified on device.** Same operator directive; the card previously showed a frozen
+> one-shot snapshot with `—` for CPU and a bogus "USB I/O (nbd0)" tile. Fix (display-only, Tier-2):
+> webd `/api/system/metrics` now exposes raw cumulative counters `cpu_times{total,idle}`
+> (`/proc/stat`) and `sd_io{read_bytes,write_bytes}` (`/proc/diskstats` `mmcblk0` sectors×512); the
+> SPA polls every 2000 ms, keeps a prev snapshot, and derives **CPU%** = `100·(1−Δidle/Δtotal)` and
+> **SD B/s** = `Δbytes/Δt` client-side (self-normalizing, guards for prev-null/counter-reset/div-zero).
+> - **CPU** → WIRED (derived from `/proc/stat` deltas). Live device shows a live `%` that updates ~2 s.
+> - **SD Card I/O** → WIRED (derived from `/proc/diskstats` deltas). Live device shows `read / write`
+>   B/s (e.g. `751 KB/s / 2.2 MB/s` during active archiving).
+> - **USB I/O (nbd0)** → REMOVED. The gadget is file-backed (`teslacam.img`/`media.img` via
+>   `usb_f_mass_storage`), no `nbd0` and no sysfs byte counter; physical writes already count on
+>   `mmcblk0` (SD Card I/O) → no honest source → tile dropped.
+> The 2 s poll also un-freezes the whole card (load/mem/temp/uptime now refresh live too). webd
+> `sysinfo.rs` adds `CpuTimes`/`DiskIo` + `parse_cpu_times`/`parse_disk_io` + 5 unit tests (377 webd
+> tests green); SPA `MediaHub.tsx` polling effect + `types.ts`/`media-hub.spec.ts` updated. Deployed
+> webd `2c8cc92e` + SPA `index-V_G6k1yY.js` under dead-man rails; retentiond untouched (MainPID
+> unchanged 48669). Live Playwright both viewports (6 tiles, no USB tile, timestamp ticks ~2 s):
+> `files/livemetrics-live-{desktop-1280,mobile-375}.png`, console 0/0.
 
 - [ ] View health: mount status, FS error counts, SMART/health severity, alerts. **(partial:
   Linux/Pi-gated probes — A5; archive-worker progress-freshness subsystem landed +

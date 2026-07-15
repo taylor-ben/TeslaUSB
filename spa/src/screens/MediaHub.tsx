@@ -1,4 +1,4 @@
-import { useEffect, useState } from "preact/hooks";
+import { useEffect, useRef, useState } from "preact/hooks";
 import { Fragment } from "preact";
 import { api } from "../api/client";
 import type {
@@ -25,8 +25,9 @@ import type {
  * fabricated value — which is exactly the parity baseline. The Video Indexer row
  * is the one System Health entry derived client-side from the catalog (clip
  * count + newest-clip age). `GET /api/settings` still populates the config-form
- * fields. CPU and SD/USB I/O tiles stay "—" because webd does not yet sample
- * them (tracked gap) — never fabricated.
+ * fields. CPU and SD Card I/O now render sampled client-side deltas from raw
+ * counters; the old USB I/O tile was removed because there is no honest
+ * per-device USB counter separate from mmcblk0 writes.
  *
  * The config form (Mapping & Indexing) is reproduced for structural parity but
  * is inert: buttons are `type="button"` and the form `preventDefault`s, so the
@@ -45,7 +46,6 @@ const METRIC_TILES = [
   { id: "metric-mem", label: "Memory" },
   { id: "metric-swap", label: "Swap" },
   { id: "metric-sd", label: "SD Card I/O" },
-  { id: "metric-usb", label: "USB I/O (nbd0)" },
 ];
 
 const TIMEZONES = [
@@ -109,6 +109,14 @@ function humanBytes(n: number | null | undefined): string {
   return `${(n / 1024 ** 2).toFixed(0)} MB`;
 }
 
+/** Bytes/sec → compact rate string ("1.2 MB/s" / "512 KB/s" / "0 B/s"). */
+function formatRate(bps: number | null): string {
+  if (bps == null || !Number.isFinite(bps) || bps < 0) return "—";
+  if (bps >= 1024 ** 2) return `${(bps / 1024 ** 2).toFixed(1)} MB/s`;
+  if (bps >= 1024) return `${(bps / 1024).toFixed(0)} KB/s`;
+  return `${Math.round(bps)} B/s`;
+}
+
 /** Seconds → "Xd Yh Zm" (drops leading zero units). */
 function formatUptime(s: number | null | undefined): string {
   if (s == null || !Number.isFinite(s) || s < 0) return "—";
@@ -145,6 +153,7 @@ function memTile(
 function metricFor(
   id: string,
   m: SystemMetrics | null,
+  derived: { cpuPct: number | null; sdReadBps: number | null; sdWriteBps: number | null },
 ): { value: string; detail: string } {
   if (!m) return { value: "—", detail: "" };
   switch (id) {
@@ -171,8 +180,18 @@ function metricFor(
                   : "",
           }
         : { value: "—", detail: "" };
+    case "metric-cpu":
+      return derived.cpuPct != null
+        ? { value: `${Math.round(derived.cpuPct)}%`, detail: "" }
+        : { value: "—", detail: "" };
+    case "metric-sd":
+      return derived.sdReadBps != null
+        ? {
+           value: `${formatRate(derived.sdReadBps)} / ${formatRate(derived.sdWriteBps)}`,
+           detail: "read / write",
+          }
+        : { value: "—", detail: "" };
     default:
-      // CPU, SD Card I/O, USB I/O — webd does not sample these yet.
       return { value: "—", detail: "" };
   }
 }
@@ -185,6 +204,18 @@ export function MediaHub() {
   const [storage, setStorage] = useState<StorageHealth | null>(null);
   const [gadget, setGadget] = useState<GadgetStatus | null>(null);
   const [gadgetUnavailable, setGadgetUnavailable] = useState(false);
+  const [derived, setDerived] = useState<{
+    cpuPct: number | null;
+    sdReadBps: number | null;
+    sdWriteBps: number | null;
+  }>({ cpuPct: null, sdReadBps: null, sdWriteBps: null });
+  const prevSample = useRef<{
+    total: number;
+    idle: number;
+    read: number;
+    write: number;
+    at: number;
+  } | null>(null);
 
   useEffect(() => {
     const ctrl = new AbortController();
@@ -199,7 +230,6 @@ export function MediaHub() {
     // unknown/null, so on the rare transport error we simply leave the section
     // in its loading/unknown state without logging (zero-console gate).
     api.systemHealth(ctrl.signal).then(setHealth).catch(() => {});
-    api.systemMetrics(ctrl.signal).then(setMetrics).catch(() => {});
     api.storageHealth(ctrl.signal).then(setStorage).catch(() => {});
     // USB-gadget status is the first cross-daemon control-socket read: it talks
     // to gadgetd's live socket and so, unlike the catalog reads, it CAN be
@@ -234,6 +264,69 @@ export function MediaHub() {
         // Degrade: the Video Indexer row stays "—"/unknown like the others.
       });
     return () => ctrl.abort();
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    let ctrl: AbortController | null = null;
+    const tick = () => {
+      ctrl?.abort();
+      ctrl = new AbortController();
+      api
+        .systemMetrics(ctrl.signal)
+        .then((m) => {
+          if (!active) return;
+          setMetrics(m);
+          const now = Date.now();
+          const prev = prevSample.current;
+          let next = {
+            cpuPct: null as number | null,
+            sdReadBps: null as number | null,
+            sdWriteBps: null as number | null,
+          };
+          if (
+            m.cpu_times &&
+            prev &&
+            m.cpu_times.total > prev.total &&
+            m.cpu_times.idle >= prev.idle
+          ) {
+            const dTotal = m.cpu_times.total - prev.total;
+            const dIdle = m.cpu_times.idle - prev.idle;
+            next.cpuPct = Math.max(0, Math.min(100, 100 * (1 - dIdle / dTotal)));
+          }
+          if (m.sd_io && prev) {
+            const secs = (now - prev.at) / 1000;
+            if (
+              secs > 0 &&
+              m.sd_io.read_bytes >= prev.read &&
+              m.sd_io.write_bytes >= prev.write
+            ) {
+              next.sdReadBps = (m.sd_io.read_bytes - prev.read) / secs;
+              next.sdWriteBps = (m.sd_io.write_bytes - prev.write) / secs;
+            }
+          }
+          setDerived(next);
+          // Advance each counter's baseline independently: a poll that is
+          // missing one source must not freeze the other metric's delta.
+          prevSample.current = {
+            total: m.cpu_times?.total ?? prev?.total ?? 0,
+            idle: m.cpu_times?.idle ?? prev?.idle ?? 0,
+            read: m.sd_io?.read_bytes ?? prev?.read ?? 0,
+            write: m.sd_io?.write_bytes ?? prev?.write ?? 0,
+            at: now,
+          };
+        })
+        .catch(() => {
+          // Read-only degrade; ignore aborts/transport errors (zero-console gate).
+        });
+    };
+    tick();
+    const h = setInterval(tick, 2000);
+    return () => {
+      active = false;
+      clearInterval(h);
+      ctrl?.abort();
+    };
   }, []);
 
   const overall = health?.overall ?? "unknown";
@@ -332,8 +425,8 @@ export function MediaHub() {
           </div>
         </details>
 
-        {/* Live Metrics — zero-state tiles (system-metrics endpoint is a tracked
-            gap; we do not fabricate CPU/MEM numbers). */}
+        {/* Live Metrics — load/temp/memory come from probe payload; CPU and SD
+            throughput are sampled client-side as deltas across polls. */}
         <details class="settings-section" id="live-metrics-section" open>
           <summary>Live Metrics</summary>
           <div class="section-content">
@@ -346,7 +439,7 @@ export function MediaHub() {
                 style="display:grid; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); gap:10px;"
               >
                 {METRIC_TILES.map((t) => {
-                  const { value, detail } = metricFor(t.id, metrics);
+                  const { value, detail } = metricFor(t.id, metrics, derived);
                   return (
                     <div class="metric-tile" id={t.id} key={t.id}>
                       <div class="metric-label">{t.label}</div>
@@ -627,20 +720,20 @@ export function MediaHub() {
           </div>
         </details>
 
-        {/* System — host facts are an on-device concern; rendered as unknown in
-            the read-only catalog build rather than fabricated. */}
+        {/* System — host facts read live from webd's /api/system/metrics;
+            anything webd cannot observe renders as "—" rather than fabricated. */}
         <details class="settings-section">
           <summary>System</summary>
           <div class="section-content">
             <div style="display:grid; grid-template-columns:auto 1fr; gap:6px 16px; font-size:0.9rem;">
               <span style="color:var(--text-secondary)">Hostname</span>
-              <strong>—</strong>
+              <strong>{metrics?.hostname ?? "—"}</strong>
               <span style="color:var(--text-secondary)">IP Address</span>
-              <span>—</span>
+              <span>{metrics?.ip_address ?? "—"}</span>
               <span style="color:var(--text-secondary)">Uptime</span>
               <span>{formatUptime(metrics?.uptime_s)}</span>
               <span style="color:var(--text-secondary)">Platform</span>
-              <span>—</span>
+              <span>{metrics?.platform ?? "—"}</span>
               <span style="color:var(--text-secondary)">Memory</span>
               <span>
                 {metrics?.mem

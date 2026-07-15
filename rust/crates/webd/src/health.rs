@@ -55,11 +55,16 @@ async fn system_metrics(State(state): State<AppState>) -> Json<SystemMetrics> {
     let out = tokio::task::spawn_blocking(move || sysinfo::system_metrics(sys.probe.as_ref(), now))
         .await
         .unwrap_or(SystemMetrics {
+            hostname: None,
+            ip_address: None,
+            platform: None,
             uptime_s: None,
             load: None,
             mem: None,
             swap: None,
             cpu_temp_c: None,
+            cpu_times: None,
+            sd_io: None,
             updated_at: now,
         });
     Json(out)

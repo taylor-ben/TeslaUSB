@@ -206,14 +206,36 @@ export interface MemStat {
   used_pct: number;
 }
 
+/** Aggregate CPU time counters (`/proc/stat`), for client-side utilization deltas. */
+export interface CpuTimes {
+  total: number;
+  idle: number;
+}
+
+/** Cumulative block-device byte counters (`/proc/diskstats`), for client-side throughput deltas. */
+export interface DiskIo {
+  read_bytes: number;
+  write_bytes: number;
+}
+
 /** `GET /api/system/metrics`. Fields webd cannot read honestly are null. */
 export interface SystemMetrics {
+  /** Host name (`/proc/sys/kernel/hostname`), or null. */
+  hostname: string | null;
+  /** Primary IPv4 address (default-route source), or null. */
+  ip_address: string | null;
+  /** Hardware platform string (device-tree model), or null. */
+  platform: string | null;
   uptime_s: number | null;
   load: LoadAvg | null;
   mem: MemStat | null;
   swap: MemStat | null;
   /** SoC temperature in °C (one decimal), or null when no sensor is exposed. */
   cpu_temp_c: number | null;
+  /** Aggregate CPU time counters, or null. Utilization is a delta across polls. */
+  cpu_times: CpuTimes | null;
+  /** SD-card cumulative byte counters, or null. Throughput is a delta across polls. */
+  sd_io: DiskIo | null;
   updated_at: number | null;
 }
 

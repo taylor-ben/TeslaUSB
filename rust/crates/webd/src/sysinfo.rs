@@ -146,6 +146,14 @@ pub trait SystemProbe: Send + Sync {
     fn cpu_temp_millic(&self) -> Option<i64> {
         None
     }
+
+    /// The host's primary IPv4 address (the source address the kernel selects
+    /// for the default route), e.g. `"192.168.1.42"`; `None` when it cannot be
+    /// determined. Best-effort, for the read-only System card only. Default
+    /// `None` for probes without a live network stack (the test double).
+    fn primary_ipv4(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Paths `webd` probes: the Pi-side data/archive root whose ext4 filesystem
@@ -243,11 +251,39 @@ impl MemDto {
     }
 }
 
+/// Aggregate CPU time counters from `/proc/stat`'s `cpu` line, exposed raw so
+/// the SPA can compute utilization as a delta between two polls
+/// (`100 * (1 - Δidle/Δtotal)`); a single sample carries no utilization.
+#[derive(Debug, Serialize)]
+pub struct CpuTimes {
+    /// Sum of all fields on the aggregate `cpu` line (jiffies).
+    pub total: u64,
+    /// Idle jiffies (`idle` + `iowait`).
+    pub idle: u64,
+}
+
+/// Cumulative block-device byte counters (from `/proc/diskstats` sectors ×512),
+/// exposed raw so the SPA can compute throughput as a delta between two polls.
+#[derive(Debug, Serialize)]
+pub struct DiskIo {
+    /// Cumulative bytes read since boot.
+    pub read_bytes: u64,
+    /// Cumulative bytes written since boot.
+    pub write_bytes: u64,
+}
+
 /// `GET /api/system/metrics`: the Live-Metrics tiles `webd` can read honestly
-/// (`load`, `mem`, `swap`, `uptime`, `cpu_temp`). CPU-percent and per-device I/O
-/// need sampling deltas and are left to a later slice (the SPA shows `—`).
+/// (`load`, `mem`, `swap`, `uptime`, `cpu_temp`) plus raw CPU/SD counters so the
+/// SPA can compute client-side deltas for utilization/throughput.
 #[derive(Debug, Serialize)]
 pub struct SystemMetrics {
+    /// Host name (`/proc/sys/kernel/hostname`), or `null`.
+    pub hostname: Option<String>,
+    /// Primary IPv4 address (the default-route source address), or `null`.
+    pub ip_address: Option<String>,
+    /// Hardware platform string (device-tree `model`, e.g. the Pi model), or
+    /// `null` on hosts without a device tree.
+    pub platform: Option<String>,
     /// Seconds since boot, or `null`.
     pub uptime_s: Option<u64>,
     /// Load averages, or `null`.
@@ -260,6 +296,12 @@ pub struct SystemMetrics {
     /// thermal sensor is exposed. A first-class tile on a fanless Pi appliance
     /// where thermal throttling is a real failure mode.
     pub cpu_temp_c: Option<f64>,
+    /// Aggregate CPU time counters for client-side utilization deltas, or
+    /// `null` when `/proc/stat` cannot be read.
+    pub cpu_times: Option<CpuTimes>,
+    /// SD-card (mmcblk0) cumulative byte counters for client-side throughput
+    /// deltas, or `null` when `/proc/diskstats` lacks the device.
+    pub sd_io: Option<DiskIo>,
     /// When this snapshot was taken (epoch seconds), or `null`.
     pub updated_at: Option<u64>,
 }
@@ -665,6 +707,40 @@ fn parse_uptime(s: &str) -> Option<u64> {
     }
 }
 
+/// Parse `/proc/stat`'s aggregate `cpu` line into total/idle jiffies.
+fn parse_cpu_times(s: &str) -> Option<CpuTimes> {
+    let line = s.lines().next()?;
+    let mut it = line.split_whitespace();
+    if it.next()? != "cpu" {
+        return None;
+    }
+    let vals: Vec<u64> = it.filter_map(|t| t.parse::<u64>().ok()).collect();
+    // Need at least user,nice,system,idle,iowait.
+    if vals.len() < 5 {
+        return None;
+    }
+    let total: u64 = vals.iter().copied().sum();
+    let idle = vals[3].saturating_add(vals[4]);
+    Some(CpuTimes { total, idle })
+}
+
+/// Parse cumulative read/write bytes for `dev` from `/proc/diskstats`
+/// (sectors ×512). `None` when the device is absent.
+fn parse_disk_io(s: &str, dev: &str) -> Option<DiskIo> {
+    for line in s.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() > 9 && f[2] == dev {
+            let read_sectors: u64 = f[5].parse().ok()?;
+            let write_sectors: u64 = f[9].parse().ok()?;
+            return Some(DiskIo {
+                read_bytes: read_sectors.saturating_mul(512),
+                write_bytes: write_sectors.saturating_mul(512),
+            });
+        }
+    }
+    None
+}
+
 /// Read one `key:` line from `/proc/meminfo` as bytes (the file reports kB).
 fn meminfo_bytes(s: &str, key: &str) -> Option<u64> {
     s.lines().find_map(|line| {
@@ -700,13 +776,54 @@ pub fn system_metrics(probe: &dyn SystemProbe, now: Option<u64>) -> SystemMetric
         Some(MemDto::new(total, free))
     });
 
+    let hostname = probe
+        .read_file_string(Path::new(HOSTNAME_PATH))
+        .as_deref()
+        .and_then(clean_host_string);
+    let platform = probe
+        .read_file_string(Path::new(PLATFORM_MODEL_PATH))
+        .as_deref()
+        .and_then(clean_host_string);
+    let ip_address = probe.primary_ipv4();
+    let cpu_times = probe.proc_file("stat").as_deref().and_then(parse_cpu_times);
+    let sd_io = probe
+        .proc_file("diskstats")
+        .as_deref()
+        .and_then(|s| parse_disk_io(s, SD_DISK_DEV));
+
     SystemMetrics {
+        hostname,
+        ip_address,
+        platform,
         uptime_s,
         load,
         mem,
         swap,
         cpu_temp_c: probe.cpu_temp_millic().map(millic_to_celsius),
+        cpu_times,
+        sd_io,
         updated_at: now,
+    }
+}
+
+/// Linux block-device name for the Pi SD card.
+const SD_DISK_DEV: &str = "mmcblk0";
+/// Kernel hostname, exposed as a plain string.
+const HOSTNAME_PATH: &str = "/proc/sys/kernel/hostname";
+/// Device-tree node carrying the board model string (Raspberry Pi models expose
+/// it; the value is NUL-terminated). Absent on non-device-tree hosts.
+const PLATFORM_MODEL_PATH: &str = "/sys/firmware/devicetree/base/model";
+
+/// Normalize a host-fact string read from `/proc` or the device tree: drop NUL
+/// bytes (the device-tree `model` node is NUL-terminated) and trim surrounding
+/// whitespace; `None` if nothing meaningful is left. Pure, so it is testable.
+fn clean_host_string(raw: &str) -> Option<String> {
+    let cleaned: String = raw.chars().filter(|c| *c != '\0').collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
     }
 }
 
@@ -983,6 +1100,20 @@ impl SystemProbe for LinuxProbe {
         let raw = std::fs::read_to_string("/sys/class/thermal/thermal_zone0/temp").ok()?;
         raw.trim().parse::<i64>().ok()
     }
+
+    fn primary_ipv4(&self) -> Option<String> {
+        // connect() on a UDP socket sends no packet; it only asks the kernel to
+        // select the egress interface + source address for the default route, so
+        // this returns the address the Pi is reached at (wlan0) and works with no
+        // internet. TEST-NET-1 (RFC 5737) is inert even if a datagram were sent.
+        let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+        sock.connect("192.0.2.1:9").ok()?;
+        let ip = sock.local_addr().ok()?.ip();
+        if ip.is_unspecified() || ip.is_loopback() {
+            return None;
+        }
+        Some(ip.to_string())
+    }
 }
 
 #[cfg(unix)]
@@ -1037,6 +1168,9 @@ mod tests {
         indexer_file: Option<String>,
         governor_file: Option<String>,
         cpu_temp: Option<i64>,
+        hostname_file: Option<String>,
+        platform_file: Option<String>,
+        ipv4: Option<String>,
     }
 
     impl SystemProbe for FakeProbe {
@@ -1065,10 +1199,19 @@ mod tests {
             if path == paths().governor_status_file.as_path() {
                 return self.governor_file.clone();
             }
+            if path == Path::new(HOSTNAME_PATH) {
+                return self.hostname_file.clone();
+            }
+            if path == Path::new(PLATFORM_MODEL_PATH) {
+                return self.platform_file.clone();
+            }
             None
         }
         fn cpu_temp_millic(&self) -> Option<i64> {
             self.cpu_temp
+        }
+        fn primary_ipv4(&self) -> Option<String> {
+            self.ipv4.clone()
         }
     }
 
@@ -1445,9 +1588,110 @@ mod tests {
     }
 
     #[test]
+    fn parse_cpu_times_sums_total_and_idle() {
+        let s = "cpu  100 0 50 800 40 0 10 0 0 0\ncpu0 1 2 3 4 5\n";
+        let got = parse_cpu_times(s).expect("cpu");
+        assert_eq!(got.total, 1000);
+        assert_eq!(got.idle, 840);
+    }
+
+    #[test]
+    fn parse_cpu_times_rejects_non_cpu() {
+        let s = "intr 123 456\ncpu 1 2 3 4 5\n";
+        assert!(parse_cpu_times(s).is_none());
+    }
+
+    #[test]
+    fn parse_disk_io_reads_mmcblk0() {
+        let s = " 179       0 mmcblk0 199979 13155 29888336 3420661 160002 10834 98764001 100392075 0 4135060 103840049 0 0 0 0 4730 27312\n";
+        let got = parse_disk_io(s, "mmcblk0").expect("mmcblk0");
+        assert_eq!(got.read_bytes, 29_888_336_u64 * 512);
+        assert_eq!(got.write_bytes, 98_764_001_u64 * 512);
+    }
+
+    #[test]
+    fn parse_disk_io_none_when_absent() {
+        let s = "   8       0 sda 1 2 3 4 5 6 7 8 0 0 0 0\n";
+        assert!(parse_disk_io(s, "mmcblk0").is_none());
+    }
+
+    #[test]
+    fn metrics_exposes_cpu_and_sd_io_when_present() {
+        let mut proc = HashMap::new();
+        proc.insert(
+            "loadavg".to_owned(),
+            "0.10 0.20 0.30 1/200 1234\n".to_owned(),
+        );
+        proc.insert("uptime".to_owned(), "98765.43 1234.00\n".to_owned());
+        proc.insert(
+            "meminfo".to_owned(),
+            "MemTotal:        512000 kB\nMemAvailable:    256000 kB\nSwapTotal:       102400 kB\nSwapFree:         51200 kB\n".to_owned(),
+        );
+        proc.insert(
+            "stat".to_owned(),
+            "cpu  100 0 50 800 40 0 10 0 0 0\ncpu0 1 2 3 4 5\n".to_owned(),
+        );
+        proc.insert(
+            "diskstats".to_owned(),
+            " 179       0 mmcblk0 199979 13155 29888336 3420661 160002 10834 98764001 100392075 0 4135060 103840049 0 0 0 0 4730 27312\n".to_owned(),
+        );
+        let probe = FakeProbe {
+            proc,
+            cpu_temp: Some(47239),
+            ..FakeProbe::default()
+        };
+        let m = system_metrics(&probe, Some(42));
+        let cpu = m.cpu_times.expect("cpu_times");
+        assert_eq!(cpu.total, 1000);
+        assert_eq!(cpu.idle, 840);
+        let io = m.sd_io.expect("sd_io");
+        assert_eq!(io.read_bytes, 29_888_336_u64 * 512);
+        assert_eq!(io.write_bytes, 98_764_001_u64 * 512);
+    }
+
+    #[test]
     fn cpu_temp_absent_when_no_sensor() {
         let m = system_metrics(&FakeProbe::default(), None);
         assert!(m.cpu_temp_c.is_none());
+    }
+
+    #[test]
+    fn clean_host_string_trims_nul_and_whitespace() {
+        assert_eq!(
+            clean_host_string("cybertruck\n").as_deref(),
+            Some("cybertruck")
+        );
+        assert_eq!(
+            clean_host_string("Raspberry Pi Zero 2 W Rev 1.0\0").as_deref(),
+            Some("Raspberry Pi Zero 2 W Rev 1.0")
+        );
+        assert_eq!(clean_host_string("  \0 \n"), None);
+        assert_eq!(clean_host_string(""), None);
+    }
+
+    #[test]
+    fn metrics_populates_host_facts_when_available() {
+        let probe = FakeProbe {
+            hostname_file: Some("cybertruck\n".to_owned()),
+            platform_file: Some("Raspberry Pi Zero 2 W Rev 1.0\0".to_owned()),
+            ipv4: Some("192.168.1.42".to_owned()),
+            ..FakeProbe::default()
+        };
+        let m = system_metrics(&probe, None);
+        assert_eq!(m.hostname.as_deref(), Some("cybertruck"));
+        assert_eq!(
+            m.platform.as_deref(),
+            Some("Raspberry Pi Zero 2 W Rev 1.0")
+        );
+        assert_eq!(m.ip_address.as_deref(), Some("192.168.1.42"));
+    }
+
+    #[test]
+    fn metrics_host_facts_none_when_unavailable() {
+        let m = system_metrics(&FakeProbe::default(), None);
+        assert!(m.hostname.is_none());
+        assert!(m.ip_address.is_none());
+        assert!(m.platform.is_none());
     }
 
     #[test]
