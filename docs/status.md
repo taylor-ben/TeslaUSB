@@ -1971,11 +1971,39 @@ LUNs) is the single make-or-break that still needs the car.**
 
 - [ ] First-run setup AP (`TeslaUSB-Setup`, auto passphrase) + captive-portal
   redirect (Apple/Android/Windows/generic). **(gated:B4 + WiFi-invariant C)**
-- [ ] Scan networks + saved networks w/ signal status. **(gated:B4)**
-- [ ] Join network (SSID+pass; open needs none). **(gated:B4)**
-- [ ] Disconnect / forget network. **(gated:B4)**
-- [ ] Enable/disable setup AP + auto-restore timer (never lock out). **(gated:B4)**
-- [ ] `wifid` UDS + webd wifi routes. **(wifid has AdminCommand core; serve/UDS missing — B4)**
+- [x] Scan networks + saved networks w/ signal status. **(DONE — Phase A read-only:
+  webd `/api/wifi/{status,networks,scan}` read NetworkManager directly; SPA WiFi
+  Networks section renders current connection + signal + full nearby list w/
+  saved/active/secured badges + working Scan. Live-verified on device 2026-07-15.
+  See addendum + `files/hw-results.md`.)**
+- [ ] Join network (SSID+pass; open needs none). **(Phase B — wifid management lease
+  + NM checkpoint/rollback; needs explicit operator go-ahead)**
+- [ ] Disconnect / forget network. **(Phase B — `netplan-*` treated as protected)**
+- [ ] Enable/disable setup AP + auto-restore timer (never lock out). **(Phase C — gated:B4 + WiFi-invariant C)**
+- [ ] `wifid` UDS + webd wifi routes. **(Phase A read routes DONE via NM; Phase B
+  mutation routes + wifid lease/UDS still missing. Architecture: `docs/specs/wifid.md` §7)**
+
+> ### Addendum (2026-07-15) — §4.13 Phase A read-only DEPLOYED + live-verified
+> - **Architecture reconciled (Opus + GPT-5.5 second opinion):** NetworkManager +
+>   netplan own `wlan0` (profile `netplan-wlan0-Trez`); `wifid` is a dormant AP/
+>   throttle spectator. So the scan/saved-list/join surface lives on **NM via webd**,
+>   not retrofitted into safety-critical `wifid`. **Phase A = webd reads NM directly
+>   (read-only nmcli shell-out); wifid untouched.** Phase B mutations (join/forget)
+>   go through a wifid management lease + NM checkpoint rollback + 17 lock-out guards
+>   (POST/CSRF, keyfile PSK never on argv) — deferred, needs explicit go-ahead.
+> - **Shipped:** `webd/src/wifi.rs` — `GET /api/wifi/status`, `GET /api/wifi/networks`,
+>   `POST /api/wifi/scan` (10 s rate-limited). Tolerant nmcli parsers w/ terse-escape
+>   (`\:`/`\\`) splitter, active-first+signal sort, saved/protected(`netplan-*`) flags;
+>   8 pure-parser unit tests (webd 385 pass). Never 5xx (degrade to empty/null). SPA
+>   WiFi Networks section wired read-only (no join/forget UI).
+> - **Live-verified (Playwright, both viewports):** `/api/wifi/status` →
+>   `{connected:true, ssid:"Trez", signal:51, security:"WPA2 WPA3", ip:"10.0.0.224",
+>   iface:"wlan0"}`; networks list rendered 13 real APs active-first (Trez pinned,
+>   Saved+Connected+🔒), open AP shows no lock; Scan fired `POST /scan`→`GET /status`
+>   (all 200); **console 0/0** desktop-1280 + mobile-375. webd `NRestarts=0`,
+>   retentiond untouched (48669), SSH/WiFi/boot intact, dead-man cancelled. Evidence:
+>   `files/hw-results.md`, `files/wifi-phaseA-{desktop-1280,mobile-375}.png`.
+
 
 ### 4.14 Failed Jobs — `Requirements.md` §4.14
 

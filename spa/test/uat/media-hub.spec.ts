@@ -96,6 +96,44 @@ const GADGET_FIXTURE = {
   last_result: "done",
 };
 
+const WIFI_STATUS_FIXTURE = {
+  connected: true,
+  ssid: "Trez",
+  signal: 52,
+  security: "WPA2",
+  ip: "192.168.1.42",
+  iface: "wlan0",
+};
+
+const WIFI_NETWORKS_FIXTURE = {
+  networks: [
+    {
+      ssid: "Trez",
+      signal: 52,
+      security: "WPA2",
+      saved: true,
+      active: true,
+      protected: true,
+    },
+    {
+      ssid: "Garage-Guest",
+      signal: 74,
+      security: "",
+      saved: false,
+      active: false,
+      protected: false,
+    },
+    {
+      ssid: "Office",
+      signal: 63,
+      security: "WPA3",
+      saved: true,
+      active: false,
+      protected: false,
+    },
+  ],
+};
+
 /** Intercept the three device-status probes with deterministic fixtures so the
  *  functional-parity assertions are host-independent. Must be called BEFORE the
  *  navigation that triggers the screen's mount-time fetches. */
@@ -108,6 +146,16 @@ async function routeSystemProbes(page: Page) {
   await page.route("**/api/system/health", (r) => r.fulfill(json(HEALTH_FIXTURE)));
   await page.route("**/api/system/metrics", (r) => r.fulfill(json(METRICS_FIXTURE)));
   await page.route("**/api/storage/health", (r) => r.fulfill(json(STORAGE_FIXTURE)));
+}
+
+async function routeWifiProbes(page: Page) {
+  const json = (body: unknown) => ({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify(body),
+  });
+  await page.route("**/api/wifi/status", (r) => r.fulfill(json(WIFI_STATUS_FIXTURE)));
+  await page.route("**/api/wifi/networks", (r) => r.fulfill(json(WIFI_NETWORKS_FIXTURE)));
 }
 
 /** Mock gadgetd-present (200) for `/api/gadget/status`. gadgetd is not spawned
@@ -163,6 +211,7 @@ test.describe("settings dashboard UAT", () => {
       body: JSON.stringify(body),
     });
     await routeSystemProbes(page);
+    await routeWifiProbes(page);
     let mtick = 0;
     await page.route("**/api/system/metrics", (r) => {
       mtick += 1;
@@ -277,10 +326,20 @@ test.describe("settings dashboard UAT", () => {
       "Mounted (/run/teslausb/media-ro)",
     );
 
-    // WiFi + Access Point — degraded read-only copy (no nmcli/AP tooling).
-    await expect(page.locator("#savedNetworksList")).toContainText(
-      "Wi-Fi management is not available in the read-only catalog build.",
-    );
+    // WiFi Networks — read-only live data from the mocked probes.
+    await expect(page.locator("#wifi-current-connection")).toContainText("Trez");
+    await expect(page.locator("#wifi-current-connection")).toContainText("52%");
+    await expect(page.locator("#wifi-current-connection")).toContainText("Connected");
+    const wifiRows = page.locator("#wifi-networks-list .wifi-network-row");
+    await expect(wifiRows).toHaveCount(3);
+    await expect(wifiRows.nth(0)).toContainText("Trez");
+    await expect(wifiRows.nth(0)).toContainText("Saved");
+    await expect(wifiRows.nth(0)).toContainText("Connected");
+    await expect(wifiRows.nth(1)).toContainText("Garage-Guest");
+    await expect(wifiRows.nth(2)).toContainText("Office");
+    await expect(page.locator("#btnWifiScan")).toBeEnabled();
+
+    // Access Point remains degraded in this read-only slice.
     const ap = page.locator("details.settings-section", {
       has: page.locator("summary", { hasText: "Access Point" }),
     });
@@ -550,6 +609,11 @@ test.describe("settings dashboard UAT", () => {
     expect(
       apiSeen.has("/api/storage/health"),
       "/api/storage/health was never requested",
+    ).toBe(true);
+    expect(apiSeen.has("/api/wifi/status"), "/api/wifi/status was never requested").toBe(true);
+    expect(
+      apiSeen.has("/api/wifi/networks"),
+      "/api/wifi/networks was never requested",
     ).toBe(true);
 
     // ACTIVELY exercise the mutation surface: expand every section, then prove

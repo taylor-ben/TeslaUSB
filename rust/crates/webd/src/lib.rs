@@ -57,6 +57,7 @@ mod scheduler;
 mod sysinfo;
 mod stats_client;
 pub(crate) mod timezone;
+mod wifi;
 mod wraps;
 
 #[cfg(test)]

@@ -38,6 +38,8 @@ import type {
   Trip,
   TripDetail,
   TripsPageParams,
+  WifiNetworksResponse,
+  WifiStatus,
 } from "./types";
 import type { TelemetrySample } from "../player/telemetry";
 
@@ -251,6 +253,15 @@ export const api = {
 
   storageHealth: (signal?: AbortSignal) =>
     getJson<StorageHealth>("/api/storage/health", signal),
+
+  wifiStatus: (signal?: AbortSignal) =>
+    getJson<WifiStatus>("/api/wifi/status", signal),
+
+  wifiNetworks: (signal?: AbortSignal) =>
+    getJson<WifiNetworksResponse>("/api/wifi/networks", signal),
+
+  wifiScan: (signal?: AbortSignal) =>
+    request<WifiNetworksResponse>("POST", "/api/wifi/scan", signal),
 
   /**
    * Live USB-gadget state (`GET /api/gadget/status`) from gadgetd's control

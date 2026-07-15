@@ -8,6 +8,8 @@ import type {
   StorageHealth,
   SystemHealth,
   SystemMetrics,
+  WifiNetwork,
+  WifiStatus,
 } from "../api/types";
 
 /**
@@ -136,6 +138,17 @@ function formatUpdated(epoch: number | null | undefined): string {
   return new Date(epoch * 1000).toLocaleTimeString();
 }
 
+function isAbortError(err: unknown): boolean {
+  return err instanceof DOMException && err.name === "AbortError";
+}
+
+function wifiSignalBars(signal: number): string {
+  if (signal >= 75) return "▂▄▆█";
+  if (signal >= 50) return "▂▄▆";
+  if (signal >= 25) return "▂▄";
+  return "▂";
+}
+
 /** A used/total memory tile → `{value:"NN%", detail:"used / total"}`. */
 function memTile(
   m: { total_bytes: number; available_bytes: number; used_pct: number } | null,
@@ -202,6 +215,10 @@ export function MediaHub() {
   const [health, setHealth] = useState<SystemHealth | null>(null);
   const [metrics, setMetrics] = useState<SystemMetrics | null>(null);
   const [storage, setStorage] = useState<StorageHealth | null>(null);
+  const [wifiStatus, setWifiStatus] = useState<WifiStatus | null>(null);
+  const [wifiNetworks, setWifiNetworks] = useState<WifiNetwork[]>([]);
+  const [wifiLoading, setWifiLoading] = useState(true);
+  const [wifiScanLoading, setWifiScanLoading] = useState(false);
   const [gadget, setGadget] = useState<GadgetStatus | null>(null);
   const [gadgetUnavailable, setGadgetUnavailable] = useState(false);
   const [derived, setDerived] = useState<{
@@ -216,6 +233,7 @@ export function MediaHub() {
     write: number;
     at: number;
   } | null>(null);
+  const wifiScanCtrl = useRef<AbortController | null>(null);
 
   useEffect(() => {
     const ctrl = new AbortController();
@@ -265,6 +283,37 @@ export function MediaHub() {
       });
     return () => ctrl.abort();
   }, []);
+
+  useEffect(() => {
+    let active = true;
+    const ctrl = new AbortController();
+    setWifiLoading(true);
+    Promise.all([api.wifiStatus(ctrl.signal), api.wifiNetworks(ctrl.signal)])
+      .then(([status, networks]) => {
+        if (!active) return;
+        setWifiStatus(status);
+        setWifiNetworks(networks.networks);
+      })
+      .catch((err) => {
+        if (!active || isAbortError(err)) return;
+        setWifiStatus(null);
+        setWifiNetworks([]);
+      })
+      .finally(() => {
+        if (active) setWifiLoading(false);
+      });
+    return () => {
+      active = false;
+      ctrl.abort();
+    };
+  }, []);
+
+  useEffect(
+    () => () => {
+      wifiScanCtrl.current?.abort();
+    },
+    [],
+  );
 
   useEffect(() => {
     let active = true;
@@ -328,6 +377,31 @@ export function MediaHub() {
       ctrl?.abort();
     };
   }, []);
+
+  const onWifiScan = () => {
+    if (wifiScanLoading) return;
+    wifiScanCtrl.current?.abort();
+    const ctrl = new AbortController();
+    wifiScanCtrl.current = ctrl;
+    setWifiScanLoading(true);
+    api
+      .wifiScan(ctrl.signal)
+      .then((networks) => {
+        setWifiNetworks(networks.networks);
+        return api
+          .wifiStatus(ctrl.signal)
+          .then(setWifiStatus)
+          .catch((err) => {
+            if (!isAbortError(err)) setWifiStatus(null);
+          });
+      })
+      .catch((err) => {
+        if (!isAbortError(err)) setWifiNetworks([]);
+      })
+      .finally(() => {
+        if (!ctrl.signal.aborted) setWifiScanLoading(false);
+      });
+  };
 
   const overall = health?.overall ?? "unknown";
   const statusCopy = STATUS_COPY[overall] ?? STATUS_COPY.unknown;
@@ -527,8 +601,8 @@ export function MediaHub() {
           </div>
         </details>
 
-        {/* WiFi Networks — collapsed; inert (no live nmcli probe). */}
-        <details class="settings-section">
+        {/* WiFi Networks — read-only NetworkManager view (no join/disconnect). */}
+        <details class="settings-section" id="wifi-networks-section">
           <summary>WiFi Networks</summary>
           <div class="section-content">
             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
@@ -541,15 +615,83 @@ export function MediaHub() {
                 class="edit-btn"
                 id="btnWifiScan"
                 style="padding:4px 10px;font-size:0.85em;white-space:nowrap"
-                disabled
+                disabled={wifiLoading || wifiScanLoading}
+                onClick={onWifiScan}
               >
-                Scan
+                {wifiScanLoading ? "Scanning…" : "Scan"}
               </button>
             </div>
             <div id="savedNetworksList">
-              <div style="text-align:center;padding:12px;color:var(--text-secondary)">
-                Wi-Fi management is not available in the read-only catalog build.
-              </div>
+              {wifiLoading ? (
+                <div style="text-align:center;padding:12px;color:var(--text-secondary)">
+                  Loading Wi-Fi networks…
+                </div>
+              ) : (
+                <div style="display:flex;flex-direction:column;gap:8px">
+                  <div
+                    id="wifi-current-connection"
+                    style="display:flex;justify-content:space-between;align-items:center;padding:8px 10px;border:1px solid var(--border-color);border-radius:8px;background:var(--bg-secondary)"
+                  >
+                    <div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+                      <strong>{wifiStatus?.ssid ?? "Not connected"}</strong>
+                      {wifiStatus?.signal != null ? (
+                        <span style="margin-left:8px;color:var(--text-secondary);font-size:0.85em">
+                          {wifiSignalBars(wifiStatus.signal)} {wifiStatus.signal}%
+                        </span>
+                      ) : null}
+                    </div>
+                    {wifiStatus?.connected ? (
+                      <span
+                        style="font-size:0.75em;padding:2px 8px;border-radius:999px;background:var(--bg-secondary);border:1px solid var(--accent-success, #4caf50);color:var(--accent-success, #4caf50)"
+                      >
+                        Connected
+                      </span>
+                    ) : null}
+                  </div>
+                  {wifiNetworks.length > 0 ? (
+                    <div
+                      id="wifi-networks-list"
+                      style="display:flex;flex-direction:column;gap:6px"
+                    >
+                      {wifiNetworks.map((network) => (
+                        <div
+                          key={network.ssid}
+                          class="wifi-network-row"
+                          style="display:flex;align-items:center;gap:10px;padding:8px 10px;border:1px solid var(--border-color);border-radius:8px"
+                        >
+                          <div style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+                            {network.ssid}
+                          </div>
+                          <div style="font-size:0.85em;color:var(--text-secondary);white-space:nowrap">
+                            {wifiSignalBars(network.signal)} {network.signal}%
+                          </div>
+                          <div style="display:flex;align-items:center;gap:6px;white-space:nowrap">
+                            {network.security ? <span aria-label="Secured">🔒</span> : null}
+                            {network.saved ? (
+                              <span
+                                style="font-size:0.75em;padding:2px 8px;border-radius:999px;background:var(--bg-secondary);border:1px solid var(--border-color);color:var(--text-secondary)"
+                              >
+                                Saved
+                              </span>
+                            ) : null}
+                            {network.active ? (
+                              <span
+                                style="font-size:0.75em;padding:2px 8px;border-radius:999px;background:var(--bg-secondary);border:1px solid var(--accent-success, #4caf50);color:var(--accent-success, #4caf50)"
+                              >
+                                Connected
+                              </span>
+                            ) : null}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div style="text-align:center;padding:12px;color:var(--text-secondary)">
+                      No nearby Wi-Fi networks found.
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           </div>
         </details>

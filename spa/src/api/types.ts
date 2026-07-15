@@ -239,6 +239,31 @@ export interface SystemMetrics {
   updated_at: number | null;
 }
 
+/** `GET /api/wifi/status`. */
+export interface WifiStatus {
+  connected: boolean;
+  ssid: string | null;
+  signal: number | null;
+  security: string | null;
+  ip: string | null;
+  iface: string | null;
+}
+
+/** One discovered Wi-Fi network (`GET /api/wifi/networks`). */
+export interface WifiNetwork {
+  ssid: string;
+  signal: number;
+  security: string;
+  saved: boolean;
+  active: boolean;
+  protected: boolean;
+}
+
+/** `GET /api/wifi/networks` and `POST /api/wifi/scan`. */
+export interface WifiNetworksResponse {
+  networks: WifiNetwork[];
+}
+
 /** One filesystem of `GET /api/storage`. */
 export interface FilesystemEntry {
   mount: string;

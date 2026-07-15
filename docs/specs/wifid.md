@@ -65,3 +65,42 @@ under the deadlock threshold; gate any reboot on USB-idle.
 policy.
 **NEVER** run AP+STA concurrently; never reboot the Pi while the car is writing;
 never let WiFi recovery endanger the write path.
+
+## 7. Network management & `webd` integration (revised 2026-07-15)
+
+> Reconciles the spec with the device reality: on the shipped image **NetworkManager**
+> (seeded by **netplan**) owns `wlan0` and the home-STA profile (`netplan-wlan0-<ssid>`),
+> **not** `wifid`. `wifid` runs as the AP-safety / throttle / watchdog arbiter and only
+> brings pre-provisioned profiles up/down — it deliberately never *creates* a profile and
+> never passes a PSK on a command line (see `src/nmcli.rs` module docs). The §4.13
+> scan / saved-list / join / forget surface therefore matches NM's model, not `wifid`'s
+> single-PSK model. (Second-opinion reconciled with GPT-5.5; see `files/hw-results.md`.)
+
+### 7.1 Authority
+- **NetworkManager is authoritative** for STA saved profiles, scan results, and the active
+  connection. UI-created networks live in NM's root-only connection store — **not** written
+  to netplan and **not** stored in `wifid`'s credential file.
+- **`wifid` owns** the AP passphrase, the TX throttle, the SDIO watchdog, and STA↔AP
+  arbitration (never both at once). For Phase B it must treat *any* active NM Wi-Fi
+  connection on the Wi-Fi interface as "STA is up", not only its configured `sta_profile`
+  name (today it matches only `teslausb-sta` + its own cred store, so it does not recognise
+  the live netplan STA — this must be reconciled before any mutation ships).
+- **`webd` never reads secrets.** Join passphrases are one-way writes (SPA → webd → NM);
+  never read back, logged, or surfaced in status.
+
+### 7.2 `webd` `/api/wifi/*` contract
+- **Phase A (read-only — no lock-out risk):**
+  - `GET /api/wifi/status` → `{ connected, ssid, signal, security, ip, iface }` (active connection).
+  - `GET /api/wifi/networks` → `{ networks: [{ ssid, signal, security, saved, active }] }`
+    (merged scan + saved; externally-owned `netplan-*` profiles flagged so Phase B can protect them).
+  - `POST /api/wifi/scan` → trigger a **rate-limited** NM rescan (safe while associated), return the refreshed list.
+  - Implemented by read-only `nmcli` shell-out in `webd` (`src/wifi.rs`) with tolerant pure
+    parsers + unit tests, mirroring `wifid/src/nmcli.rs`; **`wifid` untouched in Phase A**.
+- **Phase B (mutating — join / disconnect / forget):** guarded, and gated on a `wifid`
+  **management lease** so a mutation cannot race AP-fallback. Requires: POST-only +
+  same-origin/CSRF protection; never mutate the active / `netplan-*` profile in place;
+  snapshot the known-good profile and auto-rollback (NM checkpoint) on failure or
+  unconfirmed reachability; typed confirmation to forget/disconnect the active network;
+  PSKs set via a root-only NM keyfile / D-Bus, **never** an `nmcli … password …` argv.
+  *(Full contract finalised when Phase B is implemented.)*
+- **Phase C:** setup AP + captive portal (Apple/Android/Windows/generic) + auto-restore timer.
