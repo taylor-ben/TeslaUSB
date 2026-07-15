@@ -251,12 +251,30 @@ export interface UsbVolumeInfo {
   stable: boolean;
 }
 
-/** `GET /api/storage`. `governor` is null until retentiond is wired in. */
+/** Live retention-governor headroom (`retentiond.governor.json`, schema 1).
+ *  Null when the governor is not reporting (file absent/inert). */
+export interface GovernorInfo {
+  schema: number;
+  updated_at: number;
+  /** "armed" (real deletion) | "dryrun" (projection only). */
+  mode: string;
+  drain_only: boolean;
+  free_bytes: number;
+  total_bytes: number;
+  target_free_frac: number;
+  target_exit_frac: number;
+  recency_floor_secs: number;
+  last_stop: string;
+  last_bytes_freed: number;
+  last_items: number;
+}
+
+/** `GET /api/storage`. */
 export interface StorageInfo {
   filesystems: FilesystemEntry[];
   /** The two USB drives (TESLACAM + MEDIA); empty on an older webd. */
   volumes: UsbVolumeInfo[];
-  governor: unknown | null;
+  governor: GovernorInfo | null;
 }
 
 /** `GET /api/storage/health`. Wear telemetry is null (SD cards expose none). */

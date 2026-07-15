@@ -37,7 +37,9 @@ pub struct RecoveryRow {
     pub delete_gen: Option<String>,
 }
 
-/// List oldest-first deletion candidates from the strict hard-delete allowlist.
+/// List strict hard-delete allowlist candidates with value-tiered ordering:
+/// confirmed parked junk first, then SEI/GPS footage, with event footage last.
+/// Eligibility gates are unchanged.
 ///
 /// # Errors
 ///
@@ -61,6 +63,7 @@ pub fn list_eviction_candidates(
            FROM archive_items AS ai
            JOIN archive_item_clips AS aic ON aic.archive_item_id = ai.id
            JOIN clips AS c ON c.id = aic.clip_id
+           LEFT JOIN front_parse_attempts AS fpa ON fpa.canonical_key = c.canonical_key
           WHERE ai.delete_state = 'LIVE'
             AND (ai.durable = 1 OR ?3 = 1)
             AND ai.pinned = 0
@@ -71,7 +74,13 @@ pub fn list_eviction_candidates(
             AND MAX(c.is_sentry) = 0
             AND MIN(CASE WHEN c.started_at > 0 THEN 1 ELSE 0 END) = 1
             AND MAX(c.started_at) < ?1
-          ORDER BY MIN(c.started_at) ASC, ai.id ASC
+          ORDER BY
+            (CASE
+               WHEN MAX(CASE WHEN EXISTS(SELECT 1 FROM events e WHERE e.clip_id = c.id) THEN 1 ELSE 0 END) = 1 THEN 2
+               WHEN MIN(CASE WHEN fpa.parse_state = 'no_waypoints' THEN 1 ELSE 0 END) = 1 THEN 0
+               ELSE 1
+             END) ASC,
+            MIN(c.started_at) ASC, ai.id ASC
           LIMIT ?4",
     )?;
     let rows = stmt.query_map(
@@ -178,7 +187,7 @@ mod tests {
         canonical_key: &str,
         started_at: i64,
         folder_class: &str,
-    ) {
+    ) -> i64 {
         conn.execute(
             "INSERT INTO clips (canonical_key, started_at, partition, folder_class, created_at, updated_at)
              VALUES (?1, ?2, 'p', ?3, 0, 0)",
@@ -191,11 +200,12 @@ mod tests {
             params![archive_item_id, clip_id],
         )
         .expect("insert archive-item clip link");
+        clip_id
     }
 
     fn insert_archive_item(conn: &Connection, seed: &ArchiveSeed<'_>) -> i64 {
         let archive_item_id = insert_archive_item_unlinked(conn, seed);
-        insert_linked_clip(
+        let _ = insert_linked_clip(
             conn,
             archive_item_id,
             &format!("clip:{}", seed.path),
@@ -203,6 +213,28 @@ mod tests {
             seed.folder_class,
         );
         archive_item_id
+    }
+
+    fn insert_front_parse_attempt(conn: &Connection, canonical_key: &str, parse_state: &str) {
+        conn.execute(
+            "INSERT INTO front_parse_attempts
+                (canonical_key, parse_state, parse_fingerprint, parser_version,
+                 attempt_count, next_retry_at, attempted_at, updated_at)
+             VALUES (?1, ?2, NULL, NULL, 1, NULL, 0, 0)",
+            params![canonical_key, parse_state],
+        )
+        .expect("insert front parse attempt");
+    }
+
+    fn insert_event_row(conn: &Connection, id: i64, clip_id: i64, t: i64) {
+        conn.execute(
+            "INSERT INTO events
+                (id, trip_id, clip_id, type, severity, t, lat, lon,
+                 front_frame_offset, front_frame_index, description, created_at)
+             VALUES (?1, NULL, ?2, 'sharp_turn', 2, ?3, NULL, NULL, NULL, NULL, 'test event', 0)",
+            params![id, clip_id, t],
+        )
+        .expect("insert event");
     }
 
     fn seed_eviction_candidate_mix(conn: &Connection) -> (i64, i64) {
@@ -563,6 +595,526 @@ mod tests {
 
         let rows = list_eviction_candidates(&conn, 1_000, 1_000, false, 100).expect("query");
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn orders_confirmed_parked_before_sei_before_event() {
+        let conn = open_in_memory().expect("open db");
+
+        let item_a = insert_archive_item_unlinked(
+            &conn,
+            &ArchiveSeed {
+                folder_class: "RecentClips",
+                path: "archive/tier0-newest",
+                size_bytes: 1_000,
+                archived_at: 9_000,
+                delete_state: "LIVE",
+                durable: 1,
+                pinned: 0,
+                suppress_until: None,
+                delete_gen: None,
+            },
+        );
+        let key_a = "clip:tier0-newest";
+        let _ = insert_linked_clip(&conn, item_a, key_a, 9_000, "RecentClips");
+        insert_front_parse_attempt(&conn, key_a, "no_waypoints");
+
+        let item_b = insert_archive_item_unlinked(
+            &conn,
+            &ArchiveSeed {
+                folder_class: "RecentClips",
+                path: "archive/tier1-middle",
+                size_bytes: 1_000,
+                archived_at: 5_000,
+                delete_state: "LIVE",
+                durable: 1,
+                pinned: 0,
+                suppress_until: None,
+                delete_gen: None,
+            },
+        );
+        let key_b = "clip:tier1-middle";
+        let _ = insert_linked_clip(&conn, item_b, key_b, 5_000, "RecentClips");
+        insert_front_parse_attempt(&conn, key_b, "parsed_with_waypoints");
+
+        let item_c = insert_archive_item_unlinked(
+            &conn,
+            &ArchiveSeed {
+                folder_class: "RecentClips",
+                path: "archive/tier2-oldest",
+                size_bytes: 1_000,
+                archived_at: 1_000,
+                delete_state: "LIVE",
+                durable: 1,
+                pinned: 0,
+                suppress_until: None,
+                delete_gen: None,
+            },
+        );
+        let key_c = "clip:tier2-oldest";
+        let clip_c = insert_linked_clip(&conn, item_c, key_c, 1_000, "RecentClips");
+        insert_front_parse_attempt(&conn, key_c, "parsed_with_waypoints");
+        insert_event_row(&conn, 1, clip_c, 1_000);
+
+        let rows = list_eviction_candidates(&conn, 10_000, 10_000, false, 100).expect("query");
+        let ids: Vec<i64> = rows.iter().map(|row| row.id).collect();
+        assert_eq!(ids, vec![item_a, item_b, item_c]);
+    }
+
+    #[test]
+    fn within_tier_oldest_first() {
+        let conn = open_in_memory().expect("open db");
+        let old_item = insert_archive_item_unlinked(
+            &conn,
+            &ArchiveSeed {
+                folder_class: "RecentClips",
+                path: "archive/tier0-old",
+                size_bytes: 1_000,
+                archived_at: 1_000,
+                delete_state: "LIVE",
+                durable: 1,
+                pinned: 0,
+                suppress_until: None,
+                delete_gen: None,
+            },
+        );
+        let new_item = insert_archive_item_unlinked(
+            &conn,
+            &ArchiveSeed {
+                folder_class: "RecentClips",
+                path: "archive/tier0-new",
+                size_bytes: 1_000,
+                archived_at: 2_000,
+                delete_state: "LIVE",
+                durable: 1,
+                pinned: 0,
+                suppress_until: None,
+                delete_gen: None,
+            },
+        );
+        let key_old = "clip:tier0-old";
+        let key_new = "clip:tier0-new";
+        let _ = insert_linked_clip(&conn, old_item, key_old, 1_000, "RecentClips");
+        let _ = insert_linked_clip(&conn, new_item, key_new, 2_000, "RecentClips");
+        insert_front_parse_attempt(&conn, key_old, "no_waypoints");
+        insert_front_parse_attempt(&conn, key_new, "no_waypoints");
+
+        let rows = list_eviction_candidates(&conn, 10_000, 10_000, false, 100).expect("query");
+        let ids: Vec<i64> = rows.iter().map(|row| row.id).collect();
+        assert_eq!(ids, vec![old_item, new_item]);
+    }
+
+    #[test]
+    fn parsed_with_waypoints_never_tier0() {
+        let conn = open_in_memory().expect("open db");
+        let tier1_old = insert_archive_item_unlinked(
+            &conn,
+            &ArchiveSeed {
+                folder_class: "RecentClips",
+                path: "archive/tier1-old",
+                size_bytes: 1_000,
+                archived_at: 1_000,
+                delete_state: "LIVE",
+                durable: 1,
+                pinned: 0,
+                suppress_until: None,
+                delete_gen: None,
+            },
+        );
+        let tier0_new = insert_archive_item_unlinked(
+            &conn,
+            &ArchiveSeed {
+                folder_class: "RecentClips",
+                path: "archive/tier0-newer",
+                size_bytes: 1_000,
+                archived_at: 9_000,
+                delete_state: "LIVE",
+                durable: 1,
+                pinned: 0,
+                suppress_until: None,
+                delete_gen: None,
+            },
+        );
+        let key_tier1 = "clip:tier1-old";
+        let key_tier0 = "clip:tier0-newer";
+        let _ = insert_linked_clip(&conn, tier1_old, key_tier1, 1_000, "RecentClips");
+        let _ = insert_linked_clip(&conn, tier0_new, key_tier0, 9_000, "RecentClips");
+        insert_front_parse_attempt(&conn, key_tier1, "parsed_with_waypoints");
+        insert_front_parse_attempt(&conn, key_tier0, "no_waypoints");
+
+        let rows = list_eviction_candidates(&conn, 10_000, 10_000, false, 100).expect("query");
+        let ids: Vec<i64> = rows.iter().map(|row| row.id).collect();
+        assert_eq!(ids, vec![tier0_new, tier1_old]);
+    }
+
+    #[test]
+    fn unparsed_clip_not_treated_as_parked() {
+        let conn = open_in_memory().expect("open db");
+        let unparsed = insert_archive_item_unlinked(
+            &conn,
+            &ArchiveSeed {
+                folder_class: "RecentClips",
+                path: "archive/unparsed",
+                size_bytes: 1_000,
+                archived_at: 1_000,
+                delete_state: "LIVE",
+                durable: 1,
+                pinned: 0,
+                suppress_until: None,
+                delete_gen: None,
+            },
+        );
+        let parked = insert_archive_item_unlinked(
+            &conn,
+            &ArchiveSeed {
+                folder_class: "RecentClips",
+                path: "archive/parked",
+                size_bytes: 1_000,
+                archived_at: 9_000,
+                delete_state: "LIVE",
+                durable: 1,
+                pinned: 0,
+                suppress_until: None,
+                delete_gen: None,
+            },
+        );
+        let _ = insert_linked_clip(&conn, unparsed, "clip:unparsed", 1_000, "RecentClips");
+        let _ = insert_linked_clip(&conn, parked, "clip:parked", 9_000, "RecentClips");
+        insert_front_parse_attempt(&conn, "clip:parked", "no_waypoints");
+
+        let rows = list_eviction_candidates(&conn, 10_000, 10_000, false, 100).expect("query");
+        let ids: Vec<i64> = rows.iter().map(|row| row.id).collect();
+        assert_eq!(ids, vec![parked, unparsed]);
+    }
+
+    #[test]
+    fn left_join_does_not_change_candidate_set() {
+        let conn = open_in_memory().expect("open db");
+        let first = insert_archive_item_unlinked(
+            &conn,
+            &ArchiveSeed {
+                folder_class: "RecentClips",
+                path: "archive/candidate-first",
+                size_bytes: 1_000,
+                archived_at: 1_000,
+                delete_state: "LIVE",
+                durable: 1,
+                pinned: 0,
+                suppress_until: None,
+                delete_gen: None,
+            },
+        );
+        let second = insert_archive_item_unlinked(
+            &conn,
+            &ArchiveSeed {
+                folder_class: "RecentClips",
+                path: "archive/candidate-second",
+                size_bytes: 1_000,
+                archived_at: 2_000,
+                delete_state: "LIVE",
+                durable: 1,
+                pinned: 0,
+                suppress_until: None,
+                delete_gen: None,
+            },
+        );
+        let third = insert_archive_item_unlinked(
+            &conn,
+            &ArchiveSeed {
+                folder_class: "RecentClips",
+                path: "archive/candidate-third",
+                size_bytes: 1_000,
+                archived_at: 3_000,
+                delete_state: "LIVE",
+                durable: 1,
+                pinned: 0,
+                suppress_until: None,
+                delete_gen: None,
+            },
+        );
+        let _ = insert_linked_clip(&conn, first, "clip:candidate-first", 1_000, "RecentClips");
+        let _ = insert_linked_clip(&conn, second, "clip:candidate-second", 2_000, "RecentClips");
+        let _ = insert_linked_clip(&conn, third, "clip:candidate-third", 3_000, "RecentClips");
+
+        let before = list_eviction_candidates(&conn, 10_000, 10_000, false, 100).expect("query");
+        let mut before_ids: Vec<i64> = before.iter().map(|row| row.id).collect();
+        before_ids.sort_unstable();
+
+        insert_front_parse_attempt(&conn, "clip:candidate-first", "no_waypoints");
+        insert_front_parse_attempt(&conn, "clip:candidate-second", "parsed_with_waypoints");
+        insert_front_parse_attempt(&conn, "clip:candidate-third", "legacy_unknown");
+
+        let after = list_eviction_candidates(&conn, 10_000, 10_000, false, 100).expect("query");
+        let mut after_ids: Vec<i64> = after.iter().map(|row| row.id).collect();
+        after_ids.sort_unstable();
+
+        assert_eq!(before_ids.len(), after_ids.len());
+        assert_eq!(before_ids, after_ids);
+    }
+
+    #[test]
+    fn multiclip_mixed_item_not_tier0() {
+        let conn = open_in_memory().expect("open db");
+        let mixed_item = insert_archive_item_unlinked(
+            &conn,
+            &ArchiveSeed {
+                folder_class: "RecentClips",
+                path: "archive/mixed-tier1",
+                size_bytes: 1_000,
+                archived_at: 2_000,
+                delete_state: "LIVE",
+                durable: 1,
+                pinned: 0,
+                suppress_until: None,
+                delete_gen: None,
+            },
+        );
+        let mixed_a = "clip:mixed-no-waypoints";
+        let mixed_b = "clip:mixed-parsed";
+        let _ = insert_linked_clip(&conn, mixed_item, mixed_a, 2_000, "RecentClips");
+        let _ = insert_linked_clip(&conn, mixed_item, mixed_b, 2_100, "RecentClips");
+        insert_front_parse_attempt(&conn, mixed_a, "no_waypoints");
+        insert_front_parse_attempt(&conn, mixed_b, "parsed_with_waypoints");
+
+        let event_item = insert_archive_item_unlinked(
+            &conn,
+            &ArchiveSeed {
+                folder_class: "RecentClips",
+                path: "archive/event-tier2",
+                size_bytes: 1_000,
+                archived_at: 1_000,
+                delete_state: "LIVE",
+                durable: 1,
+                pinned: 0,
+                suppress_until: None,
+                delete_gen: None,
+            },
+        );
+        let event_key = "clip:event-tier2";
+        let event_clip = insert_linked_clip(&conn, event_item, event_key, 1_000, "RecentClips");
+        insert_front_parse_attempt(&conn, event_key, "parsed_with_waypoints");
+        insert_event_row(&conn, 1, event_clip, 1_000);
+
+        let rows = list_eviction_candidates(&conn, 10_000, 10_000, false, 100).expect("query");
+        let ids: Vec<i64> = rows.iter().map(|row| row.id).collect();
+        assert_eq!(ids, vec![mixed_item, event_item]);
+    }
+
+    #[test]
+    fn event_tier_dominates_no_waypoints() {
+        // An item whose clip is `no_waypoints` but ALSO carries an event must
+        // sort as tier 2 (event wins), never tier 0. Guards the CASE priority
+        // (event checked before no_waypoints). This clip state cannot occur in
+        // production (events are SEI-derived) but locks the ordering rule.
+        let conn = open_in_memory().expect("open db");
+        let junk = insert_archive_item_unlinked(
+            &conn,
+            &ArchiveSeed {
+                folder_class: "RecentClips",
+                path: "archive/junk-newer",
+                size_bytes: 1_000,
+                archived_at: 9_000,
+                delete_state: "LIVE",
+                durable: 1,
+                pinned: 0,
+                suppress_until: None,
+                delete_gen: None,
+            },
+        );
+        let _ = insert_linked_clip(&conn, junk, "clip:junk-newer", 9_000, "RecentClips");
+        insert_front_parse_attempt(&conn, "clip:junk-newer", "no_waypoints");
+
+        let event_nw = insert_archive_item_unlinked(
+            &conn,
+            &ArchiveSeed {
+                folder_class: "RecentClips",
+                path: "archive/event-no-waypoints-older",
+                size_bytes: 1_000,
+                archived_at: 1_000,
+                delete_state: "LIVE",
+                durable: 1,
+                pinned: 0,
+                suppress_until: None,
+                delete_gen: None,
+            },
+        );
+        let event_clip =
+            insert_linked_clip(&conn, event_nw, "clip:event-nw-older", 1_000, "RecentClips");
+        insert_front_parse_attempt(&conn, "clip:event-nw-older", "no_waypoints");
+        insert_event_row(&conn, 1, event_clip, 1_000);
+
+        let rows = list_eviction_candidates(&conn, 10_000, 10_000, false, 100).expect("query");
+        let ids: Vec<i64> = rows.iter().map(|row| row.id).collect();
+        // junk is tier 0 (deleted first) despite being newer; the event item is
+        // tier 2 (deleted last) even though its clip is also no_waypoints.
+        assert_eq!(ids, vec![junk, event_nw]);
+    }
+
+    #[test]
+    fn mixed_item_not_tier0_with_pure_sentinel() {
+        // A multi-clip item mixing a no_waypoints clip with a parsed clip is
+        // tier 1 (MIN==all), so a genuine pure-tier0 item — even if NEWER — must
+        // be deleted before it. Fails if the tier used MAX (any) instead of MIN
+        // (all) for the no_waypoints test.
+        let conn = open_in_memory().expect("open db");
+        let pure_junk = insert_archive_item_unlinked(
+            &conn,
+            &ArchiveSeed {
+                folder_class: "RecentClips",
+                path: "archive/pure-junk-newest",
+                size_bytes: 1_000,
+                archived_at: 9_000,
+                delete_state: "LIVE",
+                durable: 1,
+                pinned: 0,
+                suppress_until: None,
+                delete_gen: None,
+            },
+        );
+        let _ = insert_linked_clip(&conn, pure_junk, "clip:pure-junk-newest", 9_000, "RecentClips");
+        insert_front_parse_attempt(&conn, "clip:pure-junk-newest", "no_waypoints");
+
+        let mixed = insert_archive_item_unlinked(
+            &conn,
+            &ArchiveSeed {
+                folder_class: "RecentClips",
+                path: "archive/mixed-middle",
+                size_bytes: 1_000,
+                archived_at: 2_000,
+                delete_state: "LIVE",
+                durable: 1,
+                pinned: 0,
+                suppress_until: None,
+                delete_gen: None,
+            },
+        );
+        let _ = insert_linked_clip(&conn, mixed, "clip:mixed-nw", 2_000, "RecentClips");
+        let _ = insert_linked_clip(&conn, mixed, "clip:mixed-parsed", 2_100, "RecentClips");
+        insert_front_parse_attempt(&conn, "clip:mixed-nw", "no_waypoints");
+        insert_front_parse_attempt(&conn, "clip:mixed-parsed", "parsed_with_waypoints");
+
+        let event = insert_archive_item_unlinked(
+            &conn,
+            &ArchiveSeed {
+                folder_class: "RecentClips",
+                path: "archive/event-oldest",
+                size_bytes: 1_000,
+                archived_at: 1_000,
+                delete_state: "LIVE",
+                durable: 1,
+                pinned: 0,
+                suppress_until: None,
+                delete_gen: None,
+            },
+        );
+        let event_clip =
+            insert_linked_clip(&conn, event, "clip:event-oldest", 1_000, "RecentClips");
+        insert_front_parse_attempt(&conn, "clip:event-oldest", "parsed_with_waypoints");
+        insert_event_row(&conn, 1, event_clip, 1_000);
+
+        let rows = list_eviction_candidates(&conn, 10_000, 10_000, false, 100).expect("query");
+        let ids: Vec<i64> = rows.iter().map(|row| row.id).collect();
+        assert_eq!(ids, vec![pure_junk, mixed, event]);
+    }
+
+    #[test]
+    fn equal_tier_equal_start_orders_by_ai_id() {
+        // Two tier-0 items with identical started_at fall back to ai.id ASC for
+        // deterministic paging/claim ordering.
+        let conn = open_in_memory().expect("open db");
+        let lower = insert_archive_item_unlinked(
+            &conn,
+            &ArchiveSeed {
+                folder_class: "RecentClips",
+                path: "archive/tie-lower",
+                size_bytes: 1_000,
+                archived_at: 5_000,
+                delete_state: "LIVE",
+                durable: 1,
+                pinned: 0,
+                suppress_until: None,
+                delete_gen: None,
+            },
+        );
+        let higher = insert_archive_item_unlinked(
+            &conn,
+            &ArchiveSeed {
+                folder_class: "RecentClips",
+                path: "archive/tie-higher",
+                size_bytes: 1_000,
+                archived_at: 5_000,
+                delete_state: "LIVE",
+                durable: 1,
+                pinned: 0,
+                suppress_until: None,
+                delete_gen: None,
+            },
+        );
+        let _ = insert_linked_clip(&conn, lower, "clip:tie-lower", 5_000, "RecentClips");
+        let _ = insert_linked_clip(&conn, higher, "clip:tie-higher", 5_000, "RecentClips");
+        insert_front_parse_attempt(&conn, "clip:tie-lower", "no_waypoints");
+        insert_front_parse_attempt(&conn, "clip:tie-higher", "no_waypoints");
+
+        let rows = list_eviction_candidates(&conn, 10_000, 10_000, false, 100).expect("query");
+        let ids: Vec<i64> = rows.iter().map(|row| row.id).collect();
+        assert!(lower < higher, "insertion order should yield ascending ids");
+        assert_eq!(ids, vec![lower, higher]);
+    }
+
+    #[test]
+    fn expanded_grace_allows_recent_but_not_within_grace() {
+        let conn = open_in_memory().expect("open db");
+        let now = 20_000;
+        let recency_floor = now - 3_600;
+
+        let outside_grace = insert_archive_item_unlinked(
+            &conn,
+            &ArchiveSeed {
+                folder_class: "RecentClips",
+                path: "archive/outside-grace",
+                size_bytes: 1_000,
+                archived_at: now - 7_200,
+                delete_state: "LIVE",
+                durable: 1,
+                pinned: 0,
+                suppress_until: None,
+                delete_gen: None,
+            },
+        );
+        let inside_grace = insert_archive_item_unlinked(
+            &conn,
+            &ArchiveSeed {
+                folder_class: "RecentClips",
+                path: "archive/inside-grace",
+                size_bytes: 1_000,
+                archived_at: now - 1_800,
+                delete_state: "LIVE",
+                durable: 1,
+                pinned: 0,
+                suppress_until: None,
+                delete_gen: None,
+            },
+        );
+
+        let _ = insert_linked_clip(
+            &conn,
+            outside_grace,
+            "clip:outside-grace",
+            now - 7_200,
+            "RecentClips",
+        );
+        let _ = insert_linked_clip(
+            &conn,
+            inside_grace,
+            "clip:inside-grace",
+            now - 1_800,
+            "RecentClips",
+        );
+
+        let rows =
+            list_eviction_candidates(&conn, recency_floor, now, false, 100).expect("query");
+        let ids: Vec<i64> = rows.iter().map(|row| row.id).collect();
+        assert_eq!(ids, vec![outside_grace]);
     }
 
     #[test]

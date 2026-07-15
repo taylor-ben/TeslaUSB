@@ -34,6 +34,11 @@ const DISK_OK_FRAC: f64 = 0.15;
 const DISK_WARN_FRAC: f64 = 0.05;
 /// Bytes in one GiB, used for human-readable size messages.
 const GIB: f64 = (1u64 << 30) as f64;
+/// A healthy governor rewrites roughly every ~20s; 1h bounds stale "armed"
+/// state without false positives on a live daemon.
+const GOVERNOR_MAX_AGE_SECS: i64 = 3600;
+/// Tolerated positive clock skew when validating governor timestamps.
+const GOVERNOR_MAX_SKEW_SECS: i64 = 300;
 
 /// Severity ladder shared by every health block; the string form matches the
 /// SPA's `SEV_COLORS` keys (`ok|warn|error|unknown`).
@@ -152,6 +157,8 @@ pub struct SysPaths {
     pub worker_health_file: PathBuf,
     /// `indexd` heartbeat path.
     pub indexer_health_file: PathBuf,
+    /// Retention governor status file (`retentiond.governor.json`).
+    pub governor_status_file: PathBuf,
     /// Read-only mount of the MEDIA exFAT volume.
     pub media_ro_mount: PathBuf,
 }
@@ -296,16 +303,35 @@ pub struct UsbVolumeDto {
 }
 
 /// `GET /api/storage`: the filesystems `webd` can `statvfs` directly. The
-/// governor tier is owned by `retentiond`; while that service is not wired in,
-/// `governor` is `null` (not fabricated).
+/// governor tier is owned by `retentiond`; unreadable/invalid status degrades
+/// to `governor: null` (not fabricated).
 #[derive(Debug, Serialize)]
 pub struct Storage {
     /// The probed filesystems (root + the data/archive root).
     pub filesystems: Vec<FilesystemDto>,
     /// TESLACAM + MEDIA logical volumes.
     pub volumes: Vec<UsbVolumeDto>,
-    /// Reserved for the `retentiond` governor tier; currently always `null`.
+    /// `retentiond` governor status when available and schema-valid.
     pub governor: Option<serde_json::Value>,
+}
+
+/// Mirror of retentiond's `retentiond.governor.json` (schema 1). Parsed then
+/// re-serialized into `Storage.governor` so the SPA gets a validated, typed
+/// object (garbage/absent file → `governor: None`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct GovernorDto {
+    schema: u32,
+    updated_at: i64,
+    mode: String,
+    drain_only: bool,
+    free_bytes: u64,
+    total_bytes: u64,
+    target_free_frac: f64,
+    target_exit_frac: f64,
+    recency_floor_secs: i64,
+    last_stop: String,
+    last_bytes_freed: u64,
+    last_items: u64,
 }
 
 /// `GET /api/storage/health`: the data filesystem's capacity plus the
@@ -370,12 +396,37 @@ fn classify_frac(frac: f64) -> Severity {
     }
 }
 
+/// Classify the archive volume's free fraction. When the retention governor is
+/// ARMED the archive is a space-bounded ring buffer intentionally held near
+/// `target_free_frac`, so free >= that target is healthy; below it the governor
+/// is falling behind (warn), and below the hard danger floor recording loss is
+/// imminent (error). Without an armed governor, fall back to generic capacity
+/// thresholds.
+fn classify_archive_frac(frac: f64, gov: Option<&GovernorDto>) -> Severity {
+    match gov {
+        Some(g) if g.mode == "armed" => {
+            if frac >= g.target_free_frac {
+                Severity::Ok
+            } else if frac >= DISK_WARN_FRAC {
+                Severity::Warn
+            } else {
+                Severity::Error
+            }
+        }
+        _ => classify_frac(frac),
+    }
+}
+
 /// Build the `disk` (SD Card) block from a `statvfs` of the data root.
-fn disk_block(probe: &dyn SystemProbe, root: &Path) -> (Severity, HealthBlock) {
+fn disk_block(
+    probe: &dyn SystemProbe,
+    root: &Path,
+    gov: Option<&GovernorDto>,
+) -> (Severity, HealthBlock) {
     match probe.statvfs(root) {
         Some(fs) => {
             let frac = fs.free_frac();
-            let sev = classify_frac(frac);
+            let sev = classify_archive_frac(frac, gov);
             let msg = format!(
                 "{} free of {} ({:.0}%)",
                 human_gb(fs.free_bytes),
@@ -528,13 +579,14 @@ fn indexer_block(raw: Option<String>, now: i64) -> HealthBlock {
 #[must_use]
 pub fn system_health(probe: &dyn SystemProbe, paths: &SysPaths, now: i64) -> SystemHealth {
     let root = paths.archive_root.as_path();
+    let gov = read_governor_dto(probe, paths);
     let worker = worker_block(probe.read_file_string(&paths.worker_health_file), now);
     let indexer = indexer_block(probe.read_file_string(&paths.indexer_health_file), now);
     let blocks = [
         ("gadget", gadget_block(probe)),
         ("worker", (severity_from_wire(worker.severity), worker)),
         ("indexer", (severity_from_wire(indexer.severity), indexer)),
-        ("disk", disk_block(probe, root)),
+        ("disk", disk_block(probe, root, gov.as_ref())),
         ("storage_writable", writable_block(probe, root)),
     ];
 
@@ -687,6 +739,52 @@ fn filesystem_dto(probe: &dyn SystemProbe, path: &Path) -> Option<FilesystemDto>
     })
 }
 
+fn validate_governor(dto: GovernorDto, now: i64) -> Option<GovernorDto> {
+    if dto.schema != 1 {
+        return None;
+    }
+    let age = now.saturating_sub(dto.updated_at);
+    if age > GOVERNOR_MAX_AGE_SECS {
+        return None;
+    }
+    if age < -GOVERNOR_MAX_SKEW_SECS {
+        return None;
+    }
+    if dto.mode != "armed" && dto.mode != "dryrun" {
+        return None;
+    }
+    if dto.total_bytes == 0 || dto.free_bytes > dto.total_bytes {
+        return None;
+    }
+    if !(dto.target_free_frac > 0.0 && dto.target_free_frac <= 1.0) {
+        return None;
+    }
+    if !(dto.target_exit_frac > 0.0 && dto.target_exit_frac <= 1.0) {
+        return None;
+    }
+    if dto.recency_floor_secs < 0 {
+        return None;
+    }
+    if dto.last_stop.is_empty() {
+        return None;
+    }
+    Some(dto)
+}
+
+fn read_governor_dto(probe: &dyn SystemProbe, paths: &SysPaths) -> Option<GovernorDto> {
+    let raw = probe.read_file_string(&paths.governor_status_file)?;
+    let dto: GovernorDto = serde_json::from_str(&raw).ok()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(dto.updated_at);
+    validate_governor(dto, now)
+}
+
+fn read_governor(probe: &dyn SystemProbe, paths: &SysPaths) -> Option<serde_json::Value> {
+    read_governor_dto(probe, paths).and_then(|dto| serde_json::to_value(dto).ok())
+}
+
 /// Compose `GET /api/storage` from the probe (root + the data root, deduped by
 /// mount point).
 #[must_use]
@@ -751,7 +849,7 @@ pub fn storage(
     Storage {
         filesystems,
         volumes: vec![dashcam, media],
-        governor: None,
+        governor: read_governor(probe, paths),
     }
 }
 
@@ -762,8 +860,9 @@ pub fn storage_health(probe: &dyn SystemProbe, paths: &SysPaths) -> StorageHealt
     let Some(fs) = probe.statvfs(root) else {
         return StorageHealth::unavailable();
     };
+    let gov = read_governor_dto(probe, paths);
     let mount = probe.mount_for(root);
-    let sev = classify_frac(fs.free_frac());
+    let sev = classify_archive_frac(fs.free_frac(), gov.as_ref());
     StorageHealth {
         severity: sev.as_str(),
         summary: format!(
@@ -881,6 +980,7 @@ mod tests {
         mount: Option<MountInfo>,
         worker_file: Option<String>,
         indexer_file: Option<String>,
+        governor_file: Option<String>,
         cpu_temp: Option<i64>,
     }
 
@@ -907,6 +1007,9 @@ mod tests {
             if path == paths().indexer_health_file.as_path() {
                 return self.indexer_file.clone();
             }
+            if path == paths().governor_status_file.as_path() {
+                return self.governor_file.clone();
+            }
             None
         }
         fn cpu_temp_millic(&self) -> Option<i64> {
@@ -919,7 +1022,25 @@ mod tests {
             archive_root: PathBuf::from("/data/teslausb/archive"),
             worker_health_file: PathBuf::from("/run/teslausb/retentiond.health.json"),
             indexer_health_file: PathBuf::from("/run/teslausb/indexd.health.json"),
+            governor_status_file: PathBuf::from("/run/teslausb/retentiond.governor.json"),
             media_ro_mount: PathBuf::from("/run/teslausb/media-ro"),
+        }
+    }
+
+    fn valid_governor_dto(updated_at: i64) -> GovernorDto {
+        GovernorDto {
+            schema: 1,
+            updated_at,
+            mode: "armed".to_owned(),
+            drain_only: true,
+            free_bytes: 53_687_091_200,
+            total_bytes: 504_658_657_280,
+            target_free_frac: 0.08,
+            target_exit_frac: 0.1,
+            recency_floor_secs: 3600,
+            last_stop: "already_healthy".to_owned(),
+            last_bytes_freed: 0,
+            last_items: 0,
         }
     }
 
@@ -945,6 +1066,32 @@ mod tests {
         assert_eq!(classify_frac(0.10), Severity::Warn);
         assert_eq!(classify_frac(0.05), Severity::Warn);
         assert_eq!(classify_frac(0.01), Severity::Error);
+    }
+
+    #[test]
+    fn classify_archive_frac_thresholds() {
+        let armed = GovernorDto {
+            mode: "armed".into(),
+            target_free_frac: 0.08,
+            target_exit_frac: 0.10,
+            ..Default::default()
+        };
+        assert_eq!(classify_archive_frac(0.10, Some(&armed)), Severity::Ok);
+        assert_eq!(classify_archive_frac(0.08, Some(&armed)), Severity::Ok);
+        assert_eq!(classify_archive_frac(0.079, Some(&armed)), Severity::Warn);
+        assert_eq!(classify_archive_frac(0.05, Some(&armed)), Severity::Warn);
+        assert_eq!(classify_archive_frac(0.049, Some(&armed)), Severity::Error);
+
+        assert_eq!(classify_archive_frac(0.10, None), Severity::Warn);
+        assert_eq!(classify_archive_frac(0.20, None), Severity::Ok);
+
+        let dryrun = GovernorDto {
+            mode: "dryrun".into(),
+            target_free_frac: 0.08,
+            target_exit_frac: 0.10,
+            ..Default::default()
+        };
+        assert_eq!(classify_archive_frac(0.10, Some(&dryrun)), Severity::Warn);
     }
 
     #[test]
@@ -1278,6 +1425,166 @@ tmpfs /run tmpfs rw 0 0
         assert_eq!(s.filesystems.len(), 1);
         assert_eq!(s.volumes.len(), 2);
         assert!(s.governor.is_none());
+    }
+
+    #[test]
+    fn storage_reads_governor_when_present_and_valid() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let probe = FakeProbe {
+            governor_file: Some(format!(
+                "{{\"schema\":1,\"updated_at\":{now},\"mode\":\"armed\",\"drain_only\":true,\"free_bytes\":53687091200,\"total_bytes\":504658657280,\"target_free_frac\":0.08,\"target_exit_frac\":0.1,\"recency_floor_secs\":3600,\"last_stop\":\"already_healthy\",\"last_bytes_freed\":0,\"last_items\":0}}"
+            )),
+            ..FakeProbe::default()
+        };
+        let stats = FakeStatsClient {
+            outcome: Some(VolumeStatsOutcome::Unavailable),
+        };
+        let out = storage(&probe, &paths(), &stats);
+        let governor = out.governor.expect("governor");
+        assert_eq!(governor["mode"], "armed");
+        assert_eq!(governor["free_bytes"], 53_687_091_200_u64);
+    }
+
+    #[test]
+    fn storage_governor_none_when_absent() {
+        let probe = FakeProbe::default();
+        let stats = FakeStatsClient {
+            outcome: Some(VolumeStatsOutcome::Unavailable),
+        };
+        let out = storage(&probe, &paths(), &stats);
+        assert!(out.governor.is_none());
+    }
+
+    #[test]
+    fn storage_governor_none_when_unparseable() {
+        let probe = FakeProbe {
+            governor_file: Some("{not json".to_owned()),
+            ..FakeProbe::default()
+        };
+        let stats = FakeStatsClient {
+            outcome: Some(VolumeStatsOutcome::Unavailable),
+        };
+        let out = storage(&probe, &paths(), &stats);
+        assert!(out.governor.is_none());
+    }
+
+    #[test]
+    fn storage_governor_none_when_wrong_schema() {
+        let probe = FakeProbe {
+            governor_file: Some(
+                "{\"schema\":2,\"updated_at\":1700000000,\"mode\":\"armed\",\"drain_only\":true,\"free_bytes\":1,\"total_bytes\":2,\"target_free_frac\":0.08,\"target_exit_frac\":0.1,\"recency_floor_secs\":3600,\"last_stop\":\"already_healthy\",\"last_bytes_freed\":0,\"last_items\":0}".to_owned(),
+            ),
+            ..FakeProbe::default()
+        };
+        let stats = FakeStatsClient {
+            outcome: Some(VolumeStatsOutcome::Unavailable),
+        };
+        let out = storage(&probe, &paths(), &stats);
+        assert!(out.governor.is_none());
+    }
+
+    #[test]
+    fn storage_governor_none_when_required_field_missing() {
+        let probe = FakeProbe {
+            governor_file: Some(
+                "{\"schema\":1,\"updated_at\":1700000000,\"drain_only\":true,\"free_bytes\":1,\"total_bytes\":2,\"target_free_frac\":0.08,\"target_exit_frac\":0.1,\"recency_floor_secs\":3600,\"last_stop\":\"already_healthy\",\"last_bytes_freed\":0,\"last_items\":0}".to_owned(),
+            ),
+            ..FakeProbe::default()
+        };
+        let stats = FakeStatsClient {
+            outcome: Some(VolumeStatsOutcome::Unavailable),
+        };
+        let out = storage(&probe, &paths(), &stats);
+        assert!(out.governor.is_none());
+    }
+
+    #[test]
+    fn validate_governor_accepts_valid_payload() {
+        let now = 1_700_000_000;
+        let dto = valid_governor_dto(now);
+        assert!(validate_governor(dto, now).is_some());
+    }
+
+    #[test]
+    fn validate_governor_rejects_stale_payload() {
+        let now = 1_700_000_000;
+        let dto = valid_governor_dto(now - 4000);
+        assert!(validate_governor(dto, now).is_none());
+    }
+
+    #[test]
+    fn validate_governor_rejects_implausibly_future_payload() {
+        let now = 1_700_000_000;
+        let dto = valid_governor_dto(now + 400);
+        assert!(validate_governor(dto, now).is_none());
+    }
+
+    #[test]
+    fn validate_governor_rejects_bogus_mode() {
+        let now = 1_700_000_000;
+        let mut dto = valid_governor_dto(now);
+        dto.mode = "bogus".to_owned();
+        assert!(validate_governor(dto, now).is_none());
+    }
+
+    #[test]
+    fn validate_governor_rejects_empty_mode() {
+        let now = 1_700_000_000;
+        let mut dto = valid_governor_dto(now);
+        dto.mode = String::new();
+        assert!(validate_governor(dto, now).is_none());
+    }
+
+    #[test]
+    fn validate_governor_rejects_free_bytes_above_total() {
+        let now = 1_700_000_000;
+        let mut dto = valid_governor_dto(now);
+        dto.free_bytes = dto.total_bytes + 1;
+        assert!(validate_governor(dto, now).is_none());
+    }
+
+    #[test]
+    fn validate_governor_rejects_zero_total_bytes() {
+        let now = 1_700_000_000;
+        let mut dto = valid_governor_dto(now);
+        dto.total_bytes = 0;
+        dto.free_bytes = 0;
+        assert!(validate_governor(dto, now).is_none());
+    }
+
+    #[test]
+    fn validate_governor_rejects_zero_target_exit_fraction() {
+        let now = 1_700_000_000;
+        let mut dto = valid_governor_dto(now);
+        dto.target_exit_frac = 0.0;
+        assert!(validate_governor(dto, now).is_none());
+    }
+
+    #[test]
+    fn validate_governor_rejects_target_exit_fraction_over_one() {
+        let now = 1_700_000_000;
+        let mut dto = valid_governor_dto(now);
+        dto.target_exit_frac = 1.5;
+        assert!(validate_governor(dto, now).is_none());
+    }
+
+    #[test]
+    fn validate_governor_rejects_negative_recency_floor() {
+        let now = 1_700_000_000;
+        let mut dto = valid_governor_dto(now);
+        dto.recency_floor_secs = -1;
+        assert!(validate_governor(dto, now).is_none());
+    }
+
+    #[test]
+    fn validate_governor_rejects_empty_last_stop() {
+        let now = 1_700_000_000;
+        let mut dto = valid_governor_dto(now);
+        dto.last_stop = String::new();
+        assert!(validate_governor(dto, now).is_none());
     }
 
     #[test]

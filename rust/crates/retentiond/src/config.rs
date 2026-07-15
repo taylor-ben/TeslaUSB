@@ -223,11 +223,13 @@ pub struct TargetDrainConfig {
 
 impl Default for TargetDrainConfig {
     fn default() -> Self {
-        // CALIBRATION-GATED provisional values (470GB card, keep ~15% free).
+        // Operator-directed value-eviction defaults: on a ~503GB card, hold
+        // roughly ~40/50GB free via adaptive fractions, keep a 1h safety grace
+        // (not a multi-day floor), and pair with value-ordered eviction.
         Self {
-            target_free_frac: 0.15,
-            target_exit_frac: 0.17,
-            recency_floor_secs: 604_800, // 7 days
+            target_free_frac: 0.08,
+            target_exit_frac: 0.10,
+            recency_floor_secs: 3_600, // 1 hour
             per_cycle_evict_bytes: 8 << 30,
             per_cycle_evict_count: 256,
             per_cycle_wall_ms: 5_000,
@@ -296,6 +298,9 @@ mod tests {
     #[test]
     fn target_drain_defaults_are_sane() {
         let cfg = RetentionConfig::default().target_drain;
+        assert!((cfg.target_free_frac - 0.08).abs() < f64::EPSILON);
+        assert!((cfg.target_exit_frac - 0.10).abs() < f64::EPSILON);
+        assert_eq!(cfg.recency_floor_secs, 3_600);
         assert!(
             cfg.target_exit_frac >= cfg.target_free_frac,
             "hysteresis requires exit >= enter"

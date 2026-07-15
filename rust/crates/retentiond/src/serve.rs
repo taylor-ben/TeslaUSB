@@ -1799,6 +1799,72 @@ mod tests {
     }
 
     #[test]
+    fn drain_deletes_in_catalog_order_not_size() {
+        // The live drain (`drain_to_target`) must delete in the order the indexd
+        // catalog returns (value-tiered, oldest-first) — NOT re-sorted by size.
+        // EvictionItem.size ascends with id here, so a size-descending sort
+        // would delete id 4 first; assert the order stays [1,2,3,4].
+        let cfg = drain_cfg();
+        let clock = FakeClock(Cell::new(1_000_000));
+        let store = FakeStore::new(&[]);
+        let handoff = FakeHandoff {
+            outcome: HandoffOutcome::Done,
+            seen: RefCell::new(Vec::new()),
+        };
+        let free = Rc::new(Cell::new(100));
+        let statfs = RisingStatfs::new(free.clone(), 1_000);
+        let fs = FakeFs::new(&[]).with_free_bump(free.clone(), 150);
+        let index = FakeIndex::new(ClaimResult::Claimed);
+        let (mut eviction, delete_reqs) = recent_mirror_items_with_reqs(&[1, 2, 3, 4], 150);
+        for (item, size) in eviction.iter_mut().zip([100u64, 200, 300, 400]) {
+            item.size = size;
+        }
+        let catalog = FakeCatalog {
+            recovery: Vec::new(),
+            eviction,
+            delete_reqs,
+            recorded: RefCell::new(Vec::new()),
+            recent_marked: RefCell::new(Vec::new()),
+        };
+        let rand = SeqRand(Cell::new(0));
+        let rl = RetentionLoop::new(
+            &cfg,
+            Seams {
+                clock: &clock,
+                store: &store,
+                handoff: &handoff,
+                statfs: &statfs,
+                fs: &fs,
+                index: &index,
+                catalog: &catalog,
+                rand: &rand,
+            },
+            "trash",
+        );
+        let should_stop = || false;
+        let pet_watchdog = || {};
+        let out = rl
+            .drain_to_target(&DrainInput {
+                data_fs_path: "/data",
+                dry_run: false,
+                should_stop: &should_stop,
+                pet_watchdog: &pet_watchdog,
+            })
+            .unwrap();
+        let ids: Vec<_> = out.records.iter().map(|r| r.id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                ArchiveItemId(1),
+                ArchiveItemId(2),
+                ArchiveItemId(3),
+                ArchiveItemId(4)
+            ]
+        );
+        assert_eq!(out.stop, DrainStop::TargetReached);
+    }
+
+    #[test]
     fn drain_respects_count_cap() {
         let mut h = harness();
         h.statfs = fixed_statfs("/data", 100, 1_000);

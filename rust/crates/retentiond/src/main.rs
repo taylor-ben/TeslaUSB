@@ -35,6 +35,8 @@ use retentiond::archive_driver::{DriverState, archive_recent_capped};
 #[cfg(unix)]
 use retentiond::config::RetentionConfig;
 #[cfg(unix)]
+use retentiond::governor::{self, DiskImgAccounting, FsRole, FsSample, Statfs, Tier};
+#[cfg(unix)]
 use retentiond::index_delete_client::IndexDeleteClient;
 #[cfg(unix)]
 use retentiond::read_client::VolumeReadFileClient;
@@ -54,6 +56,8 @@ const DEFAULT_VOLUME_IMAGE: &str = "/data/teslausb/teslacam.img";
 #[cfg(unix)]
 const DEFAULT_HEALTH_FILE: &str = "/run/teslausb/retentiond.health.json";
 #[cfg(unix)]
+const DEFAULT_GOVERNOR_STATUS_FILE: &str = "/run/teslausb/retentiond.governor.json";
+#[cfg(unix)]
 const MAX_COPIES_PER_CYCLE: usize = 4;
 
 #[cfg(unix)]
@@ -67,6 +71,26 @@ struct HealthHeartbeat {
     running: bool,
     pending: u64,
     last_progress_at: i64,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Serialize)]
+struct GovernorStatus {
+    schema: u32,
+    updated_at: i64,
+    /// "armed" (real deletion) | "dryrun" (projection only).
+    mode: &'static str,
+    /// True when the archive copy pass is skipped (drain-only).
+    drain_only: bool,
+    free_bytes: u64,
+    total_bytes: u64,
+    target_free_frac: f64,
+    target_exit_frac: f64,
+    recency_floor_secs: i64,
+    /// Stable snake_case tag of the last drain stop reason.
+    last_stop: &'static str,
+    last_bytes_freed: u64,
+    last_items: u64,
 }
 
 fn main() -> ExitCode {
@@ -325,10 +349,13 @@ fn run_serve(args: &[String]) -> ExitCode {
     let mut state = DriverState::with_archive_root(&archive_root);
     let health_file = std::env::var_os("RETENTIOND_HEALTH_FILE")
         .map_or_else(|| PathBuf::from(DEFAULT_HEALTH_FILE), PathBuf::from);
+    let governor_status_file = std::env::var_os("RETENTIOND_GOVERNOR_STATUS_FILE")
+        .map_or_else(|| PathBuf::from(DEFAULT_GOVERNOR_STATUS_FILE), PathBuf::from);
     let startup_now = now_epoch_s_saturating();
     let mut last_progress_at = startup_now;
     let mut last_pending: u64 = 0;
     let mut health_write_error_logged = false;
+    let mut governor_status_write_error_logged = false;
     write_health_heartbeat_best_effort(
         &health_file,
         startup_now,
@@ -483,6 +510,8 @@ fn run_serve(args: &[String]) -> ExitCode {
     let governor = RetentionLoop::new(&cfg, seams, trash_dir.clone());
 
     let mut evict_budget = EvictBudget::default();
+    let mut prev_space_tier = Tier::Healthy;
+    let mut archive_paused_prev = false;
 
     match governor.recover() {
         Ok(report) => {
@@ -496,13 +525,57 @@ fn run_serve(args: &[String]) -> ExitCode {
     retentiond::watchdog::pet();
 
     while !SHUTDOWN.load(Ordering::Relaxed) {
+        // Fail-closed default: if statfs fails below we stay paused for this cycle
+        // (the Ok arm overwrites this with the real assessment).
+        let mut archive_paused = true;
+        match statfs.statfs(archive_root_str.as_str()) {
+            Ok(stat) => {
+                let samples = [FsSample {
+                    role: FsRole::Data,
+                    stat,
+                }];
+                let assessment = governor::evaluate(
+                    prev_space_tier,
+                    &samples,
+                    DiskImgAccounting {
+                        nominal_bytes: 0,
+                        allocated_bytes: 0,
+                    },
+                    true,
+                    &cfg.governor,
+                );
+                prev_space_tier = assessment.space_tier;
+                archive_paused = assessment.tier >= Tier::Critical;
+                if archive_paused != archive_paused_prev {
+                    eprintln!(
+                        "retentiond archive gate: {} at tier={:?} free={} bytes",
+                        if archive_paused { "PAUSED" } else { "RESUMED" },
+                        assessment.tier,
+                        assessment.data_free_bytes
+                    );
+                }
+            }
+            Err(err) => {
+                // Blind to free space -> fail SAFE (archive_paused stays true):
+                // pause the optional archive writer this cycle so it cannot fill
+                // the disk while we cannot measure it. The eviction drain below
+                // still runs and frees space if it can. A transient statfs hiccup
+                // costs one cycle of mirroring; a persistent one must not defeat
+                // the ENOSPC guard. prev_space_tier is left unchanged so a blind
+                // cycle does not poison the space hysteresis when statfs recovers.
+                if !archive_paused_prev {
+                    eprintln!("retentiond archive gate: PAUSED (statfs failed: {err})");
+                }
+            }
+        }
+        archive_paused_prev = archive_paused;
         // --drain-only (emergency): SKIP the archive pass entirely and run ONLY the
         // eviction drain below. At a near-full disk the archive pass hard-blocks on
         // the full filesystem (marker/outbox/candidate I/O) longer than the watchdog
         // window, which starves the drain that actually frees space. The drain is
         // self-contained (statfs + indexd socket + its own candidate cache; recover()
         // already ran before the loop), so skipping the archive pass here is safe.
-        let result = if parsed.drain_only {
+        let result = if parsed.drain_only || archive_paused {
             Ok(retentiond::archive_driver::CycleReport::default())
         } else {
             let now_epoch_s = now_epoch_s_saturating();
@@ -602,6 +675,14 @@ fn run_serve(args: &[String]) -> ExitCode {
             match governor.drain_to_target(&input) {
                 Ok(outcome) => {
                     log_drain(&outcome, effective_dry_run, &cfg, parsed.interval_secs);
+                    write_governor_status_best_effort(
+                        &governor_status_file,
+                        effective_dry_run,
+                        parsed.drain_only,
+                        &outcome,
+                        &cfg,
+                        &mut governor_status_write_error_logged,
+                    );
                     if !effective_dry_run {
                         // size the episode budget to the level the drain actually drives free UP to (exit hysteresis), else an honest convergence to exit_frac would exceed a free_frac-sized budget and false-latch
                         let target_free_bytes =
@@ -693,6 +774,77 @@ fn write_health_heartbeat_best_effort(
         if !*write_error_logged {
             eprintln!(
                 "retentiond archive_recent_only: health heartbeat write failed at {}: {err}",
+                path.display()
+            );
+            *write_error_logged = true;
+        }
+    }
+}
+
+#[cfg(unix)]
+fn drain_stop_tag(stop: &DrainStop) -> &'static str {
+    match stop {
+        DrainStop::TargetReached => "target_reached",
+        DrainStop::ByteCapReached => "byte_cap",
+        DrainStop::CountCapReached => "count_cap",
+        DrainStop::WallClockCapReached => "wall_cap",
+        DrainStop::ShutdownRequested => "shutdown",
+        DrainStop::NoSafeCandidate => "no_safe_candidate",
+        DrainStop::AlreadyHealthy => "already_healthy",
+        DrainStop::AnomalyRefused { .. } => "anomaly_refused",
+        DrainStop::DeleteFailed { .. } => "delete_failed",
+        DrainStop::StatCheckFailed { .. } => "stat_check_failed",
+    }
+}
+
+#[cfg(unix)]
+fn write_governor_status_atomic(path: &Path, body: &str) -> std::io::Result<()> {
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(".tmp");
+    let tmp_path = PathBuf::from(tmp);
+    std::fs::write(&tmp_path, body)?;
+    std::fs::rename(&tmp_path, path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn write_governor_status_best_effort(
+    path: &Path,
+    effective_dry_run: bool,
+    drain_only: bool,
+    outcome: &DrainOutcome,
+    cfg: &RetentionConfig,
+    write_error_logged: &mut bool,
+) {
+    let status = GovernorStatus {
+        schema: 1,
+        updated_at: now_epoch_s_saturating(),
+        mode: if effective_dry_run { "dryrun" } else { "armed" },
+        drain_only,
+        free_bytes: outcome.free_after,
+        total_bytes: outcome.total_bytes,
+        target_free_frac: cfg.target_drain.target_free_frac,
+        target_exit_frac: cfg.target_drain.target_exit_frac,
+        recency_floor_secs: cfg.target_drain.recency_floor_secs,
+        last_stop: drain_stop_tag(&outcome.stop),
+        last_bytes_freed: outcome.bytes_freed,
+        last_items: u64::try_from(outcome.records.len()).unwrap_or(u64::MAX),
+    };
+    let body = match serde_json::to_string(&status) {
+        Ok(b) => b,
+        Err(err) => {
+            if !*write_error_logged {
+                eprintln!("retentiond governor: status serialize failed: {err}");
+                *write_error_logged = true;
+            }
+            return;
+        }
+    };
+    if let Err(err) = write_governor_status_atomic(path, &body) {
+        if !*write_error_logged {
+            eprintln!(
+                "retentiond governor: status write failed at {}: {err}",
                 path.display()
             );
             *write_error_logged = true;
@@ -846,8 +998,9 @@ fn install_shutdown_handlers() {
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::{
-        cumulative_evict_budget, parse_serve_args, render_health, EvictBudget,
-        resolve_eviction_mode, validate_phase1_mode, EvictionMode, ServeArgs,
+        cumulative_evict_budget, drain_stop_tag, parse_serve_args, render_health,
+        resolve_eviction_mode, validate_phase1_mode, DrainStop, EvictBudget, EvictionMode,
+        GovernorStatus, ServeArgs,
     };
 
     #[test]
@@ -1208,5 +1361,76 @@ mod tests {
         assert_eq!(value["running"], true);
         assert_eq!(value["pending"], 42);
         assert_eq!(value["last_progress_at"], 1200);
+    }
+
+    #[test]
+    fn governor_status_serializes_expected_shape() {
+        let status = GovernorStatus {
+            schema: 1,
+            updated_at: 1_700_000_000,
+            mode: "armed",
+            drain_only: true,
+            free_bytes: 50,
+            total_bytes: 470,
+            target_free_frac: 0.08,
+            target_exit_frac: 0.10,
+            recency_floor_secs: 3_600,
+            last_stop: "already_healthy",
+            last_bytes_freed: 0,
+            last_items: 0,
+        };
+        let raw = match serde_json::to_string(&status) {
+            Ok(raw) => raw,
+            Err(err) => panic!("governor_status should serialize: {err}"),
+        };
+        let value: serde_json::Value = match serde_json::from_str(&raw) {
+            Ok(value) => value,
+            Err(err) => panic!("governor_status should be valid json: {err}"),
+        };
+        assert_eq!(value["schema"], 1);
+        assert_eq!(value["updated_at"], 1_700_000_000);
+        assert_eq!(value["mode"], "armed");
+        assert_eq!(value["drain_only"], true);
+        assert_eq!(value["free_bytes"], 50);
+        assert_eq!(value["total_bytes"], 470);
+        assert_eq!(value["target_free_frac"], 0.08);
+        assert_eq!(value["target_exit_frac"], 0.10);
+        assert_eq!(value["recency_floor_secs"], 3_600);
+        assert_eq!(value["last_stop"], "already_healthy");
+        assert_eq!(value["last_bytes_freed"], 0);
+        assert_eq!(value["last_items"], 0);
+    }
+
+    #[test]
+    fn drain_stop_tag_maps_all_variants() {
+        assert_eq!(drain_stop_tag(&DrainStop::TargetReached), "target_reached");
+        assert_eq!(drain_stop_tag(&DrainStop::ByteCapReached), "byte_cap");
+        assert_eq!(drain_stop_tag(&DrainStop::CountCapReached), "count_cap");
+        assert_eq!(drain_stop_tag(&DrainStop::WallClockCapReached), "wall_cap");
+        assert_eq!(drain_stop_tag(&DrainStop::ShutdownRequested), "shutdown");
+        assert_eq!(
+            drain_stop_tag(&DrainStop::NoSafeCandidate),
+            "no_safe_candidate"
+        );
+        assert_eq!(drain_stop_tag(&DrainStop::AlreadyHealthy), "already_healthy");
+        assert_eq!(
+            drain_stop_tag(&DrainStop::AnomalyRefused {
+                bytes_to_free: 1,
+                total_bytes: 2
+            }),
+            "anomaly_refused"
+        );
+        assert_eq!(
+            drain_stop_tag(&DrainStop::DeleteFailed {
+                reason: "x".to_owned()
+            }),
+            "delete_failed"
+        );
+        assert_eq!(
+            drain_stop_tag(&DrainStop::StatCheckFailed {
+                reason: "x".to_owned()
+            }),
+            "stat_check_failed"
+        );
     }
 }

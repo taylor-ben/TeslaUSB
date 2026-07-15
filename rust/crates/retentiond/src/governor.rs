@@ -440,6 +440,59 @@ mod tests {
     }
 
     #[test]
+    fn archive_gate_pauses_when_entering_critical() {
+        let cfg = GovernorConfig::default();
+        let total = 500 * GB;
+        let a = evaluate(
+            Tier::Healthy,
+            &data_only(10 * GB, total),
+            full_img(4 * GB),
+            true,
+            &cfg,
+        );
+        // Pure space hysteresis (immune to the root-reserve overlay): 10 GiB is
+        // below the Critical enter mark (max(3%,8GiB)=15 GiB on 500 GiB).
+        assert_eq!(a.space_tier, Tier::Critical);
+        assert!(a.tier >= Tier::Critical); // gate pauses
+    }
+
+    #[test]
+    fn archive_gate_hysteresis_stays_paused_between_exit_and_enter() {
+        let cfg = GovernorConfig::default();
+        let total = 500 * GB;
+        let a = evaluate(
+            Tier::Critical,
+            &data_only(20 * GB, total),
+            full_img(4 * GB),
+            true,
+            &cfg,
+        );
+        // From Critical, 20 GiB sits between the Critical exit (max(6%,16GiB)=30
+        // GiB) and enter (15 GiB) marks, so hysteresis must HOLD at Critical.
+        // Asserting space_tier (not the combined tier) proves this is real
+        // hysteresis and not the root-reserve overlay.
+        assert_eq!(a.space_tier, Tier::Critical);
+        assert!(a.tier >= Tier::Critical); // gate stays paused
+    }
+
+    #[test]
+    fn archive_gate_resumes_above_exit() {
+        let cfg = GovernorConfig::default();
+        let total = 500 * GB;
+        let a = evaluate(
+            Tier::Critical,
+            &data_only(40 * GB, total),
+            full_img(4 * GB),
+            true,
+            &cfg,
+        );
+        // 40 GiB clears both the Critical exit (30 GiB) and Low exit
+        // (max(8%,20GiB)=40 GiB) marks, so space recovers to Healthy.
+        assert_eq!(a.space_tier, Tier::Healthy);
+        assert!(a.tier < Tier::Critical); // gate resumes
+    }
+
+    #[test]
     fn root_reserve_breach_forces_at_least_critical() {
         let cfg = GovernorConfig::default();
         let total = 256 * GB;

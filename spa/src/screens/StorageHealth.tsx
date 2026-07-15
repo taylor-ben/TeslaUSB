@@ -4,6 +4,7 @@ import { Icon } from "../components/Icon";
 import { api } from "../api/client";
 import type {
   FilesystemEntry,
+  GovernorInfo,
   StorageHealth as StorageHealthDto,
   StorageInfo,
   SystemHealth,
@@ -120,6 +121,30 @@ function tempBand(c: number | null | undefined): string {
   return "Nominal";
 }
 
+/** Governor stop reason → friendly text. */
+const GOV_STOP_LABEL: Record<string, string> = {
+  already_healthy: "already healthy",
+  target_reached: "reached target",
+  byte_cap: "hit per-cycle byte cap",
+  count_cap: "hit per-cycle count cap",
+  wall_cap: "hit per-cycle time cap",
+  shutdown: "interrupted by shutdown",
+  no_safe_candidate: "no evictable footage",
+  anomaly_refused: "refused (disk anomaly)",
+  delete_failed: "delete failed",
+  stat_check_failed: "disk re-check failed",
+};
+
+/** recency_floor_secs → "1 h" / "45 min" protection window. */
+function formatProtectWindow(secs: number | null | undefined): string {
+  if (secs == null || !Number.isFinite(secs) || secs <= 0) return DASH;
+  if (secs >= 3600) {
+    const h = secs / 3600;
+    return `${h % 1 === 0 ? h.toFixed(0) : h.toFixed(1)} h`;
+  }
+  return `${Math.round(secs / 60)} min`;
+}
+
 /** Severity → human label + the CSS modifier suffix used by the badge/dot. */
 const SEV_LABEL: Record<string, string> = {
   ok: "Healthy",
@@ -223,6 +248,7 @@ type BannerLevel = "ok" | "warn" | "crit" | "unknown";
  *  crit < 5% free, warn < 12% free, else ok; unknown when no filesystem reported. */
 function recordingBanner(
   primary: FilesystemEntry | null,
+  governor: GovernorInfo | null,
 ): { level: BannerLevel; title: string; detail: string } {
   const frac = primary != null ? usedFraction(primary.total_bytes, primary.free_bytes) : null;
   if (primary == null || frac == null) {
@@ -234,6 +260,27 @@ function recordingBanner(
   }
   const freeFrac = 1 - frac;
   const freeText = humanBytes(primary.free_bytes);
+  if (governor != null && governor.mode === "armed") {
+    if (freeFrac >= governor.target_free_frac) {
+      return {
+        level: "ok",
+        title: "Recording protected",
+        detail: `${freeText} free — auto-cleanup keeps the newest footage and trims the oldest to hold this level.`,
+      };
+    }
+    if (freeFrac >= 0.05) {
+      return {
+        level: "warn",
+        title: "Auto-cleanup catching up",
+        detail: `${freeText} free, below the ${(governor.target_free_frac * 100).toFixed(0)}% target. If this persists, recent footage may be protected from deletion.`,
+      };
+    }
+    return {
+      level: "crit",
+      title: "Archive almost full",
+      detail: `Only ${freeText} free — auto-cleanup can't free enough space. New drives may not be saved.`,
+    };
+  }
   if (freeFrac < 0.05) {
     return {
       level: "crit",
@@ -263,8 +310,14 @@ const BANNER_ICON: Record<BannerLevel, string> = {
 };
 
 /** Top-of-page recording-safety banner. */
-function RecordingBanner({ primary }: { primary: FilesystemEntry | null }) {
-  const b = recordingBanner(primary);
+function RecordingBanner({
+  primary,
+  governor,
+}: {
+  primary: FilesystemEntry | null;
+  governor: GovernorInfo | null;
+}) {
+  const b = recordingBanner(primary, governor);
   return (
     <section
       class={`storage-banner storage-banner-${b.level}`}
@@ -508,7 +561,7 @@ export function StorageHealth() {
         </p>
       </header>
 
-      <RecordingBanner primary={primary} />
+      <RecordingBanner primary={primary} governor={info?.governor ?? null} />
 
       <SdCompositionCard primary={primary} dashcam={dashcam} media={media} />
 
@@ -655,15 +708,56 @@ export function StorageHealth() {
         </div>
       </section>
 
-      {/* Retention headroom — governor is null until retentiond lands. */}
+      {/* Retention headroom — governor is null when retentiond is not reporting. */}
       <section class="storage-card" id="storage-retention-card">
         <h2 class="storage-card-title">
           <Icon name="database" /> Retention headroom
         </h2>
         {info?.governor != null ? (
-          <pre class="storage-note" id="storage-governor">
-            {JSON.stringify(info.governor, null, 2)}
-          </pre>
+          (() => {
+            const g = info.governor;
+            const isDryRun = g.mode !== "armed";
+            const usedPct =
+              g.total_bytes > 0
+                ? clampPct(((g.total_bytes - g.free_bytes) / g.total_bytes) * 100)
+                : 0;
+            const freePct = g.total_bytes > 0 ? (g.free_bytes / g.total_bytes) * 100 : null;
+            return (
+              <div id="storage-governor">
+                <p class="storage-note" data-testid="governor-mode">
+                  Auto-cleanup:{" "}
+                  {g.mode === "armed" ? "Armed" : "Dry-run (reporting only)"}
+                </p>
+                <div
+                  class="cap-bar"
+                  role="img"
+                  aria-label={`Retention governor: ${usedPct.toFixed(1)}% used (${humanBytes(g.total_bytes - g.free_bytes)} of ${humanBytes(g.total_bytes)})`}
+                >
+                  <div class={`cap-seg ${capClass(usedPct / 100)}`} style={`width:${usedPct.toFixed(2)}%`} />
+                  <div class="cap-seg cap-seg-free" style="flex:1" />
+                </div>
+                <p class="storage-note">
+                  {humanBytes(g.free_bytes)} {isDryRun ? "projected free" : "free"} of{" "}
+                  {humanBytes(g.total_bytes)} (
+                  <span data-testid="governor-free-pct">
+                    {freePct == null ? DASH : `${freePct.toFixed(1)}%`}
+                  </span>
+                  )
+                </p>
+                <p class="storage-note" data-testid="governor-target">
+                  Keeps {"\u2265"} {(g.target_exit_frac * 100).toFixed(0)}% free
+                </p>
+                <p class="storage-note" data-testid="governor-last">
+                  Last pass: {isDryRun ? "would free" : "freed"} {humanBytes(g.last_bytes_freed)} ·{" "}
+                  {g.last_items} clips · {GOV_STOP_LABEL[g.last_stop] ?? g.last_stop}
+                </p>
+                <p class="storage-note">
+                  Protects footage newer than {formatProtectWindow(g.recency_floor_secs)}
+                </p>
+                <p class="storage-note">Updated {formatUpdated(g.updated_at)}</p>
+              </div>
+            );
+          })()
         ) : (
           <p class="storage-note" data-testid="retention-degraded">
             The auto-cleanup governor is not reporting yet, so eviction headroom

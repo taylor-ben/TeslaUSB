@@ -92,6 +92,26 @@ const STORAGE_FIXTURE = {
   governor: null,
 };
 
+const GOVERNOR_FIXTURE = {
+  schema: 1,
+  updated_at: 1700000000,
+  mode: "armed",
+  drain_only: true,
+  free_bytes: 50 * GIB,
+  total_bytes: 470 * GIB,
+  target_free_frac: 0.08,
+  target_exit_frac: 0.1,
+  recency_floor_secs: 3600,
+  last_stop: "already_healthy",
+  last_bytes_freed: 0,
+  last_items: 0,
+};
+
+const GOVERNOR_DRYRUN_FIXTURE = {
+  ...GOVERNOR_FIXTURE,
+  mode: "dryrun",
+};
+
 const STORAGE_HEALTH_FIXTURE = {
   severity: "ok",
   summary: "94 GB free of 470 GB",
@@ -291,6 +311,66 @@ test.describe("storage health UAT", () => {
 
     // Retention headroom — governor is null ⇒ degraded note (no fabricated figure).
     await expect(page.locator('[data-testid="retention-degraded"]')).toBeVisible();
+
+    assertCleanConsole(probe);
+  });
+
+  test("renders live retention headroom when the governor reports", async ({
+    page,
+    probe,
+  }) => {
+    await routeProbes(page);
+    const json = (body: unknown) => ({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(body),
+    });
+    await page.route("**/api/storage", (r) =>
+      r.fulfill(json({ ...STORAGE_FIXTURE, governor: GOVERNOR_FIXTURE })),
+    );
+
+    await gotoStorage(page);
+    const details = page.locator("#storage-device-health");
+    await details.locator("summary").click();
+
+    await expect(page.locator('[data-testid="retention-degraded"]')).toHaveCount(0);
+    await expect(page.locator("#storage-governor")).toBeVisible();
+    await expect(page.locator('[data-testid="governor-mode"]')).toContainText("Armed");
+    await expect(page.locator('[data-testid="governor-free-pct"]')).toContainText("10.6");
+    await expect(page.locator("#storage-governor")).toContainText("free of");
+    await expect(page.locator('[data-testid="governor-target"]')).toContainText("10%");
+    await expect(page.locator('[data-testid="governor-last"]')).toContainText("freed");
+    await expect(page.locator('[data-testid="governor-last"]')).toContainText("already healthy");
+    await expect(page.locator('[data-testid="governor-last"]')).toContainText("0 clips");
+
+    assertCleanConsole(probe);
+  });
+
+  test("renders dry-run retention headroom with projected labels", async ({
+    page,
+    probe,
+  }) => {
+    await routeProbes(page);
+    const json = (body: unknown) => ({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(body),
+    });
+    await page.route("**/api/storage", (r) =>
+      r.fulfill(json({ ...STORAGE_FIXTURE, governor: GOVERNOR_DRYRUN_FIXTURE })),
+    );
+
+    await gotoStorage(page);
+    const details = page.locator("#storage-device-health");
+    await details.locator("summary").click();
+
+    await expect(page.locator('[data-testid="retention-degraded"]')).toHaveCount(0);
+    await expect(page.locator("#storage-governor")).toBeVisible();
+    await expect(page.locator('[data-testid="governor-mode"]')).toContainText(
+      "Dry-run (reporting only)",
+    );
+    await expect(page.locator("#storage-governor")).toContainText("projected free");
+    await expect(page.locator('[data-testid="governor-last"]')).toContainText("would free");
 
     assertCleanConsole(probe);
   });

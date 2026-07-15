@@ -285,6 +285,9 @@ fn router_with_all_clients_and_read_client(
             indexer_health_file: std::env::var_os("WEBD_INDEXER_HEALTH_FILE")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("/run/teslausb/indexd.health.json")),
+            governor_status_file: std::env::var_os("WEBD_GOVERNOR_STATUS_FILE")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/run/teslausb/retentiond.governor.json")),
             media_ro_mount: std::env::var_os("WEBD_MEDIA_RO_MOUNT")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("/run/teslausb/media-ro")),
