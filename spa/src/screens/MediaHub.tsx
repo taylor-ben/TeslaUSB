@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from "preact/hooks";
 import { Fragment } from "preact";
-import { api } from "../api/client";
+import { ApiError, api } from "../api/client";
 import type {
   GadgetStatus,
   HealthBlock,
   Pref,
+  SavedWifiNetwork,
   StorageHealth,
   SystemHealth,
   SystemMetrics,
@@ -61,11 +62,11 @@ const TIMEZONES = [
 ];
 
 // System Health subsystems + severity colors — transcribed verbatim from the
-// legacy index.html card (Phase 4.2). The legacy JS renders any subsystem key
-// absent from the probe payload as a grey "unknown" dot + "—" message; we feed
-// a payload where ONLY `indexer` (Video Indexer) is populated, derived from the
-// read-only catalog, so every other (system-probe) row degrades to that legacy
-// "—" state rather than a fabricated value.
+// legacy index.html card (Phase 4.2). The system-probe rows
+// (gadget/worker/disk/storage_writable/network/journal) come from webd's
+// `/api/system/health`; `indexer` (Video Indexer) is derived client-side from
+// the catalog. Any subsystem key absent from the probe payload degrades to the
+// legacy grey "unknown / —" state rather than a fabricated value.
 const SUBSYSTEMS = [
   { key: "gadget", label: "USB Gadget" },
   { key: "worker", label: "Background Worker" },
@@ -217,8 +218,22 @@ export function MediaHub() {
   const [storage, setStorage] = useState<StorageHealth | null>(null);
   const [wifiStatus, setWifiStatus] = useState<WifiStatus | null>(null);
   const [wifiNetworks, setWifiNetworks] = useState<WifiNetwork[]>([]);
+  const [wifiSaved, setWifiSaved] = useState<SavedWifiNetwork[]>([]);
+  const [wifiOrder, setWifiOrder] = useState<string[]>([]);
+  const [wifiJoinSel, setWifiJoinSel] = useState<string>("");
   const [wifiLoading, setWifiLoading] = useState(true);
   const [wifiScanLoading, setWifiScanLoading] = useState(false);
+  // Which row has an inline form open, and what kind.
+  const [wifiRowForm, setWifiRowForm] = useState<
+    { ssid: string; mode: "join" | "forget" } | null
+  >(null);
+  const [wifiPsk, setWifiPsk] = useState("");
+  // SSID currently being mutated (single-flight; disables all action buttons).
+  const [wifiBusy, setWifiBusy] = useState<string | null>(null);
+  // Inline status line (no toast system exists — surface feedback inline).
+  const [wifiMsg, setWifiMsg] = useState<
+    { kind: "info" | "success" | "error"; text: string } | null
+  >(null);
   const [gadget, setGadget] = useState<GadgetStatus | null>(null);
   const [gadgetUnavailable, setGadgetUnavailable] = useState(false);
   const [derived, setDerived] = useState<{
@@ -234,6 +249,7 @@ export function MediaHub() {
     at: number;
   } | null>(null);
   const wifiScanCtrl = useRef<AbortController | null>(null);
+  const wifiActionCtrl = useRef<AbortController | null>(null);
 
   useEffect(() => {
     const ctrl = new AbortController();
@@ -288,16 +304,22 @@ export function MediaHub() {
     let active = true;
     const ctrl = new AbortController();
     setWifiLoading(true);
-    Promise.all([api.wifiStatus(ctrl.signal), api.wifiNetworks(ctrl.signal)])
-      .then(([status, networks]) => {
+    Promise.all([
+      api.wifiStatus(ctrl.signal),
+      api.wifiNetworks(ctrl.signal),
+      api.wifiSaved(ctrl.signal),
+    ])
+      .then(([status, networks, saved]) => {
         if (!active) return;
         setWifiStatus(status);
         setWifiNetworks(networks.networks);
+        setWifiSaved(saved.networks);
       })
       .catch((err) => {
         if (!active || isAbortError(err)) return;
         setWifiStatus(null);
         setWifiNetworks([]);
+        setWifiSaved([]);
       })
       .finally(() => {
         if (active) setWifiLoading(false);
@@ -311,9 +333,15 @@ export function MediaHub() {
   useEffect(
     () => () => {
       wifiScanCtrl.current?.abort();
+      wifiActionCtrl.current?.abort();
     },
     [],
   );
+
+  useEffect(() => {
+    const nextOrder = wifiSaved.map((n) => n.ssid);
+    setWifiOrder(nextOrder);
+  }, [wifiSaved]);
 
   useEffect(() => {
     let active = true;
@@ -403,8 +431,184 @@ export function MediaHub() {
       });
   };
 
+  const reloadWifi = (signal: AbortSignal) =>
+    Promise.all([api.wifiStatus(signal), api.wifiNetworks(signal), api.wifiSaved(signal)]).then(
+      ([status, networks, saved]) => {
+        setWifiStatus(status);
+        setWifiNetworks(networks.networks);
+        setWifiSaved(saved.networks);
+      },
+    );
+
+  const runConnect = (ssid: string, psk?: string) => {
+    if (wifiBusy) return;
+    wifiActionCtrl.current?.abort();
+    const ctrl = new AbortController();
+    wifiActionCtrl.current = ctrl;
+    setWifiBusy(ssid);
+    setWifiMsg({ kind: "info", text: `Connecting to ${ssid}…` });
+    api
+      .wifiConnect({ ssid, ...(psk ? { psk } : {}) }, ctrl.signal)
+      .then((resp) => {
+        if (ctrl.signal.aborted) return;
+        setWifiRowForm(null);
+        setWifiPsk("");
+        setWifiJoinSel("");
+        setWifiMsg({
+          kind: resp.connected ? "success" : "error",
+          text: resp.connected
+            ? `Connected to ${ssid}${resp.ip ? ` (${resp.ip})` : ""}`
+            : `Could not connect to ${ssid}`,
+        });
+        return reloadWifi(ctrl.signal).catch(() => {});
+      })
+      .catch((err) => {
+        if (ctrl.signal.aborted || isAbortError(err)) return;
+        setWifiMsg({
+          kind: "error",
+          text: err instanceof ApiError ? err.message : `Could not connect to ${ssid}`,
+        });
+      })
+      .finally(() => {
+        if (!ctrl.signal.aborted) setWifiBusy(null);
+      });
+  };
+
+  const runForget = (ssid: string) => {
+    if (wifiBusy) return;
+    wifiActionCtrl.current?.abort();
+    const ctrl = new AbortController();
+    wifiActionCtrl.current = ctrl;
+    setWifiBusy(ssid);
+    setWifiMsg({ kind: "info", text: `Removing ${ssid}…` });
+    api
+      .wifiForget(ssid, ctrl.signal)
+      .then((resp) => {
+        if (ctrl.signal.aborted) return;
+        setWifiRowForm(null);
+        setWifiMsg({
+          kind: resp.forgotten ? "success" : "error",
+          text: resp.forgotten
+            ? `Removed saved network ${ssid}`
+            : `Could not remove ${ssid}`,
+        });
+        return reloadWifi(ctrl.signal).catch(() => {});
+      })
+      .catch((err) => {
+        if (ctrl.signal.aborted || isAbortError(err)) return;
+        setWifiMsg({
+          kind: "error",
+          text: err instanceof ApiError ? err.message : `Could not remove ${ssid}`,
+        });
+      })
+      .finally(() => {
+        if (!ctrl.signal.aborted) setWifiBusy(null);
+      });
+  };
+
+  const runSelect = (ssid: string) => {
+    if (wifiBusy) return;
+    wifiActionCtrl.current?.abort();
+    const ctrl = new AbortController();
+    wifiActionCtrl.current = ctrl;
+    setWifiBusy(ssid);
+    setWifiMsg({ kind: "info", text: `Connecting to ${ssid}…` });
+    api
+      .wifiSelect(ssid, ctrl.signal)
+      .then((resp) => {
+        if (ctrl.signal.aborted) return;
+        setWifiMsg({
+          kind: resp.connected ? "success" : "error",
+          text: resp.connected
+            ? `Connected to ${ssid}${resp.ip ? ` (${resp.ip})` : ""}`
+            : `Could not connect to ${ssid}`,
+        });
+        return reloadWifi(ctrl.signal).catch(() => {});
+      })
+      .catch((err) => {
+        if (ctrl.signal.aborted || isAbortError(err)) return;
+        const reverted =
+          err instanceof ApiError && err.code === "wifi_select_timeout";
+        setWifiMsg({
+          kind: "error",
+          text: reverted
+            ? `Could not connect to ${ssid} — kept your previous network`
+            : err instanceof ApiError
+              ? err.message
+              : `Could not connect to ${ssid}`,
+        });
+        return reloadWifi(ctrl.signal).catch(() => {});
+      })
+      .finally(() => {
+        if (!ctrl.signal.aborted) setWifiBusy(null);
+      });
+  };
+
+  const moveWifi = (idx: number, dir: -1 | 1) => {
+    setWifiOrder((prev) => {
+      const next = prev.slice();
+      const j = idx + dir;
+      if (j < 0 || j >= next.length) return prev;
+      [next[idx], next[j]] = [next[j], next[idx]];
+      return next;
+    });
+  };
+
+  const saveWifiOrder = () => {
+    if (wifiBusy) return;
+    wifiActionCtrl.current?.abort();
+    const ctrl = new AbortController();
+    wifiActionCtrl.current = ctrl;
+    setWifiBusy("__order__");
+    setWifiMsg({ kind: "info", text: "Saving priority order…" });
+    api
+      .wifiPriority({ order: wifiOrder }, ctrl.signal)
+      .then(() => {
+        if (ctrl.signal.aborted) return;
+        setWifiMsg({ kind: "success", text: "Priority order saved" });
+        return reloadWifi(ctrl.signal).catch(() => {});
+      })
+      .catch((err) => {
+        if (ctrl.signal.aborted || isAbortError(err)) return;
+        setWifiMsg({ kind: "error", text: "Could not save priority order" });
+      })
+      .finally(() => {
+        if (!ctrl.signal.aborted) setWifiBusy(null);
+      });
+  };
+
+  const startJoin = (network: WifiNetwork) => {
+    if (wifiBusy) return;
+    setWifiMsg(null);
+    if (network.security) {
+      // Secured + unsaved → reveal inline PSK form.
+      setWifiPsk("");
+      setWifiRowForm({ ssid: network.ssid, mode: "join" });
+    } else {
+      // Open network → connect immediately.
+      void runConnect(network.ssid);
+    }
+  };
+
+  const startForget = (ssid: string) => {
+    if (wifiBusy) return;
+    setWifiMsg(null);
+    setWifiRowForm({ ssid, mode: "forget" });
+  };
+
+  const cancelRowForm = () => {
+    setWifiRowForm(null);
+    setWifiPsk("");
+  };
+
   const overall = health?.overall ?? "unknown";
   const statusCopy = STATUS_COPY[overall] ?? STATUS_COPY.unknown;
+  const wifiServerOrder = wifiSaved.map((n) => n.ssid);
+  const wifiOrderDirty = wifiOrder.join("\u0001") !== wifiServerOrder.join("\u0001");
+  const orderedSaved = wifiOrder
+    .map((ssid) => wifiSaved.find((n) => n.ssid === ssid))
+    .filter((n): n is SavedWifiNetwork => n != null);
+  const availableWifi = wifiNetworks.filter((n) => !n.saved && !n.active);
 
   return (
     // Bare screen content — the router hoists a single shared <Shell> and
@@ -456,7 +660,7 @@ export function MediaHub() {
               </p>
               <div
                 id="system-health-rows"
-                style="display:grid; grid-template-columns:auto auto 1fr; gap:6px 12px; align-items:center; font-size:0.9rem;"
+                style="display:grid; grid-template-columns:auto auto 1fr; gap:6px 12px; align-items:start; font-size:0.9rem;"
               >
                 {SUBSYSTEMS.map((sub) => {
                   let sev: string;
@@ -488,7 +692,7 @@ export function MediaHub() {
                         />
                       </div>
                       <div style="color:var(--text-primary)">{sub.label}</div>
-                      <div style="color:var(--text-secondary); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
+                      <div style="color:var(--text-secondary); min-width:0; overflow-wrap:anywhere;">
                         {msg}
                       </div>
                     </Fragment>
@@ -551,7 +755,7 @@ export function MediaHub() {
             {gadget ? (
               <div
                 id="usb-gadget-card"
-                style="display:grid; grid-template-columns:auto 1fr; gap:6px 12px; font-size:0.9rem; align-items:center;"
+                style="display:grid; grid-template-columns:auto 1fr; gap:6px 12px; font-size:0.9rem; align-items:start;"
               >
                 <div style="color:var(--text-secondary)">Presented to car</div>
                 <div data-testid="usb-present" style="color:var(--text-primary)">
@@ -564,17 +768,17 @@ export function MediaHub() {
                     : "No"}
                 </div>
                 <div style="color:var(--text-secondary)">Dashcam image</div>
-                <div style="color:var(--text-primary); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
+                <div style="color:var(--text-primary); min-width:0; overflow-wrap:anywhere;">
                   {gadget.lun_file ?? "\u2014"}
                 </div>
                 <div style="color:var(--text-secondary)">Media image</div>
-                <div style="color:var(--text-primary); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
+                <div style="color:var(--text-primary); min-width:0; overflow-wrap:anywhere;">
                   {gadget.media_lun_file ?? "\u2014"}
                 </div>
                 <div style="color:var(--text-secondary)">Media mount (read)</div>
                 <div
                   data-testid="usb-media-ro"
-                  style="color:var(--text-primary); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"
+                  style="color:var(--text-primary); min-width:0; overflow-wrap:anywhere;"
                 >
                   {gadget.media_ro_mounted === null
                     ? "\u2014"
@@ -601,27 +805,43 @@ export function MediaHub() {
           </div>
         </details>
 
-        {/* WiFi Networks — read-only NetworkManager view (no join/disconnect). */}
+        {/* WiFi Networks — NetworkManager view with join/forget controls. */}
         <details class="settings-section" id="wifi-networks-section">
           <summary>WiFi Networks</summary>
           <div class="section-content">
             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
               <p style="font-size:0.85em;color:var(--text-secondary);margin:0">
-                Networks higher in the list are preferred when multiple are in
-                range.
+                Configured networks are listed in priority order — the device
+                prefers the highest-priority network in range.
               </p>
               <button
                 type="button"
                 class="edit-btn"
                 id="btnWifiScan"
                 style="padding:4px 10px;font-size:0.85em;white-space:nowrap"
-                disabled={wifiLoading || wifiScanLoading}
+                disabled={wifiLoading || wifiScanLoading || wifiBusy != null}
                 onClick={onWifiScan}
               >
                 {wifiScanLoading ? "Scanning…" : "Scan"}
               </button>
             </div>
             <div id="savedNetworksList">
+              {wifiMsg ? (
+                <div
+                  id="wifi-action-status"
+                  role="status"
+                  aria-live="polite"
+                  style={`font-size:0.85em;margin:2px 0 6px;color:${
+                    wifiMsg.kind === "error"
+                      ? "var(--accent-error, #e53935)"
+                      : wifiMsg.kind === "success"
+                        ? "var(--accent-success, #4caf50)"
+                        : "var(--text-secondary)"
+                  }`}
+                >
+                  {wifiMsg.text}
+                </div>
+              ) : null}
               {wifiLoading ? (
                 <div style="text-align:center;padding:12px;color:var(--text-secondary)">
                   Loading Wi-Fi networks…
@@ -648,48 +868,234 @@ export function MediaHub() {
                       </span>
                     ) : null}
                   </div>
-                  {wifiNetworks.length > 0 ? (
-                    <div
-                      id="wifi-networks-list"
-                      style="display:flex;flex-direction:column;gap:6px"
-                    >
-                      {wifiNetworks.map((network) => (
-                        <div
-                          key={network.ssid}
-                          class="wifi-network-row"
-                          style="display:flex;align-items:center;gap:10px;padding:8px 10px;border:1px solid var(--border-color);border-radius:8px"
+                  <div id="wifi-saved-list" style="display:flex;flex-direction:column;gap:6px">
+                    <h4 style="margin:0;font-size:0.95em">Configured networks</h4>
+                    {wifiSaved.length > 0 ? (
+                      <Fragment>
+                        {orderedSaved.map((sn, idx) => {
+                          const scan = wifiNetworks.find((n) => n.ssid === sn.ssid);
+                          const isActive =
+                            sn.active ||
+                            (!!wifiStatus?.connected && wifiStatus?.ssid === sn.ssid);
+                          return (
+                            <div
+                              key={sn.ssid}
+                              class="wifi-network-row wifi-saved-row"
+                              data-ssid={sn.ssid}
+                              style="display:flex;align-items:center;flex-wrap:wrap;gap:10px;padding:8px 10px;border:1px solid var(--border-color);border-radius:8px"
+                            >
+                              <div style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+                                {sn.ssid}
+                              </div>
+                              <div style="font-size:0.85em;color:var(--text-secondary);white-space:nowrap">
+                                {scan ? (
+                                  <Fragment>
+                                    {wifiSignalBars(scan.signal)} {scan.signal}%
+                                  </Fragment>
+                                ) : (
+                                  "Not in range"
+                                )}
+                              </div>
+                              <div style="display:flex;align-items:center;flex-wrap:wrap;gap:6px">
+                                {scan?.security ? <span aria-label="Secured">🔒</span> : null}
+                                {isActive ? (
+                                  <span
+                                    style="font-size:0.75em;padding:2px 8px;border-radius:999px;background:var(--bg-secondary);border:1px solid var(--accent-success, #4caf50);color:var(--accent-success, #4caf50)"
+                                  >
+                                    Connected
+                                  </span>
+                                ) : null}
+                                {!isActive ? (
+                                  <button
+                                    type="button"
+                                    class="edit-btn wifi-connect-btn"
+                                    data-ssid={sn.ssid}
+                                    disabled={wifiBusy != null}
+                                    onClick={() => runSelect(sn.ssid)}
+                                    style="padding:4px 10px;font-size:0.85em;white-space:nowrap"
+                                  >
+                                    Connect
+                                  </button>
+                                ) : null}
+                                {!isActive ? (
+                                  <button
+                                    type="button"
+                                    class="edit-btn wifi-forget-btn"
+                                    data-ssid={sn.ssid}
+                                    disabled={wifiBusy != null}
+                                    onClick={() => startForget(sn.ssid)}
+                                    style="padding:4px 10px;font-size:0.85em;white-space:nowrap"
+                                  >
+                                    Forget
+                                  </button>
+                                ) : null}
+                                <button
+                                  type="button"
+                                  class="edit-btn wifi-move-up"
+                                  aria-label="Move up"
+                                  disabled={wifiBusy != null || idx === 0}
+                                  onClick={() => moveWifi(idx, -1)}
+                                  style="padding:4px 10px;font-size:0.85em;white-space:nowrap"
+                                >
+                                  ↑
+                                </button>
+                                <button
+                                  type="button"
+                                  class="edit-btn wifi-move-down"
+                                  aria-label="Move down"
+                                  disabled={wifiBusy != null || idx === orderedSaved.length - 1}
+                                  onClick={() => moveWifi(idx, 1)}
+                                  style="padding:4px 10px;font-size:0.85em;white-space:nowrap"
+                                >
+                                  ↓
+                                </button>
+                              </div>
+                              {wifiRowForm?.ssid === sn.ssid && wifiRowForm.mode === "forget" ? (
+                                <div style="display:flex;gap:6px;align-items:center;margin-top:6px;width:100%">
+                                  <span style="flex:1;min-width:0;font-size:0.85em;color:var(--text-secondary)">
+                                    Forget this saved network?
+                                  </span>
+                                  <button
+                                    type="button"
+                                    class="edit-btn wifi-forget-confirm"
+                                    disabled={wifiBusy != null}
+                                    onClick={() => runForget(sn.ssid)}
+                                    style="padding:4px 10px;font-size:0.85em"
+                                  >
+                                    Confirm
+                                  </button>
+                                  <button
+                                    type="button"
+                                    class="edit-btn wifi-forget-cancel"
+                                    disabled={wifiBusy != null}
+                                    onClick={cancelRowForm}
+                                    style="padding:4px 10px;font-size:0.85em"
+                                  >
+                                    Cancel
+                                  </button>
+                                </div>
+                              ) : null}
+                            </div>
+                          );
+                        })}
+                        {orderedSaved.length > 1 ? (
+                          <div style="display:flex;flex-direction:column;gap:6px;padding-top:2px">
+                            <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+                              <button
+                                type="button"
+                                class="edit-btn"
+                                id="wifi-order-save"
+                                disabled={wifiBusy != null || !wifiOrderDirty}
+                                onClick={saveWifiOrder}
+                                style="padding:4px 10px;font-size:0.85em"
+                              >
+                                Save priority order
+                              </button>
+                              <button
+                                type="button"
+                                class="edit-btn"
+                                id="wifi-order-reset"
+                                disabled={wifiBusy != null || !wifiOrderDirty}
+                                onClick={() => setWifiOrder(wifiServerOrder)}
+                                style="padding:4px 10px;font-size:0.85em"
+                              >
+                                Reset
+                              </button>
+                            </div>
+                            <span style="font-size:0.85em;color:var(--text-secondary)">
+                              Higher = preferred when in range.
+                            </span>
+                          </div>
+                        ) : null}
+                      </Fragment>
+                    ) : (
+                      <div style="color:var(--text-secondary);font-size:0.9em">
+                        No configured networks.
+                      </div>
+                    )}
+                  </div>
+
+                  <div style="display:flex;flex-direction:column;gap:6px">
+                    <h4 style="margin:0;font-size:0.95em">Available networks</h4>
+                    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+                      <select
+                        id="wifi-available-select"
+                        value={wifiJoinSel}
+                        disabled={wifiBusy != null || availableWifi.length === 0}
+                        onChange={(e) =>
+                          setWifiJoinSel((e.target as HTMLSelectElement).value)
+                        }
+                        style="flex:1;min-width:220px;padding:4px 8px;font-size:0.9em"
+                      >
+                        <option value="">
+                          {availableWifi.length
+                            ? "Select a network to join…"
+                            : "No new networks in range"}
+                        </option>
+                        {availableWifi.map((n) => (
+                          <option key={n.ssid} value={n.ssid}>
+                            {n.ssid} · {n.signal}%
+                            {n.security ? " 🔒" : ""}
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        type="button"
+                        class="edit-btn"
+                        id="wifi-join-btn"
+                        disabled={wifiBusy != null || wifiJoinSel === ""}
+                        onClick={() => {
+                          const net = availableWifi.find((n) => n.ssid === wifiJoinSel);
+                          if (net) startJoin(net);
+                        }}
+                        style="padding:4px 10px;font-size:0.85em;white-space:nowrap"
+                      >
+                        Join
+                      </button>
+                    </div>
+                    {wifiRowForm?.mode === "join" ? (
+                      <div style="display:flex;flex-direction:column;gap:6px;max-width:480px">
+                        <label
+                          for="wifi-join-password"
+                          style="font-size:0.85em;color:var(--text-secondary)"
                         >
-                          <div style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
-                            {network.ssid}
-                          </div>
-                          <div style="font-size:0.85em;color:var(--text-secondary);white-space:nowrap">
-                            {wifiSignalBars(network.signal)} {network.signal}%
-                          </div>
-                          <div style="display:flex;align-items:center;gap:6px;white-space:nowrap">
-                            {network.security ? <span aria-label="Secured">🔒</span> : null}
-                            {network.saved ? (
-                              <span
-                                style="font-size:0.75em;padding:2px 8px;border-radius:999px;background:var(--bg-secondary);border:1px solid var(--border-color);color:var(--text-secondary)"
-                              >
-                                Saved
-                              </span>
-                            ) : null}
-                            {network.active ? (
-                              <span
-                                style="font-size:0.75em;padding:2px 8px;border-radius:999px;background:var(--bg-secondary);border:1px solid var(--accent-success, #4caf50);color:var(--accent-success, #4caf50)"
-                              >
-                                Connected
-                              </span>
-                            ) : null}
-                          </div>
+                          Password for {wifiRowForm.ssid}
+                        </label>
+                        <div style="display:flex;gap:6px;align-items:center">
+                          <input
+                            id="wifi-join-password"
+                            type="password"
+                            class="wifi-psk-input"
+                            placeholder="Wi-Fi password"
+                            value={wifiPsk}
+                            disabled={wifiBusy != null}
+                            onInput={(e) =>
+                              setWifiPsk((e.target as HTMLInputElement).value)
+                            }
+                            style="flex:1;min-width:0;padding:4px 8px;font-size:0.85em"
+                          />
+                          <button
+                            type="button"
+                            class="edit-btn wifi-connect-confirm"
+                            disabled={wifiBusy != null || wifiPsk.length === 0}
+                            onClick={() => runConnect(wifiRowForm.ssid, wifiPsk)}
+                            style="padding:4px 10px;font-size:0.85em"
+                          >
+                            Connect
+                          </button>
+                          <button
+                            type="button"
+                            class="edit-btn wifi-join-cancel"
+                            disabled={wifiBusy != null}
+                            onClick={cancelRowForm}
+                            style="padding:4px 10px;font-size:0.85em"
+                          >
+                            Cancel
+                          </button>
                         </div>
-                      ))}
-                    </div>
-                  ) : (
-                    <div style="text-align:center;padding:12px;color:var(--text-secondary)">
-                      No nearby Wi-Fi networks found.
-                    </div>
-                  )}
+                      </div>
+                    ) : null}
+                  </div>
                 </div>
               )}
             </div>

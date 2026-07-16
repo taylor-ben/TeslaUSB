@@ -264,6 +264,65 @@ export interface WifiNetworksResponse {
   networks: WifiNetwork[];
 }
 
+/** One configured Wi-Fi profile (`GET /api/wifi/saved`), highest priority first. */
+export interface SavedWifiNetwork {
+  ssid: string;
+  priority: number;
+  autoconnect: boolean;
+  active: boolean;
+}
+/** `GET /api/wifi/saved`. */
+export interface SavedWifiResponse {
+  networks: SavedWifiNetwork[];
+}
+
+/** `POST /api/wifi/connect`. */
+export interface WifiConnectRequest {
+  ssid: string;
+  psk?: string;
+}
+
+/** Response of `POST /api/wifi/connect`. */
+export interface WifiConnectResponse {
+  connected: boolean;
+  ssid: string;
+  ip: string | null;
+  autoconnect: boolean;
+}
+
+/** `POST /api/wifi/forget`. */
+export interface WifiForgetRequest {
+  ssid: string;
+}
+
+/** Response of `POST /api/wifi/forget`. */
+export interface WifiForgetResponse {
+  forgotten: boolean;
+  count: number;
+}
+
+/** `POST /api/wifi/select` — activate an already-saved network now. */
+export interface WifiSelectRequest {
+  ssid: string;
+}
+
+/** Response of `POST /api/wifi/select`. */
+export interface WifiSelectResponse {
+  connected: boolean;
+  ssid: string;
+  ip: string | null;
+}
+
+/** `POST /api/wifi/priority` body — all saved ssids, highest priority first. */
+export interface WifiPriorityRequest {
+  order: string[];
+}
+/** `POST /api/wifi/priority` response. */
+export interface WifiPriorityResponse {
+  ok: boolean;
+  count: number;
+}
+
 /** One filesystem of `GET /api/storage`. */
 export interface FilesystemEntry {
   mount: string;

@@ -39,6 +39,22 @@ struct WifiNetworksResponse {
     networks: Vec<WifiNetwork>,
 }
 
+#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
+struct SavedWifiNetwork {
+    ssid: String,
+    /// NetworkManager `connection.autoconnect-priority` (higher = preferred; default 0).
+    priority: i32,
+    /// `connection.autoconnect` — whether NM will auto-join this profile.
+    autoconnect: bool,
+    /// True when this saved profile is the active wlan0 connection.
+    active: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
+struct SavedWifiResponse {
+    networks: Vec<SavedWifiNetwork>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ActiveWifiRow {
     ssid: String,
@@ -53,6 +69,7 @@ pub(crate) fn routes() -> Router<AppState> {
     Router::new()
         .route("/wifi/status", get(wifi_status))
         .route("/wifi/networks", get(wifi_networks))
+        .route("/wifi/saved", get(wifi_saved))
         .route("/wifi/scan", post(wifi_scan))
 }
 
@@ -66,6 +83,15 @@ async fn wifi_status(State(_): State<AppState>) -> Json<WifiStatus> {
 async fn wifi_networks(State(_): State<AppState>) -> Json<WifiNetworksResponse> {
     let out = tokio::task::spawn_blocking(|| WifiNetworksResponse {
         networks: read_wifi_networks(),
+    })
+    .await
+    .unwrap_or_default();
+    Json(out)
+}
+
+async fn wifi_saved(State(_): State<AppState>) -> Json<SavedWifiResponse> {
+    let out = tokio::task::spawn_blocking(|| SavedWifiResponse {
+        networks: read_saved_networks(),
     })
     .await
     .unwrap_or_default();
@@ -207,6 +233,135 @@ fn parse_ssid_field(output: &str) -> Option<String> {
     output.lines().find_map(|line| {
         let fields = split_terse_line(line);
         if fields.is_empty() || fields[0] != "802-11-wireless.ssid" {
+            return None;
+        }
+        let value = fields.iter().skip(1).cloned().collect::<Vec<_>>().join(":");
+        normalize_value(&value)
+    })
+}
+
+/// Parse `(autoconnect, priority, ssid)` from a per-profile terse
+/// `connection show` dump. `ssid` is required (None → skip the profile);
+/// autoconnect defaults false and priority defaults 0 when absent/unparseable.
+fn parse_saved_profile_detail(output: &str) -> Option<(bool, i32, String)> {
+    let ssid = parse_ssid_field(output)?;
+    let mut autoconnect = false;
+    let mut priority = 0;
+
+    for line in output.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        match key {
+            "connection.autoconnect" => autoconnect = value.trim() == "yes",
+            "connection.autoconnect-priority" => {
+                priority = value.trim().parse::<i32>().unwrap_or(0);
+            }
+            _ => {}
+        }
+    }
+
+    Some((autoconnect, priority, ssid))
+}
+
+/// Order saved networks by priority (desc) then ssid (asc), de-duplicating by
+/// ssid (keep the highest priority; OR the `active` and `autoconnect` flags).
+fn order_saved_networks(rows: Vec<SavedWifiNetwork>) -> Vec<SavedWifiNetwork> {
+    let mut by_ssid: HashMap<String, SavedWifiNetwork> = HashMap::new();
+
+    for row in rows {
+        if let Some(existing) = by_ssid.get_mut(&row.ssid) {
+            existing.priority = existing.priority.max(row.priority);
+            existing.active |= row.active;
+            existing.autoconnect |= row.autoconnect;
+        } else {
+            by_ssid.insert(row.ssid.clone(), row);
+        }
+    }
+
+    let mut out: Vec<SavedWifiNetwork> = by_ssid.into_values().collect();
+    out.sort_by(|left, right| {
+        right
+            .priority
+            .cmp(&left.priority)
+            .then(left.ssid.cmp(&right.ssid))
+    });
+    out
+}
+
+fn read_saved_networks() -> Vec<SavedWifiNetwork> {
+    let show =
+        capture("nmcli", &["-t", "-f", "NAME,TYPE", "connection", "show"]).unwrap_or_default();
+    let active_uuid = read_active_uuid_on_wlan0();
+    let mut rows = Vec::new();
+
+    for name in parse_wifi_profile_names(&show) {
+        let detail = capture(
+            "nmcli",
+            &[
+                "-t",
+                "-f",
+                "connection.autoconnect,connection.autoconnect-priority,802-11-wireless.ssid",
+                "connection",
+                "show",
+                name.as_str(),
+            ],
+        );
+        let uuid = capture(
+            "nmcli",
+            &["-t", "-f", "connection.uuid", "connection", "show", name.as_str()],
+        )
+        .as_deref()
+        .and_then(parse_connection_uuid)
+        .unwrap_or_default();
+        let Some((autoconnect, priority, ssid)) =
+            detail.as_deref().and_then(parse_saved_profile_detail)
+        else {
+            continue;
+        };
+        rows.push(SavedWifiNetwork {
+            ssid,
+            priority,
+            autoconnect,
+            active: !uuid.is_empty() && active_uuid.as_deref() == Some(uuid.as_str()),
+        });
+    }
+
+    order_saved_networks(rows)
+}
+
+fn read_active_uuid_on_wlan0() -> Option<String> {
+    let output = capture(
+        "nmcli",
+        &[
+            "-t",
+            "-f",
+            "UUID,DEVICE,STATE",
+            "connection",
+            "show",
+            "--active",
+        ],
+    )?;
+    parse_active_uuid_on_wlan0(&output)
+}
+
+fn parse_active_uuid_on_wlan0(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let fields = split_terse_line(line);
+        if fields.len() < 3 {
+            return None;
+        }
+        if fields[1] == "wlan0" && fields[2].eq_ignore_ascii_case("activated") {
+            return normalize_value(&fields[0]);
+        }
+        None
+    })
+}
+
+fn parse_connection_uuid(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let fields = split_terse_line(line);
+        if fields.is_empty() || fields[0] != "connection.uuid" {
             return None;
         }
         let value = fields.iter().skip(1).cloned().collect::<Vec<_>>().join(":");
@@ -379,8 +534,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        WifiNetwork, can_rescan, dedupe_sort_networks, parse_active_wifi_row, parse_network_rows,
-        parse_signal, parse_ssid_field, parse_wifi_profile_names, split_terse_line,
+        SavedWifiNetwork, WifiNetwork, can_rescan, dedupe_sort_networks, order_saved_networks,
+        parse_active_wifi_row, parse_network_rows, parse_saved_profile_detail, parse_signal,
+        parse_ssid_field, parse_wifi_profile_names, split_terse_line,
     };
 
     #[test]
@@ -481,6 +637,110 @@ mod tests {
         assert_eq!(
             parse_ssid_field("802-11-wireless.ssid:Office\\:WiFi\n").as_deref(),
             Some("Office:WiFi")
+        );
+    }
+
+    #[test]
+    fn parse_saved_profile_detail_full() {
+        let out = "\
+connection.autoconnect:yes
+connection.autoconnect-priority:10
+802-11-wireless.ssid:Trez
+";
+        assert_eq!(
+            parse_saved_profile_detail(out),
+            Some((true, 10, "Trez".to_owned()))
+        );
+    }
+
+    #[test]
+    fn parse_saved_profile_detail_defaults() {
+        let out = "802-11-wireless.ssid:Guest\n";
+        assert_eq!(
+            parse_saved_profile_detail(out),
+            Some((false, 0, "Guest".to_owned()))
+        );
+    }
+
+    #[test]
+    fn parse_saved_profile_detail_no_ssid() {
+        let out = "\
+connection.autoconnect:yes
+connection.autoconnect-priority:10
+";
+        assert_eq!(parse_saved_profile_detail(out), None);
+    }
+
+    #[test]
+    fn parse_saved_profile_detail_priority_unparseable_is_zero() {
+        let out = "\
+connection.autoconnect:no
+connection.autoconnect-priority:not-a-number
+802-11-wireless.ssid:Guest
+";
+        assert_eq!(
+            parse_saved_profile_detail(out),
+            Some((false, 0, "Guest".to_owned()))
+        );
+    }
+
+    #[test]
+    fn order_saved_networks_orders_desc_then_ssid() {
+        let rows = vec![
+            SavedWifiNetwork {
+                ssid: "Trez".to_owned(),
+                priority: 20,
+                autoconnect: true,
+                active: false,
+            },
+            SavedWifiNetwork {
+                ssid: "Alpha".to_owned(),
+                priority: 20,
+                autoconnect: false,
+                active: false,
+            },
+            SavedWifiNetwork {
+                ssid: "Guest".to_owned(),
+                priority: 0,
+                autoconnect: true,
+                active: true,
+            },
+        ];
+
+        let ordered = order_saved_networks(rows);
+        assert_eq!(ordered.len(), 3);
+        assert_eq!(ordered[0].ssid, "Alpha");
+        assert_eq!(ordered[1].ssid, "Trez");
+        assert_eq!(ordered[2].ssid, "Guest");
+    }
+
+    #[test]
+    fn order_saved_networks_dedupes_by_ssid() {
+        let rows = vec![
+            SavedWifiNetwork {
+                ssid: "Trez".to_owned(),
+                priority: 10,
+                autoconnect: false,
+                active: false,
+            },
+            SavedWifiNetwork {
+                ssid: "Trez".to_owned(),
+                priority: 30,
+                autoconnect: true,
+                active: true,
+            },
+        ];
+
+        let ordered = order_saved_networks(rows);
+        assert_eq!(ordered.len(), 1);
+        assert_eq!(
+            ordered[0],
+            SavedWifiNetwork {
+                ssid: "Trez".to_owned(),
+                priority: 30,
+                autoconnect: true,
+                active: true,
+            }
         );
     }
 

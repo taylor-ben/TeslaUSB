@@ -58,6 +58,7 @@ mod sysinfo;
 mod stats_client;
 pub(crate) mod timezone;
 mod wifi;
+mod wifi_mutate;
 mod wraps;
 
 #[cfg(test)]
@@ -97,6 +98,7 @@ struct AppState {
     /// this whenever `indexd` commits, and the `/api/media-events` SSE forwards
     /// each tick to browsers so media lists refresh in real time (no polling).
     media_events: media_events::MediaEvents,
+    wifi_mutation: Arc<tokio::sync::Mutex<()>>,
     /// The `schedulerd`-owned chime library directory (`/data/teslausb/chimes`),
     /// kept for compatibility with the legacy scheduler proxy path.
     #[allow(dead_code)]
@@ -307,6 +309,7 @@ fn router_with_all_clients_and_read_client(
         stats_client,
         jobs: jobs::JobHub::new(),
         media_events,
+        wifi_mutation: Arc::new(tokio::sync::Mutex::new(())),
         chime_library_dir,
     };
     if std::env::var_os("WEBD_CHIME_ENFORCER").is_some() {

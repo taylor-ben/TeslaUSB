@@ -124,11 +124,42 @@ const WIFI_NETWORKS_FIXTURE = {
       protected: false,
     },
     {
-      ssid: "Office",
-      signal: 63,
-      security: "WPA3",
+      ssid: "Office-5G",
+      signal: 60,
+      security: "WPA2",
+      saved: false,
+      active: false,
+      protected: false,
+    },
+    {
+      ssid: "Old-Cafe",
+      signal: 40,
+      security: "WPA2",
       saved: true,
       active: false,
+      protected: false,
+    },
+  ],
+};
+
+const WIFI_SAVED_FIXTURE = {
+  networks: [
+    {
+      ssid: "Trez",
+      priority: 100,
+      autoconnect: true,
+      protected: true,
+    },
+    {
+      ssid: "Old-Cafe",
+      priority: 10,
+      autoconnect: true,
+      protected: false,
+    },
+    {
+      ssid: "Garage",
+      priority: 9,
+      autoconnect: true,
       protected: false,
     },
   ],
@@ -156,6 +187,34 @@ async function routeWifiProbes(page: Page) {
   });
   await page.route("**/api/wifi/status", (r) => r.fulfill(json(WIFI_STATUS_FIXTURE)));
   await page.route("**/api/wifi/networks", (r) => r.fulfill(json(WIFI_NETWORKS_FIXTURE)));
+  await page.route("**/api/wifi/saved", (r) => r.fulfill(json(WIFI_SAVED_FIXTURE)));
+}
+
+async function routeWifiMutations(
+  page: Page,
+  seen: { connect: unknown[]; forget: unknown[]; priority: unknown[] },
+) {
+  const json = (body: unknown) => ({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify(body),
+  });
+  await page.route("**/api/wifi/connect", async (r) => {
+    seen.connect.push(r.request().postDataJSON());
+    const body = r.request().postDataJSON() as { ssid: string };
+    await r.fulfill(
+      json({ connected: true, ssid: body.ssid, ip: "192.168.1.99", autoconnect: false }),
+    );
+  });
+  await page.route("**/api/wifi/forget", async (r) => {
+    seen.forget.push(r.request().postDataJSON());
+    await r.fulfill(json({ forgotten: true, count: 1 }));
+  });
+  await page.route("**/api/wifi/priority", async (r) => {
+    const body = r.request().postDataJSON() as { order?: unknown[] };
+    seen.priority.push(body);
+    await r.fulfill(json({ ok: true, count: Array.isArray(body.order) ? body.order.length : 0 }));
+  });
 }
 
 /** Mock gadgetd-present (200) for `/api/gadget/status`. gadgetd is not spawned
@@ -330,13 +389,19 @@ test.describe("settings dashboard UAT", () => {
     await expect(page.locator("#wifi-current-connection")).toContainText("Trez");
     await expect(page.locator("#wifi-current-connection")).toContainText("52%");
     await expect(page.locator("#wifi-current-connection")).toContainText("Connected");
-    const wifiRows = page.locator("#wifi-networks-list .wifi-network-row");
-    await expect(wifiRows).toHaveCount(3);
-    await expect(wifiRows.nth(0)).toContainText("Trez");
-    await expect(wifiRows.nth(0)).toContainText("Saved");
-    await expect(wifiRows.nth(0)).toContainText("Connected");
-    await expect(wifiRows.nth(1)).toContainText("Garage-Guest");
-    await expect(wifiRows.nth(2)).toContainText("Office");
+    const savedRows = page.locator("#wifi-saved-list .wifi-saved-row");
+    await expect(savedRows).toHaveCount(3);
+    await expect(savedRows.nth(0)).toContainText("Trez");
+    await expect(savedRows.nth(0)).toContainText("Recovery");
+    await expect(savedRows.nth(0)).toContainText("Saved");
+    await expect(savedRows.nth(0)).toContainText("Connected");
+    await expect(savedRows.nth(0).locator(".wifi-forget-btn")).toHaveCount(0);
+    await expect(savedRows.nth(1)).toContainText("Old-Cafe");
+    await expect(savedRows.nth(1).locator(".wifi-forget-btn")).toHaveCount(1);
+    const availableSelect = page.locator("#wifi-available-select");
+    await expect(availableSelect).toBeVisible();
+    await expect(availableSelect.locator("option")).toHaveCount(3);
+    await expect(page.locator("#wifi-join-btn")).toBeDisabled();
     await expect(page.locator("#btnWifiScan")).toBeEnabled();
 
     // Access Point remains degraded in this read-only slice.
@@ -389,6 +454,98 @@ test.describe("settings dashboard UAT", () => {
     await expect(summaries).toHaveCount(SECTION_ORDER.length);
     await expect(summaries).toHaveText(SECTION_ORDER);
 
+    assertCleanConsole(probe);
+  });
+
+  test("wifi networks — join open network without PSK", async ({ page, probe }) => {
+    const seen = { connect: [] as unknown[], forget: [] as unknown[], priority: [] as unknown[] };
+    await routeWifiProbes(page);
+    await routeWifiMutations(page, seen);
+    await gotoDashboard(page);
+    await page.locator("#wifi-networks-section").evaluate((el) => el.setAttribute("open", ""));
+    await expect(page.locator("#wifi-available-select option")).toHaveCount(3);
+    await expect(page.locator("#wifi-join-btn")).toBeDisabled();
+    await page.selectOption("#wifi-available-select", "Garage-Guest");
+    await expect(page.locator("#wifi-join-btn")).toBeEnabled();
+    await page.click("#wifi-join-btn");
+    await expect.poll(() => seen.connect.length).toBe(1);
+    expect(seen.connect[0]).toEqual({ ssid: "Garage-Guest" });
+    await expect(page.locator("#wifi-action-status")).toContainText(
+      "Connected to Garage-Guest",
+    );
+    assertCleanConsole(probe);
+  });
+
+  test("wifi networks — join secured network with PSK", async ({ page, probe }) => {
+    const seen = { connect: [] as unknown[], forget: [] as unknown[], priority: [] as unknown[] };
+    await routeWifiProbes(page);
+    await routeWifiMutations(page, seen);
+    await gotoDashboard(page);
+    await page.locator("#wifi-networks-section").evaluate((el) => el.setAttribute("open", ""));
+    await page.selectOption("#wifi-available-select", "Office-5G");
+    await page.click("#wifi-join-btn");
+    await expect(page.locator(".wifi-psk-input")).toBeVisible();
+    await page.fill(".wifi-psk-input", "hunter2pass");
+    await page.click(".wifi-connect-confirm");
+    await expect.poll(() => seen.connect.length).toBe(1);
+    expect(seen.connect[seen.connect.length - 1]).toEqual({
+      ssid: "Office-5G",
+      psk: "hunter2pass",
+    });
+    await expect(page.locator("#wifi-action-status")).toContainText(
+      "Connected to Office-5G",
+    );
+    assertCleanConsole(probe);
+  });
+
+  test("wifi networks — forget saved non-active network", async ({ page, probe }) => {
+    const seen = { connect: [] as unknown[], forget: [] as unknown[], priority: [] as unknown[] };
+    await routeWifiProbes(page);
+    await routeWifiMutations(page, seen);
+    await gotoDashboard(page);
+    await page.locator("#wifi-networks-section").evaluate((el) => el.setAttribute("open", ""));
+    await page.click('.wifi-saved-row[data-ssid="Old-Cafe"] .wifi-forget-btn');
+    await expect(page.locator(".wifi-forget-confirm")).toBeVisible();
+    await page.click(".wifi-forget-confirm");
+    await expect.poll(() => seen.forget.length).toBe(1);
+    expect(seen.forget[0]).toEqual({ ssid: "Old-Cafe" });
+    await expect(page.locator("#wifi-action-status")).toContainText(
+      "Removed saved network Old-Cafe",
+    );
+    assertCleanConsole(probe);
+  });
+
+  test("wifi networks — reorder saved networks", async ({ page, probe }) => {
+    const seen = { connect: [] as unknown[], forget: [] as unknown[], priority: [] as unknown[] };
+    await routeWifiProbes(page);
+    await routeWifiMutations(page, seen);
+    await gotoDashboard(page);
+    await page.locator("#wifi-networks-section").evaluate((el) => el.setAttribute("open", ""));
+    const trezRow = page.locator('.wifi-saved-row[data-ssid="Trez"]');
+    await expect(trezRow).toContainText("Always connects first");
+    await expect(trezRow.locator(".wifi-move-up")).toHaveCount(0);
+    await expect(trezRow.locator(".wifi-move-down")).toHaveCount(0);
+    const saveBtn = page.locator("#wifi-order-save");
+    await expect(saveBtn).toBeDisabled();
+    await page.click('.wifi-saved-row[data-ssid="Old-Cafe"] .wifi-move-down');
+    await expect(saveBtn).toBeEnabled();
+    await saveBtn.click();
+    await expect.poll(() => seen.priority.length).toBe(1);
+    expect(seen.priority[0]).toEqual({ order: ["Garage", "Old-Cafe"] });
+    assertCleanConsole(probe);
+  });
+
+  test("wifi networks — active protected row has no mutation controls", async ({
+    page,
+    probe,
+  }) => {
+    await routeWifiProbes(page);
+    await gotoDashboard(page);
+    await page.locator("#wifi-networks-section").evaluate((el) => el.setAttribute("open", ""));
+    const trezRow = page.locator('.wifi-saved-row[data-ssid="Trez"]');
+    await expect(trezRow).toBeVisible();
+    await expect(trezRow).toContainText("Recovery");
+    await expect(trezRow.locator(".wifi-forget-btn")).toHaveCount(0);
     assertCleanConsole(probe);
   });
 
@@ -615,6 +772,7 @@ test.describe("settings dashboard UAT", () => {
       apiSeen.has("/api/wifi/networks"),
       "/api/wifi/networks was never requested",
     ).toBe(true);
+    expect(apiSeen.has("/api/wifi/saved"), "/api/wifi/saved was never requested").toBe(true);
 
     // ACTIVELY exercise the mutation surface: expand every section, then prove
     // each config <form> swallows its submit (onSubmit preventDefault) and that

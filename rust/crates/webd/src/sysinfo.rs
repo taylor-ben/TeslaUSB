@@ -1,7 +1,8 @@
 //! Read-only system + storage probing for the device-status endpoints
 //! (`webd.md` §2.2 / §3 "System health" / "Storage"). Every datum is a
-//! `/proc`, `/sys`, or `statvfs(3)` read — `webd` never writes and never
-//! shells out.
+//! `/proc`, `/sys`, or `statvfs(3)` read. A few best-effort probes use
+//! read-only system commands (`nmcli`, `journalctl`) and degrade to `unknown`
+//! when unavailable.
 //!
 //! Probing is behind the [`SystemProbe`] trait so the handlers stay testable
 //! on the non-Linux build host (where `/proc` and `statvfs` do not exist): the
@@ -93,6 +94,17 @@ pub struct FsStat {
     pub total_inodes: u64,
 }
 
+/// Current `WiFi` association, for the `network` health row. Best-effort.
+#[derive(Debug, Clone, Default)]
+pub struct WifiLink {
+    /// Whether wlan0 is associated with an access point.
+    pub connected: bool,
+    /// The SSID when connected.
+    pub ssid: Option<String>,
+    /// Signal strength percent (0-100) when known.
+    pub signal: Option<u8>,
+}
+
 impl FsStat {
     /// Bytes in use (`total - free`, saturating).
     #[must_use]
@@ -154,6 +166,21 @@ pub trait SystemProbe: Send + Sync {
     fn primary_ipv4(&self) -> Option<String> {
         None
     }
+
+    /// The current `WiFi` association on wlan0 (from `nmcli`). `None` when it
+    /// cannot be determined (nmcli absent/failed) → the row degrades to
+    /// unknown. Default `None` for the test double.
+    fn wifi_link(&self) -> Option<WifiLink> {
+        None
+    }
+
+    /// Count of journal entries at error priority (`-p err`) in the last 10
+    /// minutes, system-wide. `None` when the journal cannot be read (no
+    /// permission / journalctl absent) → the row degrades to unknown. Default
+    /// `None` for the test double.
+    fn recent_error_count(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Paths `webd` probes: the Pi-side data/archive root whose ext4 filesystem
@@ -192,8 +219,7 @@ impl HealthBlock {
 
 /// `GET /api/system/health`: an overall rollup plus the per-subsystem blocks
 /// `webd` can probe read-only. Subsystems it cannot observe (car-owned exFAT
-/// volumes, inactive services, Wi-Fi tooling) are deliberately omitted so the
-/// SPA renders them in the legacy `unknown / —` state.
+/// volumes) degrade to `unknown / —` when unavailable.
 #[derive(Debug, Serialize)]
 pub struct SystemHealth {
     /// Worst severity across the probed subsystems (`unknown` if none probed).
@@ -538,6 +564,46 @@ fn writable_block(probe: &dyn SystemProbe, root: &Path) -> (Severity, HealthBloc
     }
 }
 
+/// Build the `network` (`WiFi`) block from the live association.
+fn network_block(probe: &dyn SystemProbe) -> (Severity, HealthBlock) {
+    match probe.wifi_link() {
+        Some(link) if link.connected => {
+            let msg = match (link.ssid.as_deref(), link.signal) {
+                (Some(ssid), Some(sig)) => format!("Connected to {ssid} ({sig}%)"),
+                (Some(ssid), None) => format!("Connected to {ssid}"),
+                (None, _) => "Connected".to_owned(),
+            };
+            (Severity::Ok, HealthBlock::new(Severity::Ok, msg))
+        }
+        Some(_) => (
+            Severity::Warn,
+            HealthBlock::new(Severity::Warn, "WiFi disconnected"),
+        ),
+        None => (
+            Severity::Unknown,
+            HealthBlock::new(Severity::Unknown, "WiFi state unavailable"),
+        ),
+    }
+}
+
+/// Build the `journal` (Recent Errors) block from the error-priority journal.
+fn journal_block(probe: &dyn SystemProbe) -> (Severity, HealthBlock) {
+    match probe.recent_error_count() {
+        Some(0) => (
+            Severity::Ok,
+            HealthBlock::new(Severity::Ok, "No errors in last 10 min"),
+        ),
+        Some(n) => (
+            Severity::Warn,
+            HealthBlock::new(Severity::Warn, format!("{n} error(s) in last 10 min")),
+        ),
+        None => (
+            Severity::Unknown,
+            HealthBlock::new(Severity::Unknown, "Journal unavailable"),
+        ),
+    }
+}
+
 /// Build the `gadget` (USB Gadget) block from the UDC state.
 fn gadget_block(probe: &dyn SystemProbe) -> (Severity, HealthBlock) {
     match probe.udc_state() {
@@ -669,6 +735,8 @@ pub fn system_health(probe: &dyn SystemProbe, paths: &SysPaths, now: i64) -> Sys
         ("indexer", (severity_from_wire(indexer.severity), indexer)),
         ("disk", disk_block(probe, root, gov.as_ref())),
         ("storage_writable", writable_block(probe, root)),
+        ("network", network_block(probe)),
+        ("journal", journal_block(probe)),
     ];
 
     let overall = blocks
@@ -1058,6 +1126,34 @@ pub fn storage_health(probe: &dyn SystemProbe, paths: &SysPaths) -> StorageHealt
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LinuxProbe;
 
+fn split_nmcli_terse_fields(line: &str) -> Option<(String, String, String)> {
+    let mut fields = Vec::with_capacity(3);
+    let mut current = String::new();
+    let mut chars = line.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            if let Some(next) = chars.next() {
+                current.push(next);
+            } else {
+                current.push('\\');
+            }
+            continue;
+        }
+        if ch == ':' && fields.len() < 2 {
+            fields.push(current.trim().to_owned());
+            current.clear();
+            continue;
+        }
+        current.push(ch);
+    }
+    fields.push(current.trim().to_owned());
+    if fields.len() != 3 {
+        return None;
+    }
+    let mut fields = fields.into_iter();
+    Some((fields.next()?, fields.next()?, fields.next()?))
+}
+
 impl SystemProbe for LinuxProbe {
     fn proc_file(&self, name: &str) -> Option<String> {
         std::fs::read_to_string(format!("/proc/{name}")).ok()
@@ -1113,6 +1209,59 @@ impl SystemProbe for LinuxProbe {
             return None;
         }
         Some(ip.to_string())
+    }
+
+    fn wifi_link(&self) -> Option<WifiLink> {
+        // Bound the probe: the SPA polls /api/system/health repeatedly, so a hung
+        // nmcli must not pile up blocking threads. GNU `timeout` exits 124 on
+        // timeout -> status.success() is false -> degrades to "unknown" like any
+        // other probe failure. Mirrors the bounded runner in wifi_mutate.rs.
+        let out = std::process::Command::new("timeout")
+            .args(["-k", "2", "5", "nmcli", "-t", "-f", "ACTIVE,SSID,SIGNAL", "dev", "wifi"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let Some((active, ssid, signal)) = split_nmcli_terse_fields(line) else {
+                continue;
+            };
+            if active != "yes" {
+                continue;
+            }
+            return Some(WifiLink {
+                connected: true,
+                ssid: (!ssid.is_empty()).then_some(ssid),
+                signal: signal.parse::<u8>().ok(),
+            });
+        }
+        Some(WifiLink::default())
+    }
+
+    fn recent_error_count(&self) -> Option<u64> {
+        let out = std::process::Command::new("timeout")
+            .args([
+                "-k",
+                "2",
+                "5",
+                "journalctl",
+                "--since=-10min",
+                "--priority=err",
+                "--no-pager",
+                "--quiet",
+                "--output=cat",
+            ])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let count = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count();
+        u64::try_from(count).ok()
     }
 }
 
@@ -1171,6 +1320,8 @@ mod tests {
         hostname_file: Option<String>,
         platform_file: Option<String>,
         ipv4: Option<String>,
+        wifi_link: Option<WifiLink>,
+        recent_error_count: Option<u64>,
     }
 
     impl SystemProbe for FakeProbe {
@@ -1212,6 +1363,12 @@ mod tests {
         }
         fn primary_ipv4(&self) -> Option<String> {
             self.ipv4.clone()
+        }
+        fn wifi_link(&self) -> Option<WifiLink> {
+            self.wifi_link.clone()
+        }
+        fn recent_error_count(&self) -> Option<u64> {
+            self.recent_error_count
         }
     }
 
@@ -1358,6 +1515,95 @@ mod tests {
         assert_eq!(health.overall, "ok");
         assert_eq!(health.subsystems["disk"].severity, "unknown");
         assert_eq!(health.subsystems["gadget"].severity, "unknown");
+    }
+
+    #[test]
+    fn network_block_connected_with_signal_is_ok() {
+        let probe = FakeProbe {
+            wifi_link: Some(WifiLink {
+                connected: true,
+                ssid: Some("Trez".to_owned()),
+                signal: Some(51),
+            }),
+            ..FakeProbe::default()
+        };
+        let (sev, block) = network_block(&probe);
+        assert_eq!(sev.as_str(), "ok");
+        assert_eq!(block.severity, "ok");
+        assert_eq!(block.message, "Connected to Trez (51%)");
+    }
+
+    #[test]
+    fn network_block_connected_without_signal_is_ok() {
+        let probe = FakeProbe {
+            wifi_link: Some(WifiLink {
+                connected: true,
+                ssid: Some("Trez".to_owned()),
+                signal: None,
+            }),
+            ..FakeProbe::default()
+        };
+        let (sev, block) = network_block(&probe);
+        assert_eq!(sev.as_str(), "ok");
+        assert_eq!(block.severity, "ok");
+        assert_eq!(block.message, "Connected to Trez");
+    }
+
+    #[test]
+    fn network_block_disconnected_is_warn() {
+        let probe = FakeProbe {
+            wifi_link: Some(WifiLink {
+                connected: false,
+                ..WifiLink::default()
+            }),
+            ..FakeProbe::default()
+        };
+        let (sev, block) = network_block(&probe);
+        assert_eq!(sev.as_str(), "warn");
+        assert_eq!(block.severity, "warn");
+        assert_eq!(block.message, "WiFi disconnected");
+    }
+
+    #[test]
+    fn network_block_unprobeable_is_unknown() {
+        let probe = FakeProbe::default();
+        let (sev, block) = network_block(&probe);
+        assert_eq!(sev.as_str(), "unknown");
+        assert_eq!(block.severity, "unknown");
+        assert_eq!(block.message, "WiFi state unavailable");
+    }
+
+    #[test]
+    fn journal_block_zero_is_ok() {
+        let probe = FakeProbe {
+            recent_error_count: Some(0),
+            ..FakeProbe::default()
+        };
+        let (sev, block) = journal_block(&probe);
+        assert_eq!(sev.as_str(), "ok");
+        assert_eq!(block.severity, "ok");
+        assert_eq!(block.message, "No errors in last 10 min");
+    }
+
+    #[test]
+    fn journal_block_nonzero_is_warn() {
+        let probe = FakeProbe {
+            recent_error_count: Some(3),
+            ..FakeProbe::default()
+        };
+        let (sev, block) = journal_block(&probe);
+        assert_eq!(sev.as_str(), "warn");
+        assert_eq!(block.severity, "warn");
+        assert!(block.message.contains('3'));
+    }
+
+    #[test]
+    fn journal_block_unprobeable_is_unknown() {
+        let probe = FakeProbe::default();
+        let (sev, block) = journal_block(&probe);
+        assert_eq!(sev.as_str(), "unknown");
+        assert_eq!(block.severity, "unknown");
+        assert_eq!(block.message, "Journal unavailable");
     }
 
     #[test]

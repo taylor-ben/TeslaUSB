@@ -1976,12 +1976,22 @@ LUNs) is the single make-or-break that still needs the car.**
   Networks section renders current connection + signal + full nearby list w/
   saved/active/secured badges + working Scan. Live-verified on device 2026-07-15.
   See addendum + `files/hw-results.md`.)**
-- [ ] Join network (SSID+pass; open needs none). **(Phase B — wifid management lease
-  + NM checkpoint/rollback; needs explicit operator go-ahead)**
-- [ ] Disconnect / forget network. **(Phase B — `netplan-*` treated as protected)**
+- [x] Join network (SSID+pass; open needs none). **(Phase B — DEPLOYED 2026-07-16; per-network
+  Connect with **revert-to-last-known-good on failure PROVEN live 2026-07-16** — wrong-password join to
+  a stronger AP forced a real `wlan0:NONE` disassociation → HTTP 502 `wifi_join_failed` → webd explicit
+  checkpoint rollback at +33s → reverted to Trez_EXT, candidate cleaned. A *successful* join to a
+  brand-new network (correct password) is a low-risk happy-path deferred for a disposable AP.
+  `POST /api/wifi/connect` in `webd/src/wifi_mutate.rs`; SPA in `MediaHub.tsx`. See redesign addendum.)**
+- [x] Disconnect / forget network. **(Phase B — DEPLOYED 2026-07-16; **forget-active REFUSAL (409)
+  PROVEN live 2026-07-16** — `forget {Trez_EXT}` → HTTP 409 `wifi_forget_refused`, profile untouched;
+  the UI hides Forget on the active/protected network. A *successful* forget of an *inactive* saved
+  network is deferred (would delete the `netplan-wlan0-Trez` recovery fallback; needs a throwaway
+  network). `POST /api/wifi/forget`; `netplan-*`/active-connection refused. See addendum.)**
 - [ ] Enable/disable setup AP + auto-restore timer (never lock out). **(Phase C — gated:B4 + WiFi-invariant C)**
-- [ ] `wifid` UDS + webd wifi routes. **(Phase A read routes DONE via NM; Phase B
-  mutation routes + wifid lease/UDS still missing. Architecture: `docs/specs/wifid.md` §7)**
+- [x] `wifid` UDS + webd wifi routes. **(Phase A read routes DONE via NM. Phase B
+  mutation routes DEPLOYED 2026-07-16 + **live mutation PROVEN on device 2026-07-16**
+  (connect-revert / forget-refusal / reorder); wifid coordinates via a filesystem mutation-hold
+  token (NOT a UDS lease — simpler, no new socket). Architecture: `docs/specs/wifid.md` §7)**
 
 > ### Addendum (2026-07-15) — §4.13 Phase A read-only DEPLOYED + live-verified
 > - **Architecture reconciled (Opus + GPT-5.5 second opinion):** NetworkManager +
@@ -2003,6 +2013,111 @@ LUNs) is the single make-or-break that still needs the car.**
 >   (all 200); **console 0/0** desktop-1280 + mobile-375. webd `NRestarts=0`,
 >   retentiond untouched (48669), SSH/WiFi/boot intact, dead-man cancelled. Evidence:
 >   `files/hw-results.md`, `files/wifi-phaseA-{desktop-1280,mobile-375}.png`.
+
+> ### Addendum (2026-07-15; updated 2026-07-16) — §4.13 Phase B join/forget mutations: DEPLOYED (Task 4a); live mutation test (Task 4b) + commit pending
+> **Status: uncommitted, DEPLOYED to device 2026-07-16 (Task 4a — binaries+SPA live; health/read/route/UI-render
+> verified). Tasks 1–3 (wifid reconcile + webd mutations + SPA UI) CODE-COMPLETE, tested, reviewed. Remaining:
+> Task 4b live join/forget mutation test (needs phone hotspot) + commit. All 4 safety backstops verified.**
+> - **Task 1 — wifid STA reconcile (uncommitted, 74/74 tests):** `wifid/src/{link,nmcli,
+>   orchestrator,status}.rs`. Adds a mutation-hold reader (monotonic `/proc/uptime` age,
+>   TTL now **70 s** to outlive webd's 60 s checkpoint window), treats an `activating` STA
+>   as a STA (no AP flip mid-reassociation), colon-tolerant NAME-last nmcli query, and an
+>   `sta_associated` NM-authority fallback. wifid still owns AP fallback and refuses to tear
+>   down a working management-path STA (fail-safe).
+> - **Task 2 — webd mutations (NEW `webd/src/wifi_mutate.rs` ~1250 lines, uncommitted):**
+>   `POST /api/wifi/connect {ssid,psk?}` → `{connected,ssid,ip,autoconnect:false}`,
+>   `POST /api/wifi/forget {ssid}` → `{forgotten,count}`. Guards: NM checkpoint
+>   (`flags=2` DELETE_NEW_CONNECTIONS, auto-rollback ≤60 s), candidates always
+>   `autoconnect=false`, PSK via keyfile (never argv), same-origin POST, single-flight
+>   mutex (guard held inside `spawn_blocking`, survives client-cancel), fail-closed
+>   mutation-hold write, per-subprocess `timeout -k 2 20` wrapper, ambiguous-destroy
+>   disambiguation (query NM `Checkpoints` before deciding commit-vs-rollback), forget
+>   refuses `netplan-*`/active. **webd 404 tests pass, clippy-clean** (podman-verified by Opus).
+> - **Review — GPT-5.5 adversarial ×3 cycles, Opus-reconciled:** cycle 1 → 6 fixes
+>   (incl. a real checkpoint-flags lock-out bug `3→2`); cycle 2 → 3 timing hardenings;
+>   cycle 3 delta → **no BLOCKER, no new permanent lockout**. Four independent backstops
+>   bound all residual risk: wifid's working-STA guard, NM ≤60 s auto-rollback, Trez
+>   `autoconnect=yes` (only saved profile), operator power-cycle. Documented residuals
+>   (all bounded/self-healing, land on home=safe): checkpoint-path substring match (#1a,
+>   **RESOLVED** — replaced with a quote-delimited `checkpoint_present` exact-match helper
+>   + disproof unit test that `/1` ≠ `/10`), >60 s-hung false-success onto home (#1b, UI
+>   self-corrects on next poll), `timeout` D-state limit (#3, inherent OS, fail-closed → 409).
+>   Full trail: `files/hw-results.md`.
+> - **Task 3 — SPA join/forget UI (uncommitted; codex-authored, Opus-verified + reviewed):**
+>   `spa/src/api/{types,client}.ts` add `wifiConnect`/`wifiForget` typed to the exact webd
+>   contract; `spa/src/screens/MediaHub.tsx` adds per-row **Join** (open→connect; secured→
+>   inline PSK field, PSK in JSON body never argv) and **Forget** (inline two-step confirm),
+>   a single-flight `wifiBusy` lock that disables all actions + Scan mid-mutation, inline
+>   `#wifi-action-status` feedback (no toast system), refetch-on-success. Mutation controls
+>   **hidden on the active/protected home** (mirrors webd's forget-active/protected refusal).
+>   `spa/test/uat/media-hub.spec.ts` adds a saved-non-active fixture + 4 interaction tests
+>   asserting exact request bodies (open-join sends NO psk). **`npm run build` clean;
+>   `npx playwright test media-hub` = 30 passed (desktop-1280 + mobile-375); console 0/0;
+>   both-viewport screenshots visually confirm the guard logic.** Evidence: `files/hw-results.md`.
+> - **Task 4a DEPLOYED + verified (2026-07-16):** pre-deploy GPT-5.5 review = GO (covered the
+>   `sta_associated` fallback). Cross-built aarch64 webd+wifid (podman); deployed under hardware-test
+>   rails wifid-first (SSH-verified ≥10 s) then webd+SPA. Health/read/route/UI-render all GREEN: both
+>   daemons active NRestarts=0, wlan0 never left Trez, routes wired (`GET connect`→405, `POST {}`→422),
+>   live Playwright both viewports (12 networks after Scan; Trez guarded 0 Join/0 Forget; 11 neighbors
+>   show Join; console 0/0; TTFB 21 ms). Evidence: `files/hw-results.md` +
+>   `files/wifi-phaseB-live-{desktop-1280,desktop-1280-scanned,mobile-375}.png`.
+> - **REMAINING before these can be checked `[x]`:** **Task 4b** — live join/forget MUTATION test
+>   (needs a **phone hotspot near the car**): prove checkpoint rollback via bad join, join throwaway,
+>   forget-throwaway, verify forget-active + forget-Trez REFUSAL (409); then commit (gated on consent;
+>   stage WiFi files only, exclude the pre-existing line-40 HUD hunk).
+
+> ### Addendum (2026-07-16) — §4.13 WiFi phone-model REDESIGN: DEPLOYED + live-mutation-PROVEN (3/3); commit pending
+> **Supersedes the simple Phase-B join/forget with the operator-requested phone-like model:
+> reorderable saved networks (priority), per-network Connect that reverts to the last-known-good
+> network on failure, delete-any-EXCEPT-the-active-one, best-signal selection. Status: uncommitted,
+> DEPLOYED to device 2026-07-16 (webd+SPA); **live mutation PROVEN 2026-07-16 (revert-on-failure /
+> forget-active-refusal / reorder — 3/3 PASS).** Commit pending operator consent.**
+> - **Backend (`webd/src/wifi_mutate.rs`, uncommitted, ~2450 lines):** adds `POST /api/wifi/priority`
+>   (reorder) + `POST /api/wifi/select` alongside the reworked `connect`/`forget`. `connect_flow` =
+>   apply→activate→verify→NM-checkpoint-commit, reverting to last-known-good on any failure. Two
+>   Tier-3 GPT-5.5 re-review BLOCKERs fixed: **rr1** — `apply_profile` returns `ApplyOutcome{fresh,
+>   stale}` and no longer deletes the old profile inline, so a failed join can't destroy the user's
+>   previously-saved network (stale deleted only on the confirmed-success path); **rr2** — parent-dir
+>   fsync in `write_atomic_0600` is now fail-closed. **434 webd unit tests pass; wifi_mutate clippy-clean**
+>   (podman). Final GPT-5.5 review = SHIP. webd mutations are **nmcli-direct — no wifid dependency**
+>   (grep-confirmed), so the old wifid was safely held.
+> - **Deploy (hardware-test rails):** pre-deploy GPT-5.5 plan review returned NO-GO→**all 9 findings
+>   reconciled/accepted**: dropped the broad autoconnect sweep to **active-profile-only** (the real
+>   power-cut brick), atomic binary replace (temp-in-`/usr/local/bin` + `mv -fT`, not install-over-running),
+>   robust no-reboot rollback script, webd-first then SPA (kills the old-webd+new-SPA mismatch window),
+>   `/proc/PID/exe`-sha liveness (no false-positive), disk/inode precheck. Swapped webd (sha
+>   `289c19de…`) under a **webd-scoped 240 s NO-REBOOT** rollback dead-man; SPA (sha `bbc8e4ee…`)
+>   swapped last. Dead-man cancelled cleanly (never fired).
+> - **Brick-fix applied:** the active profile `teslausb-ui-…` (SSID **Trez_EXT**) had **autoconnect=no**
+>   — a latent brick (only `netplan-wlan0-Trez`, a *different* SSID, had autoconnect=yes; if Trez isn't
+>   in range at the car after a power cut → no WiFi). Set **Trez_EXT autoconnect=yes** (metadata-only,
+>   applied without disconnect, persisted — wifid did not revert it).
+> - **Live-verified (Playwright, both viewports 1366 + 375):** WiFi Networks renders configured
+>   networks in **priority order** (Trez #1 w/ Connect+Forget+reorder; Trez_EXT #2 = **Connected**, no
+>   Forget = active-protected), Scan dropdown (McIntyre/FancyFace/ventinet), Save-priority/Reset controls;
+>   System Health shows **WiFi "Connected to Trez_EXT (72%)"** + Recent Errors "No errors in last 10 min";
+>   Live Metrics populated; `/api/wifi/{status,networks,saved}` all 200; **console 0/0**; FCP 556 ms,
+>   TTFB 9 ms; **no mobile text clipping**. webd active NRestarts=0, wlan0 never left Trez_EXT, wifid
+>   active, boot `running`. Evidence: `files/hw-results.md` + `files/wifi-deploy-{desktop-1366,mobile-375}.png`
+>   + `files/hw-webd-deploy-journal-*.log`.
+> - **LIVE MUTATION PROOF DONE (2026-07-16 evening, supervised, operator near car) — 3/3 PASS:**
+>   (1) **revert-on-failure** — wrong-password Connect to a stronger AP (FancyFace 67%) forced a real
+>   `wlan0:NONE` disassociation → HTTP 502 `wifi_join_failed` → webd **explicit checkpoint rollback at
+>   +33s** (NM audit log: create 16:01:29.537 → rollback 16:02:02.634; < 60s NM backstop) → reverted to
+>   Trez_EXT, candidate profile cleaned, script safety-net never fired; (2) **forget-active REFUSAL** —
+>   `forget {Trez_EXT}` → HTTP 409 `wifi_forget_refused`, profile untouched; (3) **reorder** —
+>   `priority {[Trez_EXT,Trez]}` → 200, Trez_EXT prio 2 > Trez 1, **no hop** (non-disruptive, wlan0 never
+>   left Trez_EXT), persisted to keyfile. Post-test Playwright both viewports GREEN, console 0/0, no
+>   mobile clipping (`files/wifi-final-{desktop-1280,mobile-375}.png`); full evidence + NM audit log in
+>   `files/hw-results.md`. Root cause of the real drop (code-confirmed): candidate keyfile
+>   `autoconnect=true` → `nmcli reload` auto-hops toward the stronger AP before webd's explicit activate;
+>   the failure path + checkpoint rollback handle it correctly.
+> - **Deferred happy-paths (need a disposable AP; low-risk, NOT blocking — both safety-critical branches
+>   already proven):** a *successful* join to a brand-new network (correct password) and a *successful*
+>   forget of an *inactive* saved network (would delete the `netplan-wlan0-Trez` recovery fallback).
+> - **REMAINING:** commit (gated on consent; stage WiFi files only, exclude the pre-existing line-40 HUD
+>   hunk). wifid changes (`link/nmcli/orchestrator/status.rs`, 230 insertions) remain uncommitted +
+>   undeployed (out of scope; UI works on old wifid).
 
 
 ### 4.14 Failed Jobs — `Requirements.md` §4.14

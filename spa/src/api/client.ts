@@ -28,6 +28,7 @@ import type {
   Pref,
   RandomMode,
   ScheduleInput,
+  SavedWifiResponse,
   SchedulerSnapshot,
   StorageHealth,
   StorageInfo,
@@ -39,6 +40,14 @@ import type {
   TripDetail,
   TripsPageParams,
   WifiNetworksResponse,
+  WifiConnectRequest,
+  WifiConnectResponse,
+  WifiForgetRequest,
+  WifiForgetResponse,
+  WifiPriorityRequest,
+  WifiPriorityResponse,
+  WifiSelectRequest,
+  WifiSelectResponse,
   WifiStatus,
 } from "./types";
 import type { TelemetrySample } from "../player/telemetry";
@@ -260,8 +269,47 @@ export const api = {
   wifiNetworks: (signal?: AbortSignal) =>
     getJson<WifiNetworksResponse>("/api/wifi/networks", signal),
 
+  wifiSaved: (signal?: AbortSignal) =>
+    getJson<SavedWifiResponse>("/api/wifi/saved", signal),
+
   wifiScan: (signal?: AbortSignal) =>
     request<WifiNetworksResponse>("POST", "/api/wifi/scan", signal),
+
+  wifiConnect: (body: WifiConnectRequest, signal?: AbortSignal) =>
+    request<WifiConnectResponse>(
+      "POST",
+      "/api/wifi/connect",
+      signal,
+      JSON.stringify(body),
+      "application/json",
+    ),
+
+  wifiForget: (ssid: string, signal?: AbortSignal) =>
+    request<WifiForgetResponse>(
+      "POST",
+      "/api/wifi/forget",
+      signal,
+      JSON.stringify({ ssid } satisfies WifiForgetRequest),
+      "application/json",
+    ),
+
+  wifiPriority: (body: WifiPriorityRequest, signal?: AbortSignal) =>
+    request<WifiPriorityResponse>(
+      "POST",
+      "/api/wifi/priority",
+      signal,
+      JSON.stringify(body),
+      "application/json",
+    ),
+
+  wifiSelect: (ssid: string, signal?: AbortSignal) =>
+    request<WifiSelectResponse>(
+      "POST",
+      "/api/wifi/select",
+      signal,
+      JSON.stringify({ ssid } satisfies WifiSelectRequest),
+      "application/json",
+    ),
 
   /**
    * Live USB-gadget state (`GET /api/gadget/status`) from gadgetd's control
