@@ -6,6 +6,7 @@
 
 use serde::Serialize;
 
+use crate::creds::ApMode;
 use crate::link::{LinkMode, LinkObservation};
 use crate::throttle::ThrottleState;
 
@@ -34,7 +35,7 @@ impl From<&LinkObservation> for LinkSummary {
 }
 
 /// The full status document `webd` reads. No secrets, ever.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct WifiStatus {
     /// Current radio mode.
     pub(crate) mode: LinkMode,
@@ -44,6 +45,17 @@ pub(crate) struct WifiStatus {
     pub(crate) throttle: ThrottleState,
     /// Whether the SDIO chip-reset watchdog is mid-recovery.
     pub(crate) recovering: bool,
+    /// Access-point status (non-secret fields only).
+    pub(crate) ap: ApStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct ApStatus {
+    pub(crate) mode: ApMode,
+    pub(crate) active: bool,
+    pub(crate) ssid: Option<String>,
+    pub(crate) client_count: u32,
+    pub(crate) ip: Option<String>,
 }
 
 impl WifiStatus {
@@ -53,12 +65,14 @@ impl WifiStatus {
         obs: &LinkObservation,
         throttle: ThrottleState,
         recovering: bool,
+        ap: ApStatus,
     ) -> Self {
         Self {
             mode,
             link: LinkSummary::from(obs),
             throttle,
             recovering,
+            ap,
         }
     }
 }
@@ -66,7 +80,8 @@ impl WifiStatus {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use super::WifiStatus;
+    use super::{ApStatus, WifiStatus};
+    use crate::creds::ApMode;
     use crate::config::WifidConfig;
     use crate::link::{LinkMode, LinkObservation};
     use crate::throttle::{ThrottleInputs, ThrottlePublisher};
@@ -76,11 +91,14 @@ mod tests {
             sta_configured: true,
             sta_running: true,
             ap_running: false,
+            ap_fallback_suppressed: false,
+            mutation_hold: false,
             associated: true,
             carrier_up: true,
             gateway_reachable: true,
             ap_has_clients: false,
             signal_dbm: Some(-55),
+            sta_channel: Some(1),
         }
     }
 
@@ -94,13 +112,29 @@ mod tests {
             chip_recovering: false,
             near_deadlock: false,
             tc_applied: true,
+            ap_overlay_active: false,
+            ap_cap_applied: false,
         });
-        let status = WifiStatus::new(LinkMode::Sta, &observation(), throttle, false);
+        let status = WifiStatus::new(
+            LinkMode::Sta,
+            &observation(),
+            throttle,
+            false,
+            ApStatus {
+                mode: ApMode::ForceOff,
+                active: false,
+                ssid: Some("TeslaUSB".to_owned()),
+                client_count: 0,
+                ip: None,
+            },
+        );
         let json = serde_json::to_string(&status).expect("serialise");
         // Sanity: expected shape present.
         assert!(json.contains("\"mode\":\"sta\""));
         assert!(json.contains("\"signal_dbm\":-55"));
         assert!(json.contains("\"uploads_allowed\":true"));
+        assert!(json.contains("\"ap\""));
+        assert!(json.contains("\"force_off\""));
         // Safety: no secret-bearing keys exist in the shape at all.
         for forbidden in ["psk", "passphrase", "secret", "password"] {
             assert!(

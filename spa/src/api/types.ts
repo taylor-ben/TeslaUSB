@@ -323,6 +323,39 @@ export interface WifiPriorityResponse {
   count: number;
 }
 
+/** Access-point mode (`/api/wifi/ap`). */
+export type ApMode = "auto" | "force_on" | "force_off";
+
+/** The `.ap` object inside `GET /api/wifi/ap`. */
+export interface ApInfo {
+  mode: ApMode;
+  active: boolean;
+  ssid: string | null;
+  client_count: number;
+  ip: string | null;
+}
+
+/** `GET /api/wifi/ap` — wifid status; the SPA consumes `.ap`. */
+export interface WifiApResponse {
+  ap: ApInfo;
+}
+
+/** `POST /api/wifi/ap/mode`. */
+export interface WifiApModeRequest {
+  mode: ApMode;
+}
+
+/** `POST /api/wifi/ap/config`. */
+export interface WifiApConfigRequest {
+  ssid: string;
+  passphrase: string;
+}
+
+/** Response of the AP mutation endpoints. */
+export interface WifiApOkResponse {
+  ok: boolean;
+}
+
 /** One filesystem of `GET /api/storage`. */
 export interface FilesystemEntry {
   mount: string;

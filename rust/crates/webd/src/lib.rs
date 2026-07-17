@@ -56,8 +56,10 @@ mod route;
 mod scheduler;
 mod sysinfo;
 mod stats_client;
+mod wifid_client;
 pub(crate) mod timezone;
 mod wifi;
+mod wifi_ap;
 mod wifi_mutate;
 mod wraps;
 
@@ -90,6 +92,7 @@ struct AppState {
     sys: SysHandle,
     gadget: Arc<dyn gadget::GadgetClient>,
     scheduler: Arc<dyn scheduler::SchedulerClient>,
+    wifid: Arc<dyn wifid_client::WifidClient>,
     indexd: Arc<dyn indexd_client::IndexdClient>,
     read_client: Arc<dyn read_client::ReadFileClient + Send + Sync>,
     stats_client: Arc<dyn stats_client::VolumeStatsClient + Send + Sync>,
@@ -172,6 +175,31 @@ fn router_with_gadget(
     )
 }
 
+/// Assemble the router over an explicit `wifid` client — the injection seam used
+/// by the Wi-Fi AP handler tests. All other daemon clients default to their
+/// platform clients.
+#[cfg(test)]
+fn router_with_wifid(
+    catalog: Catalog,
+    static_dir: PathBuf,
+    media: MediaConfig,
+    wifid: Arc<dyn wifid_client::WifidClient>,
+) -> Router {
+    let gadget = default_gadget_client(PathBuf::from("/nonexistent/gadgetd.sock"));
+    router_with_all_clients_and_read_client(
+        catalog,
+        static_dir,
+        media,
+        gadget,
+        scheduler::default_client(default_scheduler_sock()),
+        indexd_client::default_client(default_indexd_sock()),
+        default_read_client(),
+        default_stats_client(),
+        wifid,
+        default_chime_library_dir(),
+    )
+}
+
 /// The default `schedulerd` control-socket path (overridable via
 /// `WEBD_SCHEDULERD_SOCK`).
 fn default_scheduler_sock() -> PathBuf {
@@ -186,6 +214,12 @@ fn default_scheduler_sock() -> PathBuf {
 fn default_indexd_sock() -> PathBuf {
     std::env::var_os("WEBD_INDEXD_SOCK")
         .map_or_else(|| PathBuf::from("/run/teslausb/indexd.sock"), PathBuf::from)
+}
+
+/// The default `wifid` control-socket path (overridable via `WEBD_WIFID_SOCK`).
+fn default_wifid_sock() -> PathBuf {
+    std::env::var_os("WEBD_WIFID_SOCK")
+        .map_or_else(|| PathBuf::from("/run/teslausb/wifid.sock"), PathBuf::from)
 }
 
 /// The default `schedulerd` chime-library directory (overridable via
@@ -236,6 +270,7 @@ fn router_with_all_clients(
         indexd,
         default_read_client(),
         default_stats_client(),
+        wifid_client::default_client(default_wifid_sock()),
         chime_library_dir,
     )
 }
@@ -276,6 +311,7 @@ fn router_with_all_clients_and_read_client(
     indexd: Arc<dyn indexd_client::IndexdClient>,
     read_client: Arc<dyn read_client::ReadFileClient + Send + Sync>,
     stats_client: Arc<dyn stats_client::VolumeStatsClient + Send + Sync>,
+    wifid: Arc<dyn wifid_client::WifidClient>,
     chime_library_dir: PathBuf,
 ) -> Router {
     let sys = SysHandle {
@@ -304,6 +340,7 @@ fn router_with_all_clients_and_read_client(
         sys,
         gadget,
         scheduler,
+        wifid,
         indexd,
         read_client,
         stats_client,

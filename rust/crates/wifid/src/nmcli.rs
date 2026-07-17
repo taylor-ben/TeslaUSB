@@ -27,23 +27,29 @@
 //! viable) rather than erroring the whole observation, so a transient `nmcli`
 //! hiccup can never crash the daemon.
 
+use std::fs;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::config::PlatformConfig;
 use crate::error::{Result, WifidError};
 use crate::link::LinkObservation;
+use crate::overlay::parse_iface_channel;
 use crate::traits::NetworkController;
 use crate::watchdog::ChipObservation;
 
+const MUTATION_HOLD_PATH: &str = "/run/teslausb/wifi-mutation.hold";
+/// Must outlive webd's 60s checkpoint window plus recovery slack.
+const MUTATION_HOLD_TTL_SECS: f64 = 70.0;
+
 /// `NetworkManager`/`nmcli`-driven controller bound to one Wi-Fi interface and
-/// its two pre-provisioned connection profiles.
+/// its pre-provisioned STA connection profile.
 pub(crate) struct NmcliNetworkController {
     cfg: PlatformConfig,
 }
 
 impl NmcliNetworkController {
-    /// Build a controller for the configured interface + profiles.
+    /// Build a controller for the configured interface + profile.
     pub(crate) fn new(cfg: PlatformConfig) -> Self {
         Self { cfg }
     }
@@ -68,19 +74,21 @@ impl NetworkController for NmcliNetworkController {
             &[
                 "-t",
                 "-f",
-                "NAME,DEVICE,STATE",
+                "TYPE,DEVICE,STATE,NAME",
                 "connection",
                 "show",
                 "--active",
             ],
         )
         .unwrap_or_default();
-        let sta_running = active_state(&active, &self.cfg.sta_profile, iface).is_some();
-        let ap_running = active_state(&active, &self.cfg.ap_profile, iface).is_some();
+        let sta_running = any_active_wifi_sta(&active, iface);
+        let ap_running = false;
 
         let link = capture("iw", &["dev", iface, "link"]).unwrap_or_default();
-        let associated = iw_connected(&link);
+        let associated = sta_associated(&link, sta_running);
         let signal_dbm = parse_iw_signal_dbm(&link);
+        let sta_channel = capture("iw", &["dev", iface, "info"])
+            .and_then(|info| parse_iface_channel(&info));
 
         let dev_show = capture(
             "nmcli",
@@ -109,11 +117,14 @@ impl NetworkController for NmcliNetworkController {
             sta_configured: false,
             sta_running,
             ap_running,
+            ap_fallback_suppressed: false,
+            mutation_hold: read_mutation_hold(),
             associated,
             carrier_up,
             gateway_reachable,
             ap_has_clients,
             signal_dbm,
+            sta_channel,
         })
     }
 
@@ -144,16 +155,6 @@ impl NetworkController for NmcliNetworkController {
         down_profile(&self.cfg.sta_profile)
     }
 
-    fn start_ap(&self) -> Result<()> {
-        // Brings up the pre-provisioned WPA2 AP. If it is not provisioned this
-        // simply fails — `wifid` never stands up an open network.
-        up_profile(&self.cfg.ap_profile)
-    }
-
-    fn stop_ap(&self) -> Result<()> {
-        down_profile(&self.cfg.ap_profile)
-    }
-
     fn apply_tx_cap(&self, bytes_per_s: u64) -> Result<()> {
         let cap_args = tc_cap_args(&self.cfg.wifi_iface, bytes_per_s);
         let argv: Vec<&str> = cap_args.iter().map(String::as_str).collect();
@@ -164,6 +165,16 @@ impl NetworkController for NmcliNetworkController {
                 "tc egress cap on {} failed",
                 self.cfg.wifi_iface
             )))
+        }
+    }
+
+    fn apply_ap_tx_cap(&self, bytes_per_s: u64) -> Result<()> {
+        let cap_args = tc_cap_args("uap0", bytes_per_s);
+        let argv: Vec<&str> = cap_args.iter().map(String::as_str).collect();
+        if run_ok("tc", &argv) {
+            Ok(())
+        } else {
+            Err(WifidError::Network("tc egress cap on uap0 failed".to_owned()))
         }
     }
 
@@ -206,15 +217,28 @@ fn down_profile(profile: &str) -> Result<()> {
 
 /// Run a command, returning whether it exited successfully. A spawn failure
 /// (binary absent) is `false`, never a panic.
-fn run_ok(program: &str, args: &[&str]) -> bool {
+pub(crate) fn run_ok(program: &str, args: &[&str]) -> bool {
     Command::new(program)
         .args(args)
         .status()
         .is_ok_and(|s| s.success())
 }
 
+/// Like [`run_ok`], but discards the child's stdout/stderr. For best-effort
+/// commands re-issued on every tick (e.g. reasserting radio power-save), where
+/// the caller handles failure itself and the child's own error output would
+/// otherwise flood the journal.
+pub(crate) fn run_ok_quiet(program: &str, args: &[&str]) -> bool {
+    Command::new(program)
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
 /// Run a command and capture its stdout as UTF-8 on success, else `None`.
-fn capture(program: &str, args: &[&str]) -> Option<String> {
+pub(crate) fn capture(program: &str, args: &[&str]) -> Option<String> {
     let out = Command::new(program).args(args).output().ok()?;
     if out.status.success() {
         String::from_utf8(out.stdout).ok()
@@ -250,24 +274,67 @@ fn tc_cap_args(iface: &str, bytes_per_s: u64) -> Vec<String> {
     ]
 }
 
-/// Find the `STATE` of an active connection matching both `name` and `device`
-/// in terse (`nmcli -t`) `NAME:DEVICE:STATE` output.
+/// `true` when any active row is a Wi-Fi STA on `iface`: terse (`nmcli -t`)
+/// `TYPE:DEVICE:STATE:NAME` with `TYPE=802-11-wireless` and `STATE` in
+/// {`activated`, `activating`}.
 ///
-/// NOTE: terse mode escapes a literal `:` inside a field as `\:`; the
-/// configured profile names contain no colons, so a plain split is correct here
-/// and a name containing an escaped colon simply will not match (fail-safe:
-/// treated as "not active").
-fn active_state(active_list: &str, name: &str, device: &str) -> Option<String> {
-    for line in active_list.lines() {
-        let mut fields = line.splitn(3, ':');
-        let n = fields.next()?;
-        let d = fields.next().unwrap_or_default();
-        let s = fields.next().unwrap_or_default();
-        if n == name && d == device {
-            return Some(s.to_owned());
-        }
-    }
-    None
+/// `activating` counts as "running" so a mid-association or roaming STA (the
+/// live NM-owned home connection briefly re-associating) reads as present, not
+/// absent. Viability is a separate, stricter gate (`sta_viable`: associated +
+/// carrier + gateway), so an `activating` STA is running-but-not-yet-viable and
+/// falls through the debounced path rather than the un-debounced
+/// `!sta_configured → AP` path — preventing a transient re-associate from
+/// flipping the daemon to AP mode (and suppressing uploads) on every roam.
+///
+fn any_active_wifi_sta(active_list: &str, iface: &str) -> bool {
+    active_list.lines().any(|line| {
+        let mut fields = line.splitn(4, ':');
+        let ty = fields.next().unwrap_or_default();
+        let device = fields.next().unwrap_or_default();
+        let state = fields.next().unwrap_or_default();
+        let _name = fields.next().unwrap_or_default();
+        ty == "802-11-wireless"
+            && device == iface
+            && matches!(state, "activated" | "activating")
+    })
+}
+
+/// Read the current monotonic uptime (seconds since boot) from `/proc/uptime`
+/// (its first whitespace token). Monotonic and immune to wall-clock/NTP steps:
+/// the Pi Zero 2 W has no RTC and steps its clock forward when NTP disciplines
+/// it after Wi-Fi comes up, so a wall-clock (`mtime`) freshness check could
+/// wrongly expire or extend the hold.
+fn read_uptime_secs() -> Option<f64> {
+    let raw = fs::read_to_string("/proc/uptime").ok()?;
+    raw.split_whitespace().next()?.parse::<f64>().ok()
+}
+
+/// Parse the hold file's stored start-uptime (its first whitespace token).
+fn read_hold_start_secs() -> Option<f64> {
+    let raw = fs::read_to_string(MUTATION_HOLD_PATH).ok()?;
+    raw.split_whitespace().next()?.parse::<f64>().ok()
+}
+
+/// `true` while a `webd` Wi-Fi mutation hold is in effect. The hold file holds
+/// the monotonic uptime-seconds captured by `webd` at mutation start; the hold
+/// is fresh for [`MUTATION_HOLD_TTL_SECS`] after that instant. A missing, empty,
+/// malformed, or expired file — or a `start` in the future relative to now —
+/// reads as "not held" (fail toward normal link management; the NM checkpoint is
+/// the primary join safety, this hold is only belt-and-braces). `/run` is tmpfs,
+/// so a stale file can never survive a reboot.
+fn read_mutation_hold() -> bool {
+    let age_secs = match (read_hold_start_secs(), read_uptime_secs()) {
+        (Some(start), Some(now)) => Some(now - start),
+        _ => None,
+    };
+    mutation_hold_fresh(age_secs)
+}
+
+/// A hold `age` (now-uptime minus start-uptime, seconds) is fresh iff it is
+/// non-negative and within the TTL. A negative age (start in the future) is a
+/// clock/parse anomaly and is treated as not-held.
+fn mutation_hold_fresh(age_secs: Option<f64>) -> bool {
+    matches!(age_secs, Some(age) if (0.0..=MUTATION_HOLD_TTL_SECS).contains(&age))
 }
 
 /// Read a single-valued `KEY:value` field from terse `nmcli … show` output,
@@ -303,6 +370,18 @@ fn iw_connected(link: &str) -> bool {
         .any(|l| l.trim_start().starts_with("Connected to"))
 }
 
+/// `true` when the STA is associated. Prefers `iw`'s radio-level association,
+/// but falls back to `NetworkManager`'s authority (`sta_running` = an `activated`
+/// non-AP Wi-Fi connection on the interface) so a base image that does not ship
+/// `iw` still reports association correctly instead of oscillating STA↔AP and
+/// re-suppressing uploads. This is only ever an OR — it can add association,
+/// never remove it — and viability keeps its independent `carrier_up`
+/// (has-IP) and `gateway_reachable` (live ping) gates, so a genuinely dead link
+/// is still caught even when NM's `activated` state momentarily lags reality.
+fn sta_associated(iw_link: &str, sta_running: bool) -> bool {
+    iw_connected(iw_link) || sta_running
+}
+
 /// Parse the STA signal strength in dBm from `iw dev <if> link` (`signal: -55
 /// dBm`). `None` when not present.
 fn parse_iw_signal_dbm(link: &str) -> Option<i32> {
@@ -316,7 +395,7 @@ fn parse_iw_signal_dbm(link: &str) -> Option<i32> {
 
 /// Count associated stations in `iw dev <if> station dump` (one `Station …`
 /// header per client). Used only in AP mode to keep onboarding sticky.
-fn count_stations(dump: &str) -> usize {
+pub(crate) fn count_stations(dump: &str) -> usize {
     dump.lines()
         .filter(|l| l.trim_start().starts_with("Station "))
         .count()
@@ -326,21 +405,56 @@ fn count_stations(dump: &str) -> usize {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::{
-        active_state, count_stations, has_ip, iw_connected, nmcli_field, parse_iw_signal_dbm,
-        tc_cap_args,
+        any_active_wifi_sta, count_stations, has_ip, iw_connected, mutation_hold_fresh, nmcli_field,
+        parse_iw_signal_dbm, sta_associated, tc_cap_args,
     };
 
     #[test]
-    fn active_state_matches_name_and_device() {
-        let out = "teslausb-sta:wlan0:activated\nWired connection 1:eth0:activated\n";
-        assert_eq!(
-            active_state(out, "teslausb-sta", "wlan0").as_deref(),
-            Some("activated")
-        );
-        // Right name, wrong device ⇒ no match (mutual-exclusion safety).
-        assert!(active_state(out, "teslausb-sta", "eth0").is_none());
-        // Absent profile ⇒ not active.
-        assert!(active_state(out, "teslausb-ap", "wlan0").is_none());
+    fn any_active_wifi_sta_detects_live_nm_owned_sta_only() {
+        // Terse layout is TYPE:DEVICE:STATE:NAME (NAME last, colon-tolerant).
+        assert!(any_active_wifi_sta(
+            "802-11-wireless:wlan0:activated:netplan-wlan0-Trez\n",
+            "wlan0"
+        ));
+        // `activating` (mid-association / roam) counts as a live STA so a
+        // transient re-associate never reads as absent and flips us to AP.
+        assert!(any_active_wifi_sta(
+            "802-11-wireless:wlan0:activating:netplan-wlan0-Trez\n",
+            "wlan0"
+        ));
+        // A profile NAME with an escaped colon (SSID containing `:`) still
+        // parses: NAME is the `splitn(4)` remainder, so TYPE/DEVICE/STATE are
+        // unaffected and the STA is correctly detected.
+        assert!(any_active_wifi_sta(
+            "802-11-wireless:wlan0:activated:netplan-wlan0-Guest\\:5G\n",
+            "wlan0"
+        ));
+        // Ethernet is not a Wi-Fi STA.
+        assert!(!any_active_wifi_sta(
+            "802-3-ethernet:eth0:activated:netplan-eth0\n",
+            "wlan0"
+        ));
+        // Wrong interface.
+        assert!(!any_active_wifi_sta(
+            "802-11-wireless:wlan1:activated:netplan-wlan0-Trez\n",
+            "wlan0"
+        ));
+        // `deactivating` is a real drop in progress ⇒ not running.
+        assert!(!any_active_wifi_sta(
+            "802-11-wireless:wlan0:deactivating:netplan-wlan0-Trez\n",
+            "wlan0"
+        ));
+    }
+
+    #[test]
+    fn mutation_hold_fresh_uses_ttl() {
+        assert!(!mutation_hold_fresh(None));
+        assert!(mutation_hold_fresh(Some(0.0)));
+        assert!(mutation_hold_fresh(Some(70.0)));
+        assert!(!mutation_hold_fresh(Some(70.1)));
+        // A negative age (hold start in the future — a clock/parse anomaly) is
+        // treated as not-held rather than a stuck-on hold.
+        assert!(!mutation_hold_fresh(Some(-1.0)));
     }
 
     #[test]
@@ -368,6 +482,21 @@ mod tests {
             "Connected to aa:bb:cc:dd:ee:ff (on wlan0)\n\tSSID: home\n"
         ));
         assert!(!iw_connected("Not connected.\n"));
+    }
+
+    #[test]
+    fn sta_associated_prefers_iw_then_falls_back_to_nm_authority() {
+        // `iw` confirms radio-level association ⇒ associated regardless of NM.
+        assert!(sta_associated(
+            "Connected to aa:bb:cc:dd:ee:ff (on wlan0)\n",
+            false
+        ));
+        // No `iw` (e.g. not installed ⇒ empty output), but NM reports an
+        // activated STA (`sta_running`) ⇒ associated via NM authority.
+        assert!(sta_associated("", true));
+        // Neither `iw` association nor an NM-active STA ⇒ not associated.
+        assert!(!sta_associated("Not connected.\n", false));
+        assert!(!sta_associated("", false));
     }
 
     #[test]

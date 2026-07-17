@@ -12,6 +12,7 @@
  */
 import type {
   Analytics,
+  ApMode,
   ApiErrorBody,
   ChimeGroup,
   Chimes,
@@ -39,6 +40,10 @@ import type {
   Trip,
   TripDetail,
   TripsPageParams,
+  WifiApConfigRequest,
+  WifiApModeRequest,
+  WifiApOkResponse,
+  WifiApResponse,
   WifiNetworksResponse,
   WifiConnectRequest,
   WifiConnectResponse,
@@ -308,6 +313,27 @@ export const api = {
       "/api/wifi/select",
       signal,
       JSON.stringify({ ssid } satisfies WifiSelectRequest),
+      "application/json",
+    ),
+
+  wifiApStatus: (signal?: AbortSignal) =>
+    getJson<WifiApResponse>("/api/wifi/ap", signal),
+
+  wifiApMode: (mode: ApMode, signal?: AbortSignal) =>
+    request<WifiApOkResponse>(
+      "POST",
+      "/api/wifi/ap/mode",
+      signal,
+      JSON.stringify({ mode } satisfies WifiApModeRequest),
+      "application/json",
+    ),
+
+  wifiApConfig: (body: WifiApConfigRequest, signal?: AbortSignal) =>
+    request<WifiApOkResponse>(
+      "POST",
+      "/api/wifi/ap/config",
+      signal,
+      JSON.stringify(body),
       "application/json",
     ),
 

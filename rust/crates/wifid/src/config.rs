@@ -29,8 +29,8 @@ pub(crate) struct WifidConfig {
 }
 
 /// Names the production [`crate::nmcli`] controller needs to drive the real
-/// radio. **No policy is hardcoded into logic** — the interface, the two
-/// `NetworkManager` profile names `wifid` toggles, and the kernel module it
+/// radio. **No policy is hardcoded into logic** — the interface, the
+/// `NetworkManager` STA profile, overlay AP default channel, and the kernel module it
 /// reloads all live here so the device's provisioning (owned elsewhere) and
 /// `wifid` agree by configuration, not by a magic string buried in code.
 ///
@@ -45,11 +45,8 @@ pub(crate) struct PlatformConfig {
     /// The pre-provisioned `NetworkManager` connection profile for station
     /// (home-WiFi) mode.
     pub(crate) sta_profile: String,
-    /// The pre-provisioned `NetworkManager` connection profile for the WPA2
-    /// onboarding access point. Always WPA2 (never an open AP); if it is not
-    /// provisioned, bringing the AP up simply fails — `wifid` never falls back
-    /// to an open network.
-    pub(crate) ap_profile: String,
+    /// Default AP channel used by the overlay when STA is not running.
+    pub(crate) ap_default_channel: u32,
     /// The Wi-Fi kernel module the chip-reset watchdog reloads to recover a
     /// wedged BCM43436 (`rmmod`/`modprobe`).
     pub(crate) wifi_module: String,
@@ -107,6 +104,14 @@ pub(crate) struct ThrottleConfig {
     /// the link is nearing the SDIO-deadlock threshold (`NearDeadlock` backoff).
     /// TUNABLE.
     pub(crate) near_deadlock_divisor: u64,
+    /// Divisor applied to [`Self::max_tx_bytes_per_s`] while a concurrent AP
+    /// overlay (uap0) is up alongside the STA (Force-on). TUNABLE.
+    pub(crate) ap_concurrent_divisor: u64,
+    /// Bounded `tc` egress cap (bytes/sec) applied to the uap0 AP interface
+    /// while it is concurrently up, so AP client traffic can't saturate the
+    /// shared single channel. Generous by design so clip-viewing UX is
+    /// unaffected. CALIBRATION-GATED: provisional.
+    pub(crate) ap_tx_bytes_per_s: u64,
 }
 
 /// Liveness-watchdog + recovery-escalation knobs (`wifid.md` §2.4, §6).
@@ -148,6 +153,8 @@ impl Default for WifidConfig {
                 max_chunk_bytes: 256 * 1024,
                 bucket_capacity_bytes: 1024 * 1024,
                 near_deadlock_divisor: 2,
+                ap_concurrent_divisor: 2,
+                ap_tx_bytes_per_s: 4 * 1024 * 1024,
             },
             watchdog: WatchdogConfig {
                 wedge_confirm: Duration::from_secs(15),
@@ -159,7 +166,7 @@ impl Default for WifidConfig {
             platform: PlatformConfig {
                 wifi_iface: "wlan0".to_owned(),
                 sta_profile: "teslausb-sta".to_owned(),
-                ap_profile: "teslausb-ap".to_owned(),
+                ap_default_channel: 6,
                 wifi_module: "brcmfmac".to_owned(),
             },
         }
@@ -182,6 +189,12 @@ impl WifidConfig {
         if self.throttle.near_deadlock_divisor == 0 {
             return Err("near_deadlock_divisor must be >= 1");
         }
+        if self.throttle.ap_concurrent_divisor == 0 {
+            return Err("ap_concurrent_divisor must be >= 1");
+        }
+        if self.throttle.ap_tx_bytes_per_s == 0 {
+            return Err("ap_tx_bytes_per_s must be > 0");
+        }
         if self.throttle.bucket_capacity_bytes < self.throttle.max_tx_bytes_per_s {
             return Err("bucket_capacity_bytes must be >= max_tx_bytes_per_s");
         }
@@ -202,13 +215,8 @@ impl WifidConfig {
         if self.platform.sta_profile.is_empty() {
             return Err("platform.sta_profile must not be empty");
         }
-        if self.platform.ap_profile.is_empty() {
-            return Err("platform.ap_profile must not be empty");
-        }
-        if self.platform.sta_profile == self.platform.ap_profile {
-            // Toggling between modes relies on two *distinct* NM profiles;
-            // collapsing them would make stop-before-start ambiguous.
-            return Err("platform.sta_profile and ap_profile must differ");
+        if self.platform.ap_default_channel == 0 {
+            return Err("platform.ap_default_channel must be > 0");
         }
         if self.platform.wifi_module.is_empty() {
             return Err("platform.wifi_module must not be empty");
@@ -257,9 +265,9 @@ mod tests {
     }
 
     #[test]
-    fn identical_sta_and_ap_profiles_are_rejected() {
+    fn zero_ap_default_channel_is_rejected() {
         let mut cfg = WifidConfig::default();
-        cfg.platform.ap_profile = cfg.platform.sta_profile.clone();
+        cfg.platform.ap_default_channel = 0;
         assert!(cfg.validate().is_err());
     }
 

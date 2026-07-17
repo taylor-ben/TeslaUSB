@@ -149,6 +149,7 @@ pub(crate) fn router(state: AppState, static_dir: PathBuf) -> Router {
         .merge(crate::health::routes())
         .merge(crate::timezone::routes())
         .merge(crate::wifi::routes())
+        .merge(crate::wifi_ap::routes())
         .merge(crate::wifi_mutate::routes())
         .fallback(api_not_found)
         .with_state(state);

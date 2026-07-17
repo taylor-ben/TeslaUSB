@@ -55,18 +55,6 @@ pub(crate) trait NetworkController {
     /// Returns an error if STA could not be confirmed stopped.
     fn stop_sta(&self) -> Result<()>;
 
-    /// Bring up the WPA2 access point (hostapd + dnsmasq) for onboarding.
-    ///
-    /// # Errors
-    /// Returns an error if the AP could not be started.
-    fn start_ap(&self) -> Result<()>;
-
-    /// Tear down the access point. Idempotent.
-    ///
-    /// # Errors
-    /// Returns an error if the AP could not be confirmed stopped.
-    fn stop_ap(&self) -> Result<()>;
-
     /// Apply (or update) the kernel `tc` egress cap to `bytes_per_s`. This is
     /// the "braces" half of the D4 belt-and-braces cap; `uploadd` self-paces as
     /// the "belt".
@@ -74,6 +62,12 @@ pub(crate) trait NetworkController {
     /// # Errors
     /// Returns an error if the cap could not be applied.
     fn apply_tx_cap(&self, bytes_per_s: u64) -> Result<()>;
+    /// Apply a bounded egress `tc` cap to the AP overlay interface (uap0) while
+    /// it is concurrently up. Idempotent.
+    ///
+    /// # Errors
+    /// Returns [`crate::error::WifidError::Network`] if the cap could not be applied.
+    fn apply_ap_tx_cap(&self, bytes_per_s: u64) -> Result<()>;
 
     /// Reset the `WiFi` chip only (`rmmod` + `modprobe brcmfmac`) — **never** a
     /// Pi reboot. This is the first-line SDIO-deadlock recovery.

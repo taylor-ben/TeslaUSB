@@ -165,6 +165,16 @@ const WIFI_SAVED_FIXTURE = {
   ],
 };
 
+const WIFI_AP_FIXTURE = {
+  ap: {
+    mode: "auto",
+    active: false,
+    ssid: "TeslaUSB-Setup",
+    client_count: 0,
+    ip: null,
+  },
+};
+
 /** Intercept the three device-status probes with deterministic fixtures so the
  *  functional-parity assertions are host-independent. Must be called BEFORE the
  *  navigation that triggers the screen's mount-time fetches. */
@@ -179,7 +189,10 @@ async function routeSystemProbes(page: Page) {
   await page.route("**/api/storage/health", (r) => r.fulfill(json(STORAGE_FIXTURE)));
 }
 
-async function routeWifiProbes(page: Page) {
+async function routeWifiProbes(
+  page: Page,
+  ap = { ...WIFI_AP_FIXTURE.ap },
+) {
   const json = (body: unknown) => ({
     status: 200,
     contentType: "application/json",
@@ -188,6 +201,7 @@ async function routeWifiProbes(page: Page) {
   await page.route("**/api/wifi/status", (r) => r.fulfill(json(WIFI_STATUS_FIXTURE)));
   await page.route("**/api/wifi/networks", (r) => r.fulfill(json(WIFI_NETWORKS_FIXTURE)));
   await page.route("**/api/wifi/saved", (r) => r.fulfill(json(WIFI_SAVED_FIXTURE)));
+  await page.route("**/api/wifi/ap", (r) => r.fulfill(json({ ap })));
 }
 
 async function routeWifiMutations(
@@ -217,6 +231,43 @@ async function routeWifiMutations(
   });
 }
 
+async function routeApMutations(
+  page: Page,
+  seen: { mode: unknown[]; config: unknown[] },
+  ap?: {
+    mode: string;
+    active: boolean;
+    ssid: string | null;
+    client_count: number;
+    ip: string | null;
+  },
+) {
+  const json = (body: unknown) => ({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify(body),
+  });
+  await page.route("**/api/wifi/ap/mode", async (r) => {
+    const body = r.request().postDataJSON() as { mode?: string };
+    seen.mode.push(body);
+    if (
+      ap &&
+      (body.mode === "auto" || body.mode === "force_on" || body.mode === "force_off")
+    ) {
+      ap.mode = body.mode;
+      ap.active = body.mode === "force_on";
+      if (body.mode !== "force_on") ap.client_count = 0;
+    }
+    await r.fulfill(json({ ok: true }));
+  });
+  await page.route("**/api/wifi/ap/config", async (r) => {
+    const body = r.request().postDataJSON() as { ssid?: string; passphrase?: string };
+    seen.config.push(body);
+    if (ap && typeof body.ssid === "string") ap.ssid = body.ssid;
+    await r.fulfill(json({ ok: true }));
+  });
+}
+
 /** Mock gadgetd-present (200) for `/api/gadget/status`. gadgetd is not spawned
  *  in the harness, so the live socket read would 503; mocking the daemon-up
  *  state mirrors the established gadgetd-flow mocking and represents the normal
@@ -228,6 +279,23 @@ async function routeGadgetStatus(page: Page) {
       status: 200,
       contentType: "application/json",
       body: JSON.stringify(GADGET_FIXTURE),
+    }),
+  );
+}
+
+/** wifid is a Linux-only unix-socket daemon that is NOT spawned in the UAT
+ *  harness, so the live GET /api/wifi/ap read honestly 503s (exactly like
+ *  gadgetd). Mock it "present, Auto, inactive" for every test so the AP panel
+ *  renders against a daemon-up fixture and the browser never logs a 503
+ *  resource error. The dedicated wifi/AP tests override this via routeWifiProbes
+ *  to assert specific AP state; webd's honest 503-on-unavailable contract is
+ *  intact and covered by webd's own unit tests. */
+async function routeApStatus(page: Page) {
+  await page.route("**/api/wifi/ap", (r) =>
+    r.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ ap: { ...WIFI_AP_FIXTURE.ap } }),
     }),
   );
 }
@@ -252,11 +320,13 @@ function assertCleanConsole(probe: Probe) {
 }
 
 test.describe("settings dashboard UAT", () => {
-  // gadgetd is not spawned in the harness; mock its control-socket read as
-  // "present" (the normal production state) for every test. The dedicated
-  // degradation test below overrides this to assert the 503 → unavailable path.
+  // gadgetd and wifid are not spawned in the harness; mock their control-socket
+  // reads as "present" (the normal production state) for every test. The
+  // dedicated degradation test below overrides gadget to assert the 503 →
+  // unavailable path; the wifi/AP tests override /api/wifi/ap via routeWifiProbes.
   test.beforeEach(async ({ page }) => {
     await routeGadgetStatus(page);
+    await routeApStatus(page);
   });
 
   // ── Gate 1: functional + structural parity ─────────────────────────────
@@ -385,15 +455,17 @@ test.describe("settings dashboard UAT", () => {
       "Mounted (/run/teslausb/media-ro)",
     );
 
-    // WiFi Networks — read-only live data from the mocked probes.
+    // WiFi Networks — read-only live data from the mocked probes. Open the
+    // collapsible section first so its controls are actually visible.
+    await page
+      .locator("#wifi-networks-section")
+      .evaluate((el) => el.setAttribute("open", ""));
     await expect(page.locator("#wifi-current-connection")).toContainText("Trez");
     await expect(page.locator("#wifi-current-connection")).toContainText("52%");
     await expect(page.locator("#wifi-current-connection")).toContainText("Connected");
     const savedRows = page.locator("#wifi-saved-list .wifi-saved-row");
     await expect(savedRows).toHaveCount(3);
     await expect(savedRows.nth(0)).toContainText("Trez");
-    await expect(savedRows.nth(0)).toContainText("Recovery");
-    await expect(savedRows.nth(0)).toContainText("Saved");
     await expect(savedRows.nth(0)).toContainText("Connected");
     await expect(savedRows.nth(0).locator(".wifi-forget-btn")).toHaveCount(0);
     await expect(savedRows.nth(1)).toContainText("Old-Cafe");
@@ -404,11 +476,10 @@ test.describe("settings dashboard UAT", () => {
     await expect(page.locator("#wifi-join-btn")).toBeDisabled();
     await expect(page.locator("#btnWifiScan")).toBeEnabled();
 
-    // Access Point remains degraded in this read-only slice.
-    const ap = page.locator("details.settings-section", {
-      has: page.locator("summary", { hasText: "Access Point" }),
-    });
-    await expect(ap).toContainText("AP status unavailable");
+    const ap = page.locator("#access-point-section");
+    await ap.evaluate((el) => el.setAttribute("open", ""));
+    await expect(page.locator("#ap-status")).toContainText("TeslaUSB-Setup");
+    await expect(page.locator("#ap-status")).toContainText("Inactive");
 
     // Storage Health — severity/summary/device/fs/mount from the fixture; the
     // wear-telemetry rows (fs errors, TRIM) stay "—" (SD exposes little stable
@@ -522,16 +593,16 @@ test.describe("settings dashboard UAT", () => {
     await gotoDashboard(page);
     await page.locator("#wifi-networks-section").evaluate((el) => el.setAttribute("open", ""));
     const trezRow = page.locator('.wifi-saved-row[data-ssid="Trez"]');
-    await expect(trezRow).toContainText("Always connects first");
-    await expect(trezRow.locator(".wifi-move-up")).toHaveCount(0);
-    await expect(trezRow.locator(".wifi-move-down")).toHaveCount(0);
+    // Trez is first (highest priority) so its move-up is disabled; every saved
+    // row is reorderable in the redesign.
+    await expect(trezRow.locator(".wifi-move-up")).toBeDisabled();
     const saveBtn = page.locator("#wifi-order-save");
     await expect(saveBtn).toBeDisabled();
     await page.click('.wifi-saved-row[data-ssid="Old-Cafe"] .wifi-move-down');
     await expect(saveBtn).toBeEnabled();
     await saveBtn.click();
     await expect.poll(() => seen.priority.length).toBe(1);
-    expect(seen.priority[0]).toEqual({ order: ["Garage", "Old-Cafe"] });
+    expect(seen.priority[0]).toEqual({ order: ["Trez", "Garage", "Old-Cafe"] });
     assertCleanConsole(probe);
   });
 
@@ -544,8 +615,107 @@ test.describe("settings dashboard UAT", () => {
     await page.locator("#wifi-networks-section").evaluate((el) => el.setAttribute("open", ""));
     const trezRow = page.locator('.wifi-saved-row[data-ssid="Trez"]');
     await expect(trezRow).toBeVisible();
-    await expect(trezRow).toContainText("Recovery");
     await expect(trezRow.locator(".wifi-forget-btn")).toHaveCount(0);
+    assertCleanConsole(probe);
+  });
+
+  test("access point — change mode forwards POST", async ({ page, probe }) => {
+    const seen = { mode: [] as unknown[], config: [] as unknown[] };
+    const ap = { ...WIFI_AP_FIXTURE.ap };
+    await routeWifiProbes(page, ap);
+    await routeApMutations(page, seen, ap);
+    await gotoDashboard(page);
+    await page
+      .locator("#access-point-section")
+      .evaluate((el) => el.setAttribute("open", ""));
+    await page.selectOption("#ap-mode-select", "force_on");
+    await expect.poll(() => seen.mode.length).toBe(1);
+    expect(seen.mode[0]).toEqual({ mode: "force_on" });
+    await expect(page.locator("#ap-action-status")).toContainText(
+      "Access point updated",
+    );
+    assertCleanConsole(probe);
+  });
+
+  test("access point — Off shows lockout warning", async ({ page, probe }) => {
+    const seen = { mode: [] as unknown[], config: [] as unknown[] };
+    const ap = { ...WIFI_AP_FIXTURE.ap };
+    await routeWifiProbes(page, ap);
+    await routeApMutations(page, seen, ap);
+    await gotoDashboard(page);
+    await page
+      .locator("#access-point-section")
+      .evaluate((el) => el.setAttribute("open", ""));
+    await page.selectOption("#ap-mode-select", "force_off");
+    await expect.poll(() => seen.mode.length).toBe(1);
+    await expect(page.locator("#ap-lockout-warning")).toBeVisible();
+    assertCleanConsole(probe);
+  });
+
+  test("access point — save config forwards write-only body", async ({
+    page,
+    probe,
+  }) => {
+    const seen = { mode: [] as unknown[], config: [] as unknown[] };
+    const ap = { ...WIFI_AP_FIXTURE.ap };
+    await routeWifiProbes(page, ap);
+    await routeApMutations(page, seen, ap);
+    await gotoDashboard(page);
+    await page
+      .locator("#access-point-section")
+      .evaluate((el) => el.setAttribute("open", ""));
+    await page.click("#ap-edit-btn");
+    await page.fill("#ap-ssid-input", "MyAP");
+    await page.fill(".ap-pass-input", "supersecret1");
+    await page.click(".ap-config-save");
+    await expect.poll(() => seen.config.length).toBe(1);
+    expect(seen.config[0]).toEqual({
+      ssid: "MyAP",
+      passphrase: "supersecret1",
+    });
+    assertCleanConsole(probe);
+  });
+
+  test("access point — status card renders SSID and Inactive state", async ({
+    page,
+    probe,
+  }) => {
+    // Default fixture: Auto mode, not broadcasting. The status card shows the
+    // configured SSID + an "Inactive" pill and omits the client/IP line.
+    await routeWifiProbes(page, { ...WIFI_AP_FIXTURE.ap });
+    await gotoDashboard(page);
+    await page
+      .locator("#access-point-section")
+      .evaluate((el) => el.setAttribute("open", ""));
+    const status = page.locator("#ap-status");
+    await expect(status).toContainText("TeslaUSB-Setup");
+    await expect(status).toContainText("Inactive");
+    await expect(status).not.toContainText("connected");
+    assertCleanConsole(probe);
+  });
+
+  test("access point — active status card shows client count and IP", async ({
+    page,
+    probe,
+  }) => {
+    // When the AP is broadcasting, the card flips to an "Active" pill and adds
+    // the connected-client count and the AP's IP address.
+    await routeWifiProbes(page, {
+      mode: "force_on",
+      active: true,
+      ssid: "TeslaUSB-Setup",
+      client_count: 2,
+      ip: "192.168.4.1",
+    });
+    await gotoDashboard(page);
+    await page
+      .locator("#access-point-section")
+      .evaluate((el) => el.setAttribute("open", ""));
+    const status = page.locator("#ap-status");
+    await expect(status).toContainText("TeslaUSB-Setup");
+    await expect(status).toContainText("Active");
+    await expect(status).toContainText("2 connected");
+    await expect(status).toContainText("192.168.4.1");
     assertCleanConsole(probe);
   });
 
@@ -733,6 +903,7 @@ test.describe("settings dashboard UAT", () => {
     const origin = new URL(loadState().baseURL).origin;
     await gotoDashboard(page);
     await page.waitForLoadState("networkidle");
+    const allowedApi = new Set([...ALLOWED_API, "/api/wifi/saved", "/api/wifi/ap"]);
 
     // Every request is same-origin (no third-party calls / exfiltration), and
     // every /api/ call is a GET to a whitelisted path. Factored so we can re-run
@@ -745,7 +916,7 @@ test.describe("settings dashboard UAT", () => {
         expect(u.origin, `off-origin request to ${req.url}`).toBe(origin);
         if (!u.pathname.startsWith("/api/")) continue;
         expect(req.method.toUpperCase(), `${req.method} ${u.pathname}`).toBe("GET");
-        expect(ALLOWED_API.has(u.pathname), `unexpected API path ${u.pathname}`).toBe(true);
+        expect(allowedApi.has(u.pathname), `unexpected API path ${u.pathname}`).toBe(true);
         seen.set(u.pathname, u.search);
       }
       return seen;
@@ -773,6 +944,7 @@ test.describe("settings dashboard UAT", () => {
       "/api/wifi/networks was never requested",
     ).toBe(true);
     expect(apiSeen.has("/api/wifi/saved"), "/api/wifi/saved was never requested").toBe(true);
+    expect(apiSeen.has("/api/wifi/ap"), "/api/wifi/ap was never requested").toBe(true);
 
     // ACTIVELY exercise the mutation surface: expand every section, then prove
     // each config <form> swallows its submit (onSubmit preventDefault) and that
@@ -816,6 +988,10 @@ test.describe("settings dashboard UAT", () => {
     probe,
   }) => {
     const origin = new URL(loadState().baseURL).origin;
+    // /api/wifi/ap is mocked "present" by beforeEach (routeApStatus) — wifid is
+    // not in the harness, so the real read would 503 and the browser would log a
+    // resource error; the mock keeps this gate testing the app, not the absent
+    // daemon.
     await gotoDashboard(page);
     await page.waitForLoadState("networkidle");
     // Bounded post-load window: a regression that introduces a delayed poller

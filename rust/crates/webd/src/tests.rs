@@ -34,9 +34,11 @@ use crate::read_client::{
 };
 use crate::scheduler::SchedulerClient;
 use crate::stats_client::UnavailableVolumeStatsClient;
+use crate::wifid_client::WifidClient;
 use crate::{
     Catalog, MediaConfig, build_router, router_with_all_clients,
     router_with_all_clients_and_read_client, router_with_clients, router_with_gadget,
+    router_with_wifid,
 };
 
 /// A live fixture: a seeded catalog + its router. `_dir` keeps the temp files
@@ -972,6 +974,7 @@ fn media_fixture_with_read_client(
         indexd,
         read_client,
         Arc::new(UnavailableVolumeStatsClient),
+        crate::wifid_client::default_client(dir.path().join("wifid.sock")),
         chime_dir,
     );
     MediaFixture {
@@ -4153,6 +4156,151 @@ async fn chime_scheduler_protocol_error_maps_to_502() {
     let (status, body) = get_json(&fx.app, "/api/chime-scheduler").await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     assert_eq!(body["error"]["code"], "scheduler_protocol");
+}
+
+// ---------------------------------------------------------------------------
+// Wi-Fi AP proxy (`/api/wifi/ap*`) — webd is a pure forwarder to wifid.
+// These tests inject a MockWifid via `router_with_wifid` and assert request
+// forwarding + status/error mapping.
+// ---------------------------------------------------------------------------
+
+enum WifidReply {
+    Json(Value),
+    Unavailable,
+    Protocol,
+}
+
+struct MockWifid {
+    reply: WifidReply,
+    last: Arc<Mutex<Option<Value>>>,
+}
+
+impl WifidClient for MockWifid {
+    fn call(&self, request: Value) -> Result<Value, TransportError> {
+        *self.last.lock().unwrap() = Some(request);
+        match &self.reply {
+            WifidReply::Json(v) => Ok(v.clone()),
+            WifidReply::Unavailable => Err(TransportError::Unavailable("socket down".to_owned())),
+            WifidReply::Protocol => Err(TransportError::Protocol("garbled".to_owned())),
+        }
+    }
+}
+
+struct WifiApFixture {
+    _dir: TempDir,
+    app: Router,
+    last: Arc<Mutex<Option<Value>>>,
+}
+
+fn wifi_ap_fixture(reply: WifidReply) -> WifiApFixture {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("catalog.db");
+    seed(&db_path);
+
+    let static_dir = dir.path().join("static");
+    std::fs::create_dir_all(&static_dir).unwrap();
+    std::fs::write(static_dir.join("index.html"), "<!doctype html>shell").unwrap();
+
+    let archive_dir = dir.path().join("archive");
+    let cache_dir = dir.path().join("cache");
+    std::fs::create_dir_all(&archive_dir).unwrap();
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    let catalog = Catalog::open(&db_path).unwrap();
+    let media = MediaConfig::new(archive_dir, cache_dir);
+    let last = Arc::new(Mutex::new(None));
+    let wifid: Arc<dyn WifidClient> = Arc::new(MockWifid {
+        reply,
+        last: Arc::clone(&last),
+    });
+    let app = router_with_wifid(catalog, static_dir, media, wifid);
+    WifiApFixture {
+        _dir: dir,
+        app,
+        last,
+    }
+}
+
+#[tokio::test]
+async fn wifi_ap_get_status_forwards_cmd_and_relays_body() {
+    let reply =
+        json!({ "ap": { "mode": "auto", "active": false, "ssid": "tesla", "client_count": 0, "ip": null } });
+    let fx = wifi_ap_fixture(WifidReply::Json(reply.clone()));
+    let (status, body) = get_json(&fx.app, "/api/wifi/ap").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, reply);
+    let req = fx.last.lock().unwrap().clone().unwrap();
+    assert_eq!(req, json!({ "cmd": "get_ap_status" }));
+}
+
+#[tokio::test]
+async fn wifi_ap_set_mode_force_on_forwards_cmd() {
+    let fx = wifi_ap_fixture(WifidReply::Json(json!({ "ok": true })));
+    let (status, body) = post_json(&fx.app, "/api/wifi/ap/mode", json!({ "mode": "force_on" })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!({ "ok": true }));
+    let req = fx.last.lock().unwrap().clone().unwrap();
+    assert_eq!(req, json!({ "cmd": "set_ap_mode", "mode": "force_on" }));
+}
+
+#[tokio::test]
+async fn wifi_ap_set_mode_invalid_is_422_before_forward() {
+    let fx = wifi_ap_fixture(WifidReply::Json(json!({ "ok": true })));
+    let (status, body) = post_json(&fx.app, "/api/wifi/ap/mode", json!({ "mode": "bogus" })).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(body["error"]["code"], "invalid_mode");
+    assert!(fx.last.lock().unwrap().is_none(), "wifid not contacted");
+}
+
+#[tokio::test]
+async fn wifi_ap_set_config_forwards_cmd_and_never_echoes_secret() {
+    let fx = wifi_ap_fixture(WifidReply::Json(json!({ "ok": true })));
+    let (status, body) = post_json(
+        &fx.app,
+        "/api/wifi/ap/config",
+        json!({ "ssid": "MyAP", "passphrase": "supersecret1" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!({ "ok": true }));
+    let req = fx.last.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        req,
+        json!({ "cmd": "set_ap_config", "ssid": "MyAP", "passphrase": "supersecret1" })
+    );
+    let body_string = serde_json::to_string(&body).unwrap();
+    assert!(!body_string.contains("supersecret1"));
+}
+
+#[tokio::test]
+async fn wifi_ap_unavailable_maps_to_503() {
+    let fx = wifi_ap_fixture(WifidReply::Unavailable);
+    let (status, body) = get_json(&fx.app, "/api/wifi/ap").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"]["code"], "wifi_ap_unavailable");
+}
+
+#[tokio::test]
+async fn wifi_ap_invalid_argument_maps_to_422() {
+    let fx = wifi_ap_fixture(WifidReply::Json(json!({
+        "error": { "code": "invalid_argument", "message": "passphrase too short" }
+    })));
+    let (status, body) = post_json(
+        &fx.app,
+        "/api/wifi/ap/config",
+        json!({ "ssid": "x", "passphrase": "y" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(body["error"]["code"], "invalid_argument");
+}
+
+#[tokio::test]
+async fn wifi_ap_protocol_error_maps_to_502() {
+    let fx = wifi_ap_fixture(WifidReply::Protocol);
+    let (status, body) = get_json(&fx.app, "/api/wifi/ap").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(body["error"]["code"], "wifi_ap_protocol");
 }
 
 // ---------------------------------------------------------------------------

@@ -14,7 +14,7 @@
 
 use std::time::Instant;
 
-use crate::creds::{CredentialStore, Credentials, Secret};
+use crate::creds::{ApMode, CredentialStore, Credentials, Secret};
 use crate::error::{Result, WifidError};
 use crate::traits::{Clock, HeartbeatSource, RebootController};
 use crate::watchdog::WriteHeartbeat;
@@ -136,12 +136,22 @@ impl FileCredentialStore {
             out.push_str(ap.reveal());
             out.push('\n');
         }
+        if let Some(ap_ssid) = &creds.ap_ssid {
+            out.push_str("ap_ssid=");
+            out.push_str(ap_ssid);
+            out.push('\n');
+        }
+        out.push_str("ap_mode=");
+        out.push_str(creds.ap_mode.as_str());
+        out.push('\n');
         out
     }
 
     fn parse(contents: &str) -> Result<Credentials> {
         let mut sta_psk = None;
         let mut ap_passphrase = None;
+        let mut ap_ssid = None;
+        let mut ap_mode = ApMode::Auto;
         for line in contents.lines() {
             let line = line.trim();
             if line.is_empty() {
@@ -155,12 +165,16 @@ impl FileCredentialStore {
             match key {
                 "sta_psk" => sta_psk = Some(Secret::new(value)),
                 "ap_passphrase" => ap_passphrase = Some(Secret::new(value)),
+                "ap_ssid" => ap_ssid = Some(value.to_owned()),
+                "ap_mode" => ap_mode = ApMode::from_persisted(value),
                 _ => {} // forward-compatible: ignore unknown keys
             }
         }
         Ok(Credentials {
             sta_psk,
             ap_passphrase,
+            ap_ssid,
+            ap_mode,
         })
     }
 }
@@ -199,7 +213,7 @@ impl CredentialStore for FileCredentialStore {
 /// outset — the secret must never exist even briefly under the looser umask
 /// default that a write-then-chmod would leave it in.
 #[cfg(unix)]
-fn write_owner_only(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_owner_only(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let mut f = std::fs::OpenOptions::new()
@@ -215,8 +229,23 @@ fn write_owner_only(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
 /// Non-unix hosts (dev boxes) cannot set POSIX modes; the production target is
 /// always Linux, so this is a test-only fallback.
 #[cfg(not(unix))]
-fn write_owner_only(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_owner_only(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     std::fs::write(path, bytes)?;
+    Ok(())
+}
+
+/// Atomically (over)write `path` with `bytes` at `0600` via a temp-file +
+/// rename. Unlike [`write_owner_only`] (which uses `create_new` and so refuses
+/// an existing target), this is **idempotent across calls** — the target may
+/// already exist — and a reader never observes a half-written file. The temp is
+/// created `0600` from the outset and `rename` preserves the mode, so the
+/// content is never exposed under a looser umask even briefly.
+pub(crate) fn write_owner_only_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    let tmp = path.with_extension("tmp");
+    // Clear any stale temp from a previous crash so the create below succeeds.
+    let _ = std::fs::remove_file(&tmp);
+    write_owner_only(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)?;
     Ok(())
 }
 
@@ -224,7 +253,7 @@ fn write_owner_only(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::{FileCredentialStore, MonotonicClock};
-    use crate::creds::{CredentialStore, Credentials, Secret};
+    use crate::creds::{ApMode, CredentialStore, Credentials, Secret};
     use crate::traits::Clock;
 
     #[test]
@@ -245,11 +274,28 @@ mod tests {
         let creds = Credentials {
             sta_psk: Some(Secret::new("home-psk-value")),
             ap_passphrase: Some(Secret::new("ap-pass-value")),
+            ap_ssid: Some("TeslaUSB=AP".to_owned()),
+            ap_mode: ApMode::ForceOn,
         };
         store.store(&creds).unwrap();
         let loaded = store.load().unwrap().expect("credentials present");
         assert_eq!(loaded, creds);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_writer_overwrites_an_existing_file() {
+        // Regression: the overlay writes hostapd/dnsmasq confs to a *stable*
+        // path every reconcile. `write_owner_only` alone (create_new) would fail
+        // AlreadyExists on the 2nd call; the atomic writer must succeed and
+        // replace the contents.
+        let dir = std::env::temp_dir().join(format!("wifid-atomic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("conf");
+        super::write_owner_only_atomic(&path, b"first").unwrap();
+        super::write_owner_only_atomic(&path, b"second").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -297,6 +343,8 @@ mod tests {
             .store(&Credentials {
                 sta_psk: None,
                 ap_passphrase: Some(Secret::new("ap-pass-value")),
+                ap_ssid: None,
+                ap_mode: ApMode::Auto,
             })
             .unwrap();
 

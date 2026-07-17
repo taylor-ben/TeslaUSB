@@ -14,6 +14,39 @@
 //!   passes a secret on a command line (the executor renders config files).
 
 use crate::error::{Result, WifidError};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ApMode {
+    Auto,
+    ForceOn,
+    ForceOff,
+}
+
+impl Default for ApMode {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+impl ApMode {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::ForceOn => "force_on",
+            Self::ForceOff => "force_off",
+        }
+    }
+
+    pub(crate) fn from_persisted(s: &str) -> ApMode {
+        match s {
+            "force_on" => Self::ForceOn,
+            "force_off" => Self::ForceOff,
+            _ => Self::Auto,
+        }
+    }
+}
 
 /// A secret string (PSK / passphrase) that refuses to reveal itself except
 /// through the explicit [`Secret::reveal`] accessor.
@@ -66,6 +99,10 @@ pub(crate) struct Credentials {
     /// forbidden), so the executor refuses to start it until a passphrase is
     /// set. Never `None` once `set-credentials` has run.
     pub(crate) ap_passphrase: Option<Secret>,
+    /// AP SSID (public, non-secret). `None` means AP is not provisioned yet.
+    pub(crate) ap_ssid: Option<String>,
+    /// AP policy mode.
+    pub(crate) ap_mode: ApMode,
 }
 
 impl Credentials {
@@ -76,6 +113,8 @@ impl Credentials {
         Self {
             sta_psk: None,
             ap_passphrase: None,
+            ap_ssid: None,
+            ap_mode: ApMode::Auto,
         }
     }
 
@@ -84,19 +123,43 @@ impl Credentials {
     pub(crate) fn sta_configured(&self) -> bool {
         self.sta_psk.is_some()
     }
+
+    /// AP is provisioned only when both SSID and WPA2 passphrase are present.
+    pub(crate) fn ap_provisioned(&self) -> bool {
+        self.ap_ssid.is_some() && self.ap_passphrase.is_some()
+    }
 }
 
 /// A change requested by `webd` over IPC. `webd` sets values; it never reads
 /// them back. A `None` field leaves that credential unchanged; `clear_sta`
 /// removes the STA PSK (revert to onboarding-only).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct CredentialUpdate {
     /// New STA PSK, if changing.
     pub(crate) sta_psk: Option<String>,
     /// New AP passphrase, if changing.
     pub(crate) ap_passphrase: Option<String>,
+    /// New AP SSID, if changing.
+    pub(crate) ap_ssid: Option<String>,
+    /// New AP mode, if changing.
+    pub(crate) ap_mode: Option<ApMode>,
     /// Remove the STA PSK entirely.
     pub(crate) clear_sta: bool,
+}
+
+impl std::fmt::Debug for CredentialUpdate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CredentialUpdate")
+            .field("sta_psk", &self.sta_psk.as_ref().map(|_| "<redacted>"))
+            .field(
+                "ap_passphrase",
+                &self.ap_passphrase.as_ref().map(|_| "<redacted>"),
+            )
+            .field("ap_ssid", &self.ap_ssid)
+            .field("ap_mode", &self.ap_mode)
+            .field("clear_sta", &self.clear_sta)
+            .finish()
+    }
 }
 
 /// WPA2-PSK passphrase rule: 8..=63 printable ASCII characters (IEEE 802.11i).
@@ -111,6 +174,33 @@ pub(crate) fn validate_wpa2_passphrase(value: &str) -> std::result::Result<(), &
     }
     if !value.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
         return Err("WPA2 passphrase must be printable ASCII");
+    }
+    Ok(())
+}
+
+/// AP SSID rule: 1..=32 bytes, no ASCII control bytes, no leading/trailing
+/// ASCII whitespace.
+///
+/// # Errors
+/// Returns a static reason (never the value) if the SSID is invalid.
+pub(crate) fn validate_ssid(value: &str) -> std::result::Result<(), &'static str> {
+    let len = value.len();
+    if !(1..=32).contains(&len) {
+        return Err("SSID must be 1..=32 bytes");
+    }
+    if value.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return Err("SSID must not contain ASCII control characters");
+    }
+    if value
+        .as_bytes()
+        .first()
+        .is_some_and(u8::is_ascii_whitespace)
+        || value
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_whitespace)
+    {
+        return Err("SSID must not have leading or trailing ASCII whitespace");
     }
     Ok(())
 }
@@ -147,9 +237,20 @@ pub(crate) fn apply_update(
         current.ap_passphrase.clone()
     };
 
+    let ap_ssid = if let Some(ssid) = &update.ap_ssid {
+        validate_ssid(ssid).map_err(WifidError::InvalidCredential)?;
+        Some(ssid.clone())
+    } else {
+        current.ap_ssid.clone()
+    };
+
+    let ap_mode = update.ap_mode.unwrap_or(current.ap_mode);
+
     Ok(Credentials {
         sta_psk,
         ap_passphrase,
+        ap_ssid,
+        ap_mode,
     })
 }
 
@@ -180,7 +281,10 @@ pub(crate) trait CredentialStore {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use super::{CredentialUpdate, Credentials, Secret, apply_update, validate_wpa2_passphrase};
+    use super::{
+        ApMode, CredentialUpdate, Credentials, Secret, apply_update, validate_ssid,
+        validate_wpa2_passphrase,
+    };
 
     const SENTINEL: &str = "hunter2-supersecret-psk";
 
@@ -188,6 +292,8 @@ mod tests {
         Credentials {
             sta_psk: Some(Secret::new(SENTINEL)),
             ap_passphrase: Some(Secret::new("onboarding-pass")),
+            ap_ssid: Some("TeslaUSB".to_owned()),
+            ap_mode: ApMode::Auto,
         }
     }
 
@@ -212,6 +318,24 @@ mod tests {
     }
 
     #[test]
+    fn credential_update_debug_redacts_secrets() {
+        let shown = format!(
+            "{:?}",
+            CredentialUpdate {
+                sta_psk: Some("secretpsk123".to_owned()),
+                ap_passphrase: Some("secretpass456".to_owned()),
+                ap_ssid: Some("Vis".to_owned()),
+                ap_mode: None,
+                clear_sta: false,
+            }
+        );
+        assert!(!shown.contains("secretpsk123"));
+        assert!(!shown.contains("secretpass456"));
+        assert!(shown.contains("Vis"));
+        assert!(shown.contains("<redacted>"));
+    }
+
+    #[test]
     fn wpa2_validation_enforces_length() {
         assert!(validate_wpa2_passphrase("short").is_err());
         assert!(validate_wpa2_passphrase("12345678").is_ok());
@@ -226,12 +350,32 @@ mod tests {
     }
 
     #[test]
+    fn ssid_validation_enforces_bounds_and_characters() {
+        assert!(validate_ssid("").is_err());
+        assert!(validate_ssid("a").is_ok());
+        assert!(validate_ssid(&"x".repeat(32)).is_ok());
+        assert!(validate_ssid(&"x".repeat(33)).is_err());
+        assert!(validate_ssid("abc\x1fdef").is_err());
+        assert!(validate_ssid(" leading").is_err());
+        assert!(validate_ssid("trailing ").is_err());
+    }
+
+    #[test]
+    fn ssid_validation_error_does_not_echo_the_value() {
+        let value = " bad-ssid";
+        let err = validate_ssid(value).unwrap_err();
+        assert!(!err.contains(value), "validation error echoed the value");
+    }
+
+    #[test]
     fn apply_update_changes_psk_and_keeps_ap() {
         let updated = apply_update(
             &base(),
             &CredentialUpdate {
                 sta_psk: Some("newpassword".to_owned()),
                 ap_passphrase: None,
+                ap_ssid: None,
+                ap_mode: None,
                 clear_sta: false,
             },
         )
@@ -250,6 +394,8 @@ mod tests {
             &CredentialUpdate {
                 sta_psk: None,
                 ap_passphrase: None,
+                ap_ssid: None,
+                ap_mode: None,
                 clear_sta: true,
             },
         )
@@ -264,6 +410,8 @@ mod tests {
             &CredentialUpdate {
                 sta_psk: Some("12345678".to_owned()),
                 ap_passphrase: None,
+                ap_ssid: None,
+                ap_mode: None,
                 clear_sta: true,
             },
         );
@@ -277,9 +425,54 @@ mod tests {
             &CredentialUpdate {
                 sta_psk: None,
                 ap_passphrase: Some("short".to_owned()),
+                ap_ssid: None,
+                ap_mode: None,
                 clear_sta: false,
             },
         );
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn apply_update_sets_ap_ssid_and_mode_without_touching_secrets() {
+        let updated = apply_update(
+            &base(),
+            &CredentialUpdate {
+                sta_psk: None,
+                ap_passphrase: None,
+                ap_ssid: Some("TeslaUSB AP".to_owned()),
+                ap_mode: Some(ApMode::ForceOn),
+                clear_sta: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(updated.ap_ssid.as_deref(), Some("TeslaUSB AP"));
+        assert_eq!(updated.ap_mode, ApMode::ForceOn);
+        assert_eq!(updated.sta_psk.as_ref().unwrap().reveal(), SENTINEL);
+        assert_eq!(
+            updated.ap_passphrase.as_ref().unwrap().reveal(),
+            "onboarding-pass"
+        );
+    }
+
+    #[test]
+    fn ap_provisioned_requires_both_ssid_and_passphrase() {
+        let both = Credentials {
+            sta_psk: None,
+            ap_passphrase: Some(Secret::new("onboarding-pass")),
+            ap_ssid: Some("TeslaUSB".to_owned()),
+            ap_mode: ApMode::Auto,
+        };
+        assert!(both.ap_provisioned());
+        let missing_ssid = Credentials {
+            ap_ssid: None,
+            ..both.clone()
+        };
+        assert!(!missing_ssid.ap_provisioned());
+        let missing_pass = Credentials {
+            ap_passphrase: None,
+            ..both
+        };
+        assert!(!missing_pass.ap_provisioned());
     }
 }

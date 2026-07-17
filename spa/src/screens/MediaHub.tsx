@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from "preact/hooks";
 import { Fragment } from "preact";
 import { ApiError, api } from "../api/client";
 import type {
+  ApInfo,
+  ApMode,
   GadgetStatus,
   HealthBlock,
   Pref,
@@ -234,6 +236,15 @@ export function MediaHub() {
   const [wifiMsg, setWifiMsg] = useState<
     { kind: "info" | "success" | "error"; text: string } | null
   >(null);
+  const [apStatus, setApStatus] = useState<ApInfo | null>(null);
+  const [apLoading, setApLoading] = useState(true);
+  const [apBusy, setApBusy] = useState(false);
+  const [apMsg, setApMsg] = useState<
+    { kind: "info" | "success" | "error"; text: string } | null
+  >(null);
+  const [apEditing, setApEditing] = useState(false);
+  const [apSsid, setApSsid] = useState("");
+  const [apPass, setApPass] = useState("");
   const [gadget, setGadget] = useState<GadgetStatus | null>(null);
   const [gadgetUnavailable, setGadgetUnavailable] = useState(false);
   const [derived, setDerived] = useState<{
@@ -250,6 +261,7 @@ export function MediaHub() {
   } | null>(null);
   const wifiScanCtrl = useRef<AbortController | null>(null);
   const wifiActionCtrl = useRef<AbortController | null>(null);
+  const apActionCtrl = useRef<AbortController | null>(null);
 
   useEffect(() => {
     const ctrl = new AbortController();
@@ -330,10 +342,34 @@ export function MediaHub() {
     };
   }, []);
 
+  useEffect(() => {
+    let active = true;
+    const ctrl = new AbortController();
+    setApLoading(true);
+    api
+      .wifiApStatus(ctrl.signal)
+      .then((resp) => {
+        if (!active) return;
+        setApStatus(resp.ap);
+      })
+      .catch((err) => {
+        if (!active || isAbortError(err)) return;
+        setApStatus(null);
+      })
+      .finally(() => {
+        if (active) setApLoading(false);
+      });
+    return () => {
+      active = false;
+      ctrl.abort();
+    };
+  }, []);
+
   useEffect(
     () => () => {
       wifiScanCtrl.current?.abort();
       wifiActionCtrl.current?.abort();
+      apActionCtrl.current?.abort();
     },
     [],
   );
@@ -440,6 +476,11 @@ export function MediaHub() {
       },
     );
 
+  const reloadAp = (signal: AbortSignal) =>
+    api.wifiApStatus(signal).then((resp) => {
+      setApStatus(resp.ap);
+    });
+
   const runConnect = (ssid: string, psk?: string) => {
     if (wifiBusy) return;
     wifiActionCtrl.current?.abort();
@@ -544,6 +585,72 @@ export function MediaHub() {
       });
   };
 
+  const applyApMode = (mode: ApMode) => {
+    if (apBusy) return;
+    apActionCtrl.current?.abort();
+    const ctrl = new AbortController();
+    apActionCtrl.current = ctrl;
+    setApBusy(true);
+    setApMsg({ kind: "info", text: "Updating access point…" });
+    api
+      .wifiApMode(mode, ctrl.signal)
+      .then(() => {
+        if (ctrl.signal.aborted) return;
+        setApMsg({ kind: "success", text: "Access point updated" });
+        return reloadAp(ctrl.signal).catch(() => {});
+      })
+      .catch((err) => {
+        if (ctrl.signal.aborted || isAbortError(err)) return;
+        setApMsg({
+          kind: "error",
+          text: err instanceof ApiError ? err.message : "Could not update access point",
+        });
+      })
+      .finally(() => {
+        if (!ctrl.signal.aborted) setApBusy(false);
+      });
+  };
+
+  const saveApConfig = () => {
+    if (apBusy) return;
+    const ssid = apSsid.trim();
+    if (ssid.length === 0) {
+      setApMsg({ kind: "error", text: "Access point name is required" });
+      return;
+    }
+    if (apPass.length < 8 || apPass.length > 63) {
+      setApMsg({
+        kind: "error",
+        text: "Password must be 8–63 characters",
+      });
+      return;
+    }
+    apActionCtrl.current?.abort();
+    const ctrl = new AbortController();
+    apActionCtrl.current = ctrl;
+    setApBusy(true);
+    setApMsg({ kind: "info", text: "Saving access point settings…" });
+    api
+      .wifiApConfig({ ssid, passphrase: apPass }, ctrl.signal)
+      .then(() => {
+        if (ctrl.signal.aborted) return;
+        setApPass("");
+        setApEditing(false);
+        setApMsg({ kind: "success", text: "Access point settings saved" });
+        return reloadAp(ctrl.signal).catch(() => {});
+      })
+      .catch((err) => {
+        if (ctrl.signal.aborted || isAbortError(err)) return;
+        setApMsg({
+          kind: "error",
+          text: err instanceof ApiError ? err.message : "Could not save access point settings",
+        });
+      })
+      .finally(() => {
+        if (!ctrl.signal.aborted) setApBusy(false);
+      });
+  };
+
   const moveWifi = (idx: number, dir: -1 | 1) => {
     setWifiOrder((prev) => {
       const next = prev.slice();
@@ -609,6 +716,7 @@ export function MediaHub() {
     .map((ssid) => wifiSaved.find((n) => n.ssid === ssid))
     .filter((n): n is SavedWifiNetwork => n != null);
   const availableWifi = wifiNetworks.filter((n) => !n.saved && !n.active);
+  const apMode = apStatus?.mode ?? "auto";
 
   return (
     // Bare screen content — the router hoists a single shared <Shell> and
@@ -1102,14 +1210,179 @@ export function MediaHub() {
           </div>
         </details>
 
-        {/* Access Point — degraded (no Wi-Fi tooling), matching the baseline. */}
-        <details class="settings-section">
+        <details class="settings-section" id="access-point-section">
           <summary>Access Point</summary>
           <div class="section-content">
-            <div style="color: var(--error-text);">
-              AP status unavailable (Wi-Fi tooling is not part of the read-only
-              catalog build).
-            </div>
+            {apMsg ? (
+              <div
+                id="ap-action-status"
+                role="status"
+                aria-live="polite"
+                style={`font-size:0.85em;margin:2px 0 6px;color:${
+                  apMsg.kind === "error"
+                    ? "var(--accent-error, #e53935)"
+                    : apMsg.kind === "success"
+                      ? "var(--accent-success, #4caf50)"
+                      : "var(--text-secondary)"
+                }`}
+              >
+                {apMsg.text}
+              </div>
+            ) : null}
+            {apLoading ? (
+              <div style="text-align:center;padding:12px;color:var(--text-secondary)">
+                Loading access point…
+              </div>
+            ) : (
+              <div style="display:flex;flex-direction:column;gap:8px">
+                <div
+                  id="ap-status"
+                  style="display:flex;justify-content:space-between;align-items:center;padding:8px 10px;border:1px solid var(--border-color);border-radius:8px;background:var(--bg-secondary);gap:8px;flex-wrap:wrap"
+                >
+                  <div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0">
+                    <strong>{apStatus?.ssid ?? "(not configured)"}</strong>
+                  </div>
+                  <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+                    {apStatus?.active ? (
+                      <span
+                        style="font-size:0.75em;padding:2px 8px;border-radius:999px;background:var(--bg-secondary);border:1px solid var(--accent-success, #4caf50);color:var(--accent-success, #4caf50)"
+                      >
+                        Active
+                      </span>
+                    ) : (
+                      <span
+                        style="font-size:0.75em;padding:2px 8px;border-radius:999px;background:var(--bg-secondary);border:1px solid var(--border-color);color:var(--text-secondary)"
+                      >
+                        Inactive
+                      </span>
+                    )}
+                    {apStatus?.active ? (
+                      <span style="font-size:0.85em;color:var(--text-secondary)">
+                        {apStatus.client_count} connected
+                        {apStatus.ip ? ` · ${apStatus.ip}` : ""}
+                      </span>
+                    ) : null}
+                  </div>
+                </div>
+
+                <div style="display:flex;flex-direction:column;gap:6px;max-width:520px">
+                  <label for="ap-mode-select" style="font-size:0.85em;color:var(--text-secondary)">
+                    Access point mode
+                  </label>
+                  <select
+                    id="ap-mode-select"
+                    value={apMode}
+                    disabled={apBusy || apLoading}
+                    onChange={(e) =>
+                      applyApMode((e.target as HTMLSelectElement).value as ApMode)
+                    }
+                    style="padding:4px 8px;font-size:0.9em"
+                  >
+                    <option value="auto">Auto (recommended)</option>
+                    <option value="force_on">On</option>
+                    <option value="force_off">Off</option>
+                  </select>
+                  <p style="margin:0;font-size:0.85em;color:var(--text-secondary)">
+                    {apMode === "force_on"
+                      ? "The access point always broadcasts, even while Wi-Fi is connected."
+                      : apMode === "force_off"
+                        ? "The access point is disabled and never broadcasts."
+                        : "The access point turns on only when the device cannot reach home Wi-Fi."}
+                  </p>
+                  {apMode === "force_off" ? (
+                    <div
+                      id="ap-lockout-warning"
+                      style="font-size:0.85em;color:var(--error-text);border:1px solid var(--accent-error, #e53935);border-radius:8px;padding:8px 10px;background:var(--bg-secondary)"
+                    >
+                      With the access point off, if the device can't reach your Wi-Fi
+                      you may lose access to it.
+                    </div>
+                  ) : null}
+                </div>
+
+                <div style="display:flex;flex-direction:column;gap:6px;max-width:520px">
+                  <div>
+                    <button
+                      type="button"
+                      class="edit-btn"
+                      id="ap-edit-btn"
+                      disabled={apBusy || apLoading}
+                      onClick={() => {
+                        if (!apEditing) {
+                          setApSsid(apStatus?.ssid ?? "");
+                          setApPass("");
+                        }
+                        setApEditing((v) => !v);
+                      }}
+                      style="padding:4px 10px;font-size:0.85em"
+                    >
+                      Edit AP name &amp; password
+                    </button>
+                  </div>
+                  {apEditing ? (
+                    <div style="display:flex;flex-direction:column;gap:6px;max-width:480px">
+                      <label
+                        for="ap-ssid-input"
+                        style="font-size:0.85em;color:var(--text-secondary)"
+                      >
+                        Access point name
+                      </label>
+                      <input
+                        id="ap-ssid-input"
+                        value={apSsid}
+                        disabled={apBusy}
+                        onInput={(e) =>
+                          setApSsid((e.target as HTMLInputElement).value)
+                        }
+                        style="padding:4px 8px;font-size:0.85em"
+                      />
+                      <label
+                        for="ap-pass-input"
+                        style="font-size:0.85em;color:var(--text-secondary)"
+                      >
+                        Password
+                      </label>
+                      <div style="display:flex;gap:6px;align-items:center">
+                        <input
+                          id="ap-pass-input"
+                          type="password"
+                          class="ap-pass-input"
+                          placeholder="8–63 characters"
+                          value={apPass}
+                          disabled={apBusy}
+                          onInput={(e) =>
+                            setApPass((e.target as HTMLInputElement).value)
+                          }
+                          style="flex:1;min-width:0;padding:4px 8px;font-size:0.85em"
+                        />
+                        <button
+                          type="button"
+                          class="edit-btn ap-config-save"
+                          disabled={apBusy}
+                          onClick={saveApConfig}
+                          style="padding:4px 10px;font-size:0.85em"
+                        >
+                          Save
+                        </button>
+                        <button
+                          type="button"
+                          class="edit-btn"
+                          disabled={apBusy}
+                          onClick={() => {
+                            setApEditing(false);
+                            setApSsid(apStatus?.ssid ?? "");
+                            setApPass("");
+                          }}
+                          style="padding:4px 10px;font-size:0.85em"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+            )}
           </div>
         </details>
 

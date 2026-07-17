@@ -30,8 +30,10 @@ mod config;
 mod creds;
 mod error;
 mod exec;
+mod ipc;
 mod link;
 mod nmcli;
+mod overlay;
 mod orchestrator;
 mod status;
 mod throttle;
@@ -39,19 +41,25 @@ mod traits;
 mod watchdog;
 
 use std::process::ExitCode;
+use std::path::PathBuf;
+use std::sync::mpsc::RecvTimeoutError;
 use std::time::Duration;
+use std::time::Instant;
 
 use config::WifidConfig;
-use creds::{CredentialStore, CredentialUpdate, Credentials, Secret};
+use creds::{ApMode, CredentialStore, CredentialUpdate, Credentials, Secret};
 use exec::{
     FileCredentialStore, GadgetHeartbeatSource, HardwareRebootController, MonotonicClock,
     current_boot_id,
 };
 use nmcli::NmcliNetworkController;
+use overlay::Uap0Overlay;
 use orchestrator::Daemon;
 
 /// Default credential file (Pi-side ext4 data area, never on the Tesla volume).
 const DEFAULT_CRED_PATH: &str = "/data/teslausb/wifi-credentials";
+/// Control-plane UDS socket (device-only; webd connects here).
+const CONTROL_SOCKET: &str = "/run/teslausb/wifid.sock";
 /// Control-loop tick interval.
 const TICK_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -98,6 +106,7 @@ fn build_daemon(
         GadgetHeartbeatSource,
         HardwareRebootController,
         FileCredentialStore,
+        Uap0Overlay,
     >,
     String,
 > {
@@ -110,6 +119,7 @@ fn build_daemon(
         GadgetHeartbeatSource,
         HardwareRebootController,
         FileCredentialStore::new(cred_path),
+        Uap0Overlay::new(cfg.platform.wifi_iface.clone()),
         cfg,
         current_boot_id(),
     )
@@ -118,15 +128,10 @@ fn build_daemon(
 
 fn cmd_serve(cred_path: &str) -> Result<(), String> {
     let mut daemon = build_daemon(cred_path)?;
+    let (tx, rx) = std::sync::mpsc::channel::<ipc::IpcJob>();
+    ipc::spawn_control_server(PathBuf::from(CONTROL_SOCKET), tx);
     println!("wifid serve: control loop starting (tick {TICK_INTERVAL:?})");
     loop {
-        // Drain any pending admin commands (delivered over IPC on the device;
-        // none off-device). Referenced here so the command path is wired.
-        for cmd in drain_admin_commands() {
-            if let Err(e) = daemon.handle_command(cmd) {
-                eprintln!("wifid: admin command failed: {e}");
-            }
-        }
         match daemon.tick() {
             Ok(status) => {
                 if let Ok(json) = serde_json::to_string(&status) {
@@ -144,13 +149,33 @@ fn cmd_serve(cred_path: &str) -> Result<(), String> {
                 eprintln!("wifid: tick failed (continuing): {e}");
             }
         }
-        std::thread::sleep(TICK_INTERVAL);
+        // Service IPC jobs until the next tick deadline. IPC problems can never
+        // stop the control loop: a dead server thread just falls back to sleep.
+        let deadline = Instant::now() + TICK_INTERVAL;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match rx.recv_timeout(remaining) {
+                Ok(job) => {
+                    // Drop a job whose caller already timed out rather than
+                    // applying a mutation it was told failed (esp. `force_off`).
+                    if !ipc::job_is_live(&job) {
+                        continue;
+                    }
+                    let response = daemon.handle_ipc(job.request);
+                    // Client may have hung up; dropping the reply is fine.
+                    let _ = job.reply.send(response);
+                }
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(RecvTimeoutError::Disconnected) => {
+                    std::thread::sleep(remaining);
+                    break;
+                }
+            }
+        }
     }
-}
-
-/// On the device this is fed by the control UDS; off-device there are none.
-fn drain_admin_commands() -> Vec<orchestrator::AdminCommand> {
-    Vec::new()
 }
 
 fn cmd_status(cred_path: &str) -> Result<(), String> {
@@ -179,7 +204,7 @@ fn cmd_check_tx(args: &[String], cred_path: &str) -> Result<(), String> {
 fn cmd_set_credentials(args: &[String], cred_path: &str) -> Result<(), String> {
     let store = FileCredentialStore::new(cred_path);
     // First run: there is no credential file yet. The AP must always have a
-    // WPA2 passphrase, so seed a base from --ap-pass before the daemon loads. A
+    // WPA2 passphrase and SSID, so seed a base before the daemon loads. A
     // genuine read/parse error (not a missing file) is surfaced, not papered
     // over — we must never overwrite a store we failed to read.
     let existing = store.load().map_err(|e| e.to_string())?;
@@ -187,11 +212,18 @@ fn cmd_set_credentials(args: &[String], cred_path: &str) -> Result<(), String> {
         let ap = opt_flag(args, "--ap-pass")?.ok_or_else(|| {
             "no existing credentials: --ap-pass is required to initialise".to_owned()
         })?;
+        let ap_ssid = opt_flag(args, "--ap-ssid")?.ok_or_else(|| {
+            "no existing credentials: --ap-ssid is required to initialise".to_owned()
+        })?;
         creds::validate_wpa2_passphrase(&ap).map_err(str::to_owned)?;
+        creds::validate_ssid(&ap_ssid).map_err(str::to_owned)?;
         let base = Credentials {
             sta_psk: None,
             ap_passphrase: Some(Secret::new(ap)),
+            ap_ssid: Some(ap_ssid),
+            ap_mode: ApMode::Auto,
         };
+        debug_assert!(base.ap_provisioned());
         store.store(&base).map_err(|e| e.to_string())?;
     }
 
@@ -201,6 +233,8 @@ fn cmd_set_credentials(args: &[String], cred_path: &str) -> Result<(), String> {
     let update = CredentialUpdate {
         sta_psk: opt_flag(args, "--sta-psk")?,
         ap_passphrase: opt_flag(args, "--ap-pass")?,
+        ap_ssid: opt_flag(args, "--ap-ssid")?,
+        ap_mode: None,
         clear_sta: args.iter().any(|a| a == "--clear-sta"),
     };
     daemon
@@ -241,6 +275,6 @@ fn parse_u64_flag(args: &[String], name: &str, default: u64) -> Result<u64, Stri
 
 fn usage() -> String {
     "usage: wifid <serve|status|check-tx|set-credentials|config> [--cred-path <path>] \
-[--bytes <n>] [--sta-psk <psk>] [--ap-pass <passphrase>] [--clear-sta]"
+[--bytes <n>] [--sta-psk <psk>] [--ap-pass <passphrase>] [--ap-ssid <ssid>] [--clear-sta]"
         .to_owned()
 }

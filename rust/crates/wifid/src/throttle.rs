@@ -46,6 +46,9 @@ pub(crate) enum PauseReason {
     LinkDown,
     /// SDIO watchdog resetting `brcmfmac`.
     ChipRecovery,
+    /// Concurrent AP overlay up alongside STA — uploads reduced (or paused if
+    /// the uap0 cap could not be applied) to bound shared-radio TX.
+    ApConcurrent,
     /// Backing off to stay under the SDIO threshold.
     NearDeadlock,
 }
@@ -92,6 +95,10 @@ pub(crate) struct ThrottleInputs {
     pub(crate) near_deadlock: bool,
     /// The kernel `tc` cap has been successfully applied.
     pub(crate) tc_applied: bool,
+    /// A concurrent AP overlay (uap0) is observed up alongside the STA.
+    pub(crate) ap_overlay_active: bool,
+    /// The bounded uap0 TX cap has been successfully applied.
+    pub(crate) ap_cap_applied: bool,
 }
 
 /// A token bucket enforcing a sustained byte/sec cap with a bounded burst.
@@ -154,6 +161,7 @@ pub(crate) struct ThrottlePublisher {
     full_rate: u64,
     max_chunk_bytes: u32,
     near_deadlock_divisor: u64,
+    ap_concurrent_divisor: u64,
     seq: u64,
     last_body: Option<ThrottleBody>,
 }
@@ -165,6 +173,7 @@ impl ThrottlePublisher {
             full_rate: cfg.max_tx_bytes_per_s,
             max_chunk_bytes: cfg.max_chunk_bytes,
             near_deadlock_divisor: cfg.near_deadlock_divisor.max(1),
+            ap_concurrent_divisor: cfg.ap_concurrent_divisor.max(1),
             seq: 0,
             last_body: None,
         }
@@ -184,27 +193,39 @@ impl ThrottlePublisher {
         }
     }
 
+    #[allow(clippy::if_same_then_else)]
     fn derive_body(&self, i: ThrottleInputs) -> ThrottleBody {
         // Priority order matters: recovery and non-STA modes fail closed before
         // any "allowed" path is considered.
         let (uploads_allowed, max_tx, action, reason) = if i.chip_recovering {
-            (
-                false,
-                0,
-                PauseAction::AbortResumeLater,
-                PauseReason::ChipRecovery,
-            )
+            (false, 0, PauseAction::AbortResumeLater, PauseReason::ChipRecovery)
         } else if i.link_mode == LinkMode::Ap {
             (false, 0, PauseAction::DrainNoNew, PauseReason::ApMode)
         } else if i.link_mode == LinkMode::Down {
             (false, 0, PauseAction::DrainNoNew, PauseReason::LinkDown)
         } else if !i.sta_link_up || !i.tc_applied {
-            // STA mode but not yet confirmed up, or the hard cap is not in place
-            // — never allow TX without the braces applied.
             (false, 0, PauseAction::DrainNoNew, PauseReason::LinkDown)
-        } else if i.near_deadlock {
-            let reduced = (self.full_rate / self.near_deadlock_divisor).max(1);
-            (true, reduced, PauseAction::Run, PauseReason::NearDeadlock)
+        } else if i.ap_overlay_active && !i.ap_cap_applied {
+            // Concurrent AP up but the uap0 TX cap is NOT in place — fail safe:
+            // pause uploads so aggregate single-channel radio TX stays bounded.
+            (false, 0, PauseAction::DrainNoNew, PauseReason::ApConcurrent)
+        } else if i.ap_overlay_active || i.near_deadlock {
+            // Reduce the sustained cap under concurrency and/or deadlock
+            // pressure; take the most restrictive divisor of those that apply.
+            let mut divisor = 1u64;
+            if i.ap_overlay_active {
+                divisor = divisor.max(self.ap_concurrent_divisor);
+            }
+            if i.near_deadlock {
+                divisor = divisor.max(self.near_deadlock_divisor);
+            }
+            let reduced = (self.full_rate / divisor).max(1);
+            let reason = if i.ap_overlay_active {
+                PauseReason::ApConcurrent
+            } else {
+                PauseReason::NearDeadlock
+            };
+            (true, reduced, PauseAction::Run, reason)
         } else {
             (true, self.full_rate, PauseAction::Run, PauseReason::None)
         };
@@ -272,6 +293,8 @@ mod tests {
             chip_recovering: false,
             near_deadlock: false,
             tc_applied: false,
+            ap_overlay_active: false,
+            ap_cap_applied: false,
         }
     }
 
@@ -337,6 +360,55 @@ mod tests {
         assert_eq!(s.body.reason, PauseReason::NearDeadlock);
         let full = WifidConfig::default().throttle.max_tx_bytes_per_s;
         assert!(s.body.max_tx_bytes_per_s < full && s.body.max_tx_bytes_per_s > 0);
+    }
+
+    #[test]
+    fn ap_concurrent_reduces_rate_and_sets_reason() {
+        let mut p = publisher();
+        let cfg = WifidConfig::default().throttle;
+        let mut i = inputs(LinkMode::Sta);
+        i.sta_link_up = true;
+        i.tc_applied = true;
+        i.ap_overlay_active = true;
+        i.ap_cap_applied = true;
+        let s = p.update(i);
+        assert!(s.body.uploads_allowed);
+        assert_eq!(
+            s.body.max_tx_bytes_per_s,
+            cfg.max_tx_bytes_per_s / cfg.ap_concurrent_divisor
+        );
+        assert_eq!(s.body.reason, PauseReason::ApConcurrent);
+        assert_eq!(s.body.action, PauseAction::Run);
+    }
+
+    #[test]
+    fn ap_concurrent_without_cap_pauses_uploads() {
+        let mut p = publisher();
+        let mut i = inputs(LinkMode::Sta);
+        i.sta_link_up = true;
+        i.tc_applied = true;
+        i.ap_overlay_active = true;
+        i.ap_cap_applied = false;
+        let s = p.update(i);
+        assert!(!s.body.uploads_allowed);
+        assert_eq!(s.body.max_tx_bytes_per_s, 0);
+        assert_eq!(s.body.reason, PauseReason::ApConcurrent);
+    }
+
+    #[test]
+    fn ap_concurrent_and_near_deadlock_takes_most_restrictive() {
+        let mut p = publisher();
+        let cfg = WifidConfig::default().throttle;
+        let mut i = inputs(LinkMode::Sta);
+        i.sta_link_up = true;
+        i.tc_applied = true;
+        i.ap_overlay_active = true;
+        i.ap_cap_applied = true;
+        i.near_deadlock = true;
+        let s = p.update(i);
+        let divisor = cfg.ap_concurrent_divisor.max(cfg.near_deadlock_divisor);
+        assert_eq!(s.body.max_tx_bytes_per_s, cfg.max_tx_bytes_per_s / divisor);
+        assert_eq!(s.body.reason, PauseReason::ApConcurrent);
     }
 
     #[test]

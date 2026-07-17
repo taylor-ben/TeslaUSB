@@ -55,6 +55,11 @@ pub(crate) struct LinkObservation {
     pub(crate) sta_running: bool,
     /// AP mode is actually running right now.
     pub(crate) ap_running: bool,
+    /// Suppress base-machine AP fallback (`ForceOn`/`ForceOff` overlay modes).
+    pub(crate) ap_fallback_suppressed: bool,
+    /// A `webd` Wi-Fi mutation is in progress; suppress AP fallback so a
+    /// transient STA drop during a join can never flip us to AP (lock-out guard).
+    pub(crate) mutation_hold: bool,
     /// Associated to the home BSSID.
     pub(crate) associated: bool,
     /// Carrier + IP are up on the STA interface.
@@ -66,6 +71,8 @@ pub(crate) struct LinkObservation {
     pub(crate) ap_has_clients: bool,
     /// Last known STA signal strength, for status reporting only.
     pub(crate) signal_dbm: Option<i32>,
+    /// Current STA channel, if known (forwarded to the overlay resolver).
+    pub(crate) sta_channel: Option<u32>,
 }
 
 impl LinkObservation {
@@ -215,7 +222,14 @@ impl LinkMachine {
 
         // 3. Decide the target mode.
         let current = self.mode;
-        let target = self.choose_target(obs, now_ms);
+        let mut target = self.choose_target(obs, now_ms);
+        if obs.ap_fallback_suppressed && target == LinkMode::Ap {
+            target = if obs.sta_configured {
+                LinkMode::Sta
+            } else {
+                LinkMode::Down
+            };
+        }
 
         // 4. Backoff bookkeeping on STA-attempt outcome.
         if current == LinkMode::Sta && target == LinkMode::Ap {
@@ -244,6 +258,10 @@ impl LinkMachine {
     }
 
     fn choose_target(&self, obs: &LinkObservation, now_ms: i64) -> LinkMode {
+        if obs.mutation_hold {
+            // Never fall back to AP while webd is mutating WiFi. Hold STA.
+            return LinkMode::Sta;
+        }
         if !obs.sta_configured {
             // Nothing to connect to: AP onboarding is the only useful mode.
             return LinkMode::Ap;
@@ -356,11 +374,14 @@ mod tests {
             sta_configured,
             sta_running,
             ap_running,
+            ap_fallback_suppressed: false,
+            mutation_hold: false,
             associated: false,
             carrier_up: false,
             gateway_reachable: false,
             ap_has_clients: false,
             signal_dbm: None,
+            sta_channel: None,
         }
     }
 
@@ -401,6 +422,26 @@ mod tests {
     }
 
     #[test]
+    fn mutation_hold_forces_sta_even_without_creds_or_viability() {
+        let mut m = machine();
+        let mut o = obs(false, false, false);
+        o.mutation_hold = true;
+        let s = m.step(&o, 0);
+        assert_eq!(s.actions, vec![WifiAction::StartSta]);
+        assert_eq!(s.mode, LinkMode::Sta);
+    }
+
+    #[test]
+    fn mutation_hold_disabled_keeps_unconfigured_sta_fallback_to_ap() {
+        let mut m = machine();
+        let mut o = obs(false, false, false);
+        o.mutation_hold = false;
+        let s = m.step(&o, 0);
+        assert_eq!(s.actions, vec![WifiAction::StartAp]);
+        assert_eq!(s.mode, LinkMode::Ap);
+    }
+
+    #[test]
     fn sta_to_ap_stops_sta_before_starting_ap() {
         let mut m = machine();
         // Enter STA; the executor brings the radio up in whatever mode the
@@ -415,11 +456,14 @@ mod tests {
                 sta_configured: true,
                 sta_running: running == LinkMode::Sta,
                 ap_running: running == LinkMode::Ap,
+                ap_fallback_suppressed: false,
+                mutation_hold: false,
                 associated: false,
                 carrier_up: false,
                 gateway_reachable: false,
                 ap_has_clients: false,
                 signal_dbm: None,
+                sta_channel: None,
             };
             let s = m.step(&o, t);
             assert_never_both_started(&s.actions);
@@ -605,16 +649,52 @@ mod tests {
                 sta_configured: true,
                 sta_running: running == LinkMode::Sta,
                 ap_running: running == LinkMode::Ap,
+                ap_fallback_suppressed: false,
+                mutation_hold: false,
                 associated: false,
                 carrier_up: false,
                 gateway_reachable: false,
                 ap_has_clients: false,
                 signal_dbm: None,
+                sta_channel: None,
             };
             let s = m.step(&o, t);
             assert_never_both_started(&s.actions);
             running = s.mode;
             t += 1000;
         }
+    }
+
+    #[test]
+    fn suppressed_ap_fallback_keeps_non_viable_sta_in_sta_mode() {
+        let mut m = machine();
+        m.step(&obs(true, false, false), 0);
+        for t in (1_000..=35_000).step_by(1_000) {
+            let mut o = obs(true, true, false);
+            o.ap_fallback_suppressed = true;
+            let s = m.step(&o, t);
+            assert_eq!(s.mode, LinkMode::Sta);
+        }
+    }
+
+    #[test]
+    fn suppressed_ap_fallback_without_sta_creds_targets_down_not_ap() {
+        let mut m = machine();
+        let mut o = obs(false, false, false);
+        o.ap_fallback_suppressed = true;
+        let s = m.step(&o, 0);
+        assert_eq!(s.mode, LinkMode::Down);
+        assert!(s.actions.is_empty());
+    }
+
+    #[test]
+    fn mutation_hold_is_unaffected_by_ap_fallback_suppression() {
+        let mut m = machine();
+        let mut o = obs(false, false, false);
+        o.ap_fallback_suppressed = true;
+        o.mutation_hold = true;
+        let s = m.step(&o, 0);
+        assert_eq!(s.mode, LinkMode::Sta);
+        assert_eq!(s.actions, vec![WifiAction::StartSta]);
     }
 }
