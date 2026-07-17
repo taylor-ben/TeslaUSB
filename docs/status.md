@@ -1987,11 +1987,17 @@ LUNs) is the single make-or-break that still needs the car.**
   the UI hides Forget on the active/protected network. A *successful* forget of an *inactive* saved
   network is deferred (would delete the `netplan-wlan0-Trez` recovery fallback; needs a throwaway
   network). `POST /api/wifi/forget`; `netplan-*`/active-connection refused. See addendum.)**
-- [ ] Enable/disable setup AP + auto-restore timer (never lock out). **(Phase C — gated:B4 + WiFi-invariant C)**
+- [ ] Enable/disable setup AP + auto-restore timer (never lock out). **(Enable/disable DONE — concurrent
+  AP+STA overlay `TeslaUSB-Setup` on virtual `uap0`, modes `auto|force_on|force_off`, COMMITTED `edea143` +
+  PUSHED + live client-join PROVEN 2026-07-17 (see 2026-07-17 addendum). REMAINING: auto-restore timer
+  ("never lock out") + first-run provisioning persistence — gated:B4 + WiFi-invariant C.)**
 - [x] `wifid` UDS + webd wifi routes. **(Phase A read routes DONE via NM. Phase B
   mutation routes DEPLOYED 2026-07-16 + **live mutation PROVEN on device 2026-07-16**
   (connect-revert / forget-refusal / reorder); wifid coordinates via a filesystem mutation-hold
-  token (NOT a UDS lease — simpler, no new socket). Architecture: `docs/specs/wifid.md` §7)**
+  token (NOT a UDS lease — simpler, no new socket). AP control plane added 2026-07-17: framed UDS
+  `GetApStatus`/`SetApMode`/`SetApConfig` (`wifid/src/ipc.rs`) proxied by webd `GET/POST /api/wifi/ap`,
+  `/api/wifi/ap/mode`, `/api/wifi/ap/config` (`webd/src/{wifi_ap,wifid_client}.rs`), COMMITTED `edea143`.
+  Architecture: `docs/specs/wifid.md` §7)**
 
 > ### Addendum (2026-07-15) — §4.13 Phase A read-only DEPLOYED + live-verified
 > - **Architecture reconciled (Opus + GPT-5.5 second opinion):** NetworkManager +
@@ -2061,10 +2067,10 @@ LUNs) is the single make-or-break that still needs the car.**
 >   live Playwright both viewports (12 networks after Scan; Trez guarded 0 Join/0 Forget; 11 neighbors
 >   show Join; console 0/0; TTFB 21 ms). Evidence: `files/hw-results.md` +
 >   `files/wifi-phaseB-live-{desktop-1280,desktop-1280-scanned,mobile-375}.png`.
-> - **REMAINING before these can be checked `[x]`:** **Task 4b** — live join/forget MUTATION test
->   (needs a **phone hotspot near the car**): prove checkpoint rollback via bad join, join throwaway,
->   forget-throwaway, verify forget-active + forget-Trez REFUSAL (409); then commit (gated on consent;
->   stage WiFi files only, exclude the pre-existing line-40 HUD hunk).
+> - **RESOLVED (2026-07-17):** Task 4b live mutation test PASSED (3/3 — see the 2026-07-16 redesign
+>   addendum below); the join/forget boxes above are `[x]`. Committed in `fa7fd4c` (webd+SPA redesign) +
+>   `edea143` (wifid reconcile), both PUSHED to `origin/mhackermsft/b1-clean`. The pre-existing line-40 HUD
+>   hunk stayed out of both commits, as planned.
 
 > ### Addendum (2026-07-16) — §4.13 WiFi phone-model REDESIGN: DEPLOYED + live-mutation-PROVEN (3/3); commit pending
 > **Supersedes the simple Phase-B join/forget with the operator-requested phone-like model:
@@ -2115,9 +2121,39 @@ LUNs) is the single make-or-break that still needs the car.**
 > - **Deferred happy-paths (need a disposable AP; low-risk, NOT blocking — both safety-critical branches
 >   already proven):** a *successful* join to a brand-new network (correct password) and a *successful*
 >   forget of an *inactive* saved network (would delete the `netplan-wlan0-Trez` recovery fallback).
-> - **REMAINING:** commit (gated on consent; stage WiFi files only, exclude the pre-existing line-40 HUD
->   hunk). wifid changes (`link/nmcli/orchestrator/status.rs`, 230 insertions) remain uncommitted +
->   undeployed (out of scope; UI works on old wifid).
+> - **DONE (2026-07-17):** COMMITTED + PUSHED — the webd+SPA redesign landed in `fa7fd4c`; the wifid
+>   changes (`link/nmcli/orchestrator/status.rs`) landed together with the concurrent AP+STA overlay in
+>   `edea143`. Both are on `origin/mhackermsft/b1-clean`. wifid is now DEPLOYED + live-proven (see the
+>   2026-07-17 addendum). The pre-existing line-40 HUD hunk remains intentionally uncommitted.
+
+> ### Addendum (2026-07-17) — §4.13 concurrent AP+STA (`TeslaUSB-Setup` / `uap0`): COMMITTED + PUSHED + live-proven
+> **The opt-in concurrent Access Point now works on the single-radio Pi Zero 2 W: `TeslaUSB-Setup` runs on
+> a virtual `uap0` interface alongside the STA lifeline (`wlan0` on `Trez_EXT`), so the setup AP no longer
+> requires taking the STA down. COMMITTED `edea143` (22 files, +4923/−184, both trailers) + PUSHED to
+> `origin/mhackermsft/b1-clean`. Device DEPLOYED + finalized SAFE in `auto`.**
+> - **Control plane:** wifid framed-UDS `GetApStatus` / `SetApMode {auto|force_on|force_off}` /
+>   `SetApConfig {ssid,passphrase}` (`wifid/src/ipc.rs`, 536 lines); webd proxy `GET /api/wifi/ap`,
+>   `POST /api/wifi/ap/mode`, `POST /api/wifi/ap/config` (`webd/src/{wifi_ap,wifid_client}.rs`). New wifid
+>   module `overlay.rs` (818 lines) owns uap0/hostapd/dnsmasq bring-up.
+> - **Mode semantics:** `auto` = STA/AP mutually exclusive (safe default, recording-first); `force_on` =
+>   opt-in concurrent AP+STA; `force_off` = AP down. The spec's "never concurrent" invariant was reconciled
+>   to opt-in concurrency in `docs/specs/wifid.md` §7.3 — now hardware-proven safe.
+> - **Recording-safety preserved:** uap0 TX cap folded into the deadlock budget + fail-safe pause, so the AP
+>   never starves the USB recording path; dnsmasq is gated behind two consecutive AP-active ticks so it never
+>   binds during hostapd's START_AP IP-flush window (the race-free IP-flush recovery fix).
+> - **Four hardware stability barriers (BCM43430/43436 FullMAC, documented in spec §7.3):** (1) power-save
+>   OFF on wlan0/uap0 every tick; (2) split-tick settle (create+up+unmanage uap0 tick N, `hostapd -B` tick
+>   N+1 ~2 s later); (3) race-free uap0 IP re-assert on flush; (4) NM-unmanage uap0.
+> - **LIVE PROOF (2026-07-17):** an external client (this PC's Wi-Fi, MAC `58:cd:c9:4f:a8:91`) associated to
+>   `TeslaUSB-Setup`, got DHCP lease `192.168.4.32`, pinged the gateway 3/3, and held ~170 s while the STA
+>   stayed on `Trez_EXT` (-58..-62 dBm) and SSH rode Ethernet — zero teardown churn; uploads capped
+>   `ap_concurrent`. Earlier same effort: join/forget/reorder mutation proof 3/3 (2026-07-16). Evidence:
+>   `files/hw-results.md`, `files/ipflush-clientjoin-evidence.txt`.
+> - **REMAINING (not in `edea143`; keeps the §4.13 items above `[ ]`):** captive-portal redirect
+>   (Apple/Android/Windows/generic); AP auto-restore timer ("never lock out"); first-run provisioning
+>   persistence in `setup.sh` (NM `wifi.powersave=2` + `unmanaged-devices=interface-name:uap0` so the four
+>   barriers survive a fresh OS); pre-existing follow-ups **F3** (channel-follow live-channel guard) + **FA**
+>   (one-tick throttle publish-before-bring-up, self-heals) — both documented in spec §7.3 + `hw-results.md`.
 
 
 ### 4.14 Failed Jobs — `Requirements.md` §4.14
