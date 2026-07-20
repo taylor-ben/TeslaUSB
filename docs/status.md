@@ -1910,13 +1910,20 @@ LUNs) is the single make-or-break that still needs the car.**
   on the two-LUN device and the new thumbnail serves real bytes — see F5 /
   `files/hw-results.md`.)**
 - [x] Wrap delete (incl. bulk). **(proven)**
-- [ ] **Plates (images):** list w/ thumbnails, upload, delete `.png` ≤512 KB,
-  exactly 420×200 (NA)/420×100 (EU/Italy), name ≤32 alnum, ≤10. **(validation + count
-  cap DONE to the real Tesla spec — `media_upload.rs` `PLATE_DIMENSIONS`=420×200/420×100
+- [x] **Plates (images):** list w/ thumbnails, upload, delete `.png` ≤512 KB,
+  exactly 420×200 (NA)/420×100 (EU/Italy), name ≤32 alnum, ≤10. **(DONE. validation + count
+  cap to the real Tesla spec — `media_upload.rs` `PLATE_DIMENSIONS`=420×200/420×100
   + `validate_plate_filename` ≤32 alnum + `plates.rs` `PLATES_MAX_FILES=10` with exact
   `rel_path` replace exception, all rejecting `422` pre-handoff; thumbnail Preview column
-  DONE (`<img>` + Playwright `naturalWidth>0`). Corrected 2026-07-20 from the wrong
-  420×75/492×75/≤12/≤5 that matched no real source — see the §4.9 banner. Cropper deferred — A2)**
+  (`<img>` + Playwright `naturalWidth>0`). Corrected 2026-07-20 from the wrong
+  420×75/492×75/≤12/≤5 that matched no real source — see the §4.9 banner. **Cropper DONE
+  (A2, 2026-07-20):** client-side canvas cropper (`spa/src/components/PlateCropper.tsx` +
+  `spa/src/lib/plateCrop.ts`) crops ANY uploaded image to an exact 420×200/420×100 PNG via a
+  surgical optional `transformFiles` hook on `useMediaCategory` (strict no-op for every other
+  media screen); already-compliant PNGs bypass the cropper; NA/EU toggle, aspect-locked
+  drag/resize, live preview, `toBlob` PNG export. Playwright 30/30 both viewports (375+1280) —
+  compliant-bypass, crop-confirm, region-toggle, cancel; cropper modal visually verified
+  clean at 375px. v1 parity ported from `origin/main:scripts/web/templates/license_plates.html`.)**
 - [ ] **Tracked-plate list (privacy/redaction):** add/edit/delete (uppercase ≤16,
   label ≤64, notes ≤240, dedupe), bulk delete, redaction toggle. **(not started)**
 

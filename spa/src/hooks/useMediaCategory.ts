@@ -118,6 +118,14 @@ interface UseMediaCategoryOptions {
    * accept anything the server will validate.
    */
   accept?: string[];
+  /**
+   * Optional async pre-processor run on raw incoming files BEFORE the `accept`
+   * extension filter, letting a screen transform arbitrary uploads (e.g. crop an
+   * image to an exact PNG) before they are staged. Omit for pass-through
+   * behavior. When provided, a transform is single-flight: files dropped while a
+   * transform is already running are ignored.
+   */
+  transformFiles?: (files: File[]) => Promise<File[]>;
 }
 
 export interface UseMediaCategory {
@@ -164,6 +172,7 @@ export function useMediaCategory({
   remove,
   bulkDelete,
   accept,
+  transformFiles,
 }: UseMediaCategoryOptions): UseMediaCategory {
   const [state, setState] = useState<LoadState>({ tag: "loading" });
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -190,6 +199,7 @@ export function useMediaCategory({
   const removeAbortRef = useRef<AbortController | null>(null);
   const bulkAbortRef = useRef<AbortController | null>(null);
   const listAbortRef = useRef<AbortController | null>(null);
+  const transformInFlightRef = useRef(false);
 
   function doFetch(signal?: AbortSignal) {
     fetchList(signal)
@@ -238,13 +248,25 @@ export function useMediaCategory({
     [],
   );
 
-  /** Filter incoming files to the accepted extensions and de-dupe by name+size. */
-  function acceptFiles(incoming: File[]) {
+  /** Optionally transform, then filter to accepted extensions and de-dupe by name+size. */
+  async function acceptFiles(incoming: File[]) {
+    let files = incoming;
+    if (transformFiles) {
+      if (transformInFlightRef.current) return;
+      transformInFlightRef.current = true;
+      try {
+        files = await transformFiles(incoming);
+      } catch {
+        files = [];
+      } finally {
+        transformInFlightRef.current = false;
+      }
+    }
     const exts = accept?.map((e) => e.toLowerCase());
     setSelectedFiles((prev) => {
       const seen = new Set(prev.map((f) => `${f.name}:${f.size}`));
       const next = [...prev];
-      for (const f of incoming) {
+      for (const f of files) {
         if (exts && exts.length > 0) {
           const lower = f.name.toLowerCase();
           if (!exts.some((ext) => lower.endsWith(ext))) continue;
@@ -263,7 +285,7 @@ export function useMediaCategory({
     setNotice(null);
     const input = e.currentTarget as HTMLInputElement;
     const files = input.files ? Array.from(input.files) : [];
-    acceptFiles(files);
+    void acceptFiles(files);
     // Clear so re-selecting the same file fires another change.
     input.value = "";
   }
@@ -272,7 +294,7 @@ export function useMediaCategory({
     if (uploading) return;
     setUploadFail(null);
     setNotice(null);
-    acceptFiles(files);
+    void acceptFiles(files);
   }
 
   function removeStagedFile(name: string) {

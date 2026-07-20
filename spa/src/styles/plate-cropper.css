@@ -1,0 +1,71 @@
+.plate-cropper-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 3000;
+  padding: 12px;
+}
+
+.plate-cropper {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color, var(--border));
+  border-radius: 10px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+  max-width: min(600px, calc(100vw - 24px));
+  max-height: calc(100vh - 24px);
+  overflow: auto;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  color: var(--text-primary);
+}
+
+.plate-cropper canvas[data-testid="plate-cropper-canvas"] {
+  max-width: 100%;
+  height: auto;
+  border: 1px solid var(--border-input, var(--border-color));
+  border-radius: 6px;
+  touch-action: none;
+  cursor: crosshair;
+  background: rgba(0, 0, 0, 0.15);
+}
+
+.plate-cropper-preview-wrap {
+  overflow: auto;
+}
+
+.plate-cropper canvas[data-testid="plate-cropper-preview"] {
+  border: 1px solid var(--border-input, var(--border-color));
+  border-radius: 6px;
+  image-rendering: auto;
+  max-width: 100%;
+  height: auto;
+  display: block;
+  background: var(--bg-primary);
+}
+
+.plate-cropper-regions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  color: var(--text-secondary);
+}
+
+.plate-cropper-regions label {
+  display: inline-flex;
+  align-items: center;
+}
+
+.plate-cropper-output {
+  color: var(--text-secondary);
+}
+
+.plate-cropper-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}

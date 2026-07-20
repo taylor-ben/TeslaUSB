@@ -191,18 +191,25 @@ test.describe("license plates UAT", () => {
     await gotoScreen(page, PATH, SCREEN);
     const zone = page.locator("[data-testid=license-plates-dropzone]");
     await expect(zone).toBeVisible();
-    await zone.evaluate((el) => {
+    await zone.evaluate(async (el, name) => {
+      const c = document.createElement("canvas");
+      c.width = 420;
+      c.height = 200;
+      const ctx = c.getContext("2d")!;
+      ctx.fillStyle = "#334455";
+      ctx.fillRect(0, 0, 420, 200);
+      const blob: Blob = await new Promise((res) => c.toBlob((b) => res(b!), "image/png"));
+      const file = new File([blob], name, { type: "image/png" });
       const dt = new DataTransfer();
-      dt.items.add(new File([new Uint8Array([1, 2, 3])], "dropped.png", {
-        type: "image/png",
-      }));
+      dt.items.add(file);
       for (const t of ["dragenter", "dragover", "drop"]) {
         const ev = new DragEvent(t, { bubbles: true, cancelable: true });
         Object.defineProperty(ev, "dataTransfer", { value: dt });
         el.dispatchEvent(ev);
       }
-    });
+    }, "dropped.png");
     await expect(page.getByText("dropped.png", { exact: false })).toBeVisible();
+    await expect(page.locator("[data-testid=plate-cropper]")).toHaveCount(0);
   });
 
   test("upload button label is 'Upload' (not 'Install')", async ({ page }) => {
@@ -217,12 +224,17 @@ test.describe("license plates UAT", () => {
   }) => {
     await gotoScreen(page, PATH, SCREEN);
     const zone = page.locator("[data-testid=license-plates-dropzone]");
-    await zone.evaluate((el) => {
+    await zone.evaluate(async (el) => {
       const dt = new DataTransfer();
-      for (const n of ["multi-a.png", "multi-b.png"]) {
-        dt.items.add(
-          new File([new Uint8Array([1, 2, 3])], n, { type: "image/png" }),
-        );
+      for (const n of ["plateone.png", "platetwo.png"]) {
+        const c = document.createElement("canvas");
+        c.width = 420;
+        c.height = 200;
+        const ctx = c.getContext("2d")!;
+        ctx.fillStyle = "#334455";
+        ctx.fillRect(0, 0, 420, 200);
+        const blob: Blob = await new Promise((res) => c.toBlob((b) => res(b!), "image/png"));
+        dt.items.add(new File([blob], n, { type: "image/png" }));
       }
       for (const t of ["dragenter", "dragover", "drop"]) {
         const ev = new DragEvent(t, { bubbles: true, cancelable: true });
@@ -230,10 +242,120 @@ test.describe("license plates UAT", () => {
         el.dispatchEvent(ev);
       }
     });
-    await expect(page.getByText("multi-a.png", { exact: false })).toBeVisible();
-    await expect(page.getByText("multi-b.png", { exact: false })).toBeVisible();
+    await expect(page.getByText("plateone.png", { exact: false })).toBeVisible();
+    await expect(page.getByText("platetwo.png", { exact: false })).toBeVisible();
     await expect(
       zone.getByRole("button", { name: "Upload 2 files" }),
     ).toBeVisible();
+  });
+
+  test("compliant PNG bypasses the cropper and stages", async ({
+    page,
+  }) => {
+    await gotoScreen(page, PATH, SCREEN);
+    const zone = page.locator("[data-testid=license-plates-dropzone]");
+    await zone.evaluate(async (el) => {
+      const c = document.createElement("canvas");
+      c.width = 420;
+      c.height = 200;
+      const ctx = c.getContext("2d")!;
+      ctx.fillStyle = "#334455";
+      ctx.fillRect(0, 0, 420, 200);
+      const blob: Blob = await new Promise((res) => c.toBlob((b) => res(b!), "image/png"));
+      const dt = new DataTransfer();
+      dt.items.add(new File([blob], "compliant.png", { type: "image/png" }));
+      for (const t of ["dragenter", "dragover", "drop"]) {
+        const ev = new DragEvent(t, { bubbles: true, cancelable: true });
+        Object.defineProperty(ev, "dataTransfer", { value: dt });
+        el.dispatchEvent(ev);
+      }
+    });
+    await expect(page.locator("[data-testid=plate-cropper]")).toHaveCount(0);
+    await expect(page.getByText("compliant.png", { exact: false })).toBeVisible();
+  });
+
+  test("non-compliant image opens the cropper; confirming stages a compliant PNG", async ({
+    page,
+  }) => {
+    await gotoScreen(page, PATH, SCREEN);
+    const zone = page.locator("[data-testid=license-plates-dropzone]");
+    await zone.evaluate(async (el) => {
+      const c = document.createElement("canvas");
+      c.width = 800;
+      c.height = 600;
+      const ctx = c.getContext("2d")!;
+      ctx.fillStyle = "#556677";
+      ctx.fillRect(0, 0, 800, 600);
+      const blob: Blob = await new Promise((res) => c.toBlob((b) => res(b!), "image/png"));
+      const dt = new DataTransfer();
+      dt.items.add(new File([blob], "plate1.png", { type: "image/png" }));
+      for (const t of ["dragenter", "dragover", "drop"]) {
+        const ev = new DragEvent(t, { bubbles: true, cancelable: true });
+        Object.defineProperty(ev, "dataTransfer", { value: dt });
+        el.dispatchEvent(ev);
+      }
+    });
+    await expect(page.locator("[data-testid=plate-cropper]")).toBeVisible();
+    await expect(page.locator("[data-testid=plate-cropper-output]")).toContainText("420x200");
+    await page.locator("[data-testid=plate-cropper-confirm]").click();
+    await expect(page.locator("[data-testid=plate-cropper]")).toHaveCount(0);
+    await expect(page.getByText("plate1.png", { exact: false })).toBeVisible();
+  });
+
+  test("region toggle switches target to 420x100", async ({
+    page,
+  }) => {
+    await gotoScreen(page, PATH, SCREEN);
+    const zone = page.locator("[data-testid=license-plates-dropzone]");
+    await zone.evaluate(async (el) => {
+      const c = document.createElement("canvas");
+      c.width = 800;
+      c.height = 600;
+      const ctx = c.getContext("2d")!;
+      ctx.fillStyle = "#556677";
+      ctx.fillRect(0, 0, 800, 600);
+      const blob: Blob = await new Promise((res) => c.toBlob((b) => res(b!), "image/png"));
+      const dt = new DataTransfer();
+      dt.items.add(new File([blob], "plate1.png", { type: "image/png" }));
+      for (const t of ["dragenter", "dragover", "drop"]) {
+        const ev = new DragEvent(t, { bubbles: true, cancelable: true });
+        Object.defineProperty(ev, "dataTransfer", { value: dt });
+        el.dispatchEvent(ev);
+      }
+    });
+    await expect(page.locator("[data-testid=plate-cropper]")).toBeVisible();
+    await expect(page.locator("[data-testid=plate-cropper-output]")).toContainText("420x200");
+    await page.locator("[data-testid=plate-cropper-region-eu]").check();
+    await expect(page.locator("[data-testid=plate-cropper-output]")).toContainText("420x100");
+    await page.locator("[data-testid=plate-cropper-cancel]").click();
+  });
+
+  test("Cancel closes the cropper without staging", async ({
+    page,
+  }) => {
+    await gotoScreen(page, PATH, SCREEN);
+    const zone = page.locator("[data-testid=license-plates-dropzone]");
+    await zone.evaluate(async (el) => {
+      const c = document.createElement("canvas");
+      c.width = 800;
+      c.height = 600;
+      const ctx = c.getContext("2d")!;
+      ctx.fillStyle = "#556677";
+      ctx.fillRect(0, 0, 800, 600);
+      const blob: Blob = await new Promise((res) => c.toBlob((b) => res(b!), "image/png"));
+      const dt = new DataTransfer();
+      dt.items.add(new File([blob], "plate1.png", { type: "image/png" }));
+      for (const t of ["dragenter", "dragover", "drop"]) {
+        const ev = new DragEvent(t, { bubbles: true, cancelable: true });
+        Object.defineProperty(ev, "dataTransfer", { value: dt });
+        el.dispatchEvent(ev);
+      }
+    });
+    await expect(page.locator("[data-testid=plate-cropper]")).toBeVisible();
+    await page.locator("[data-testid=plate-cropper-cancel]").click();
+    await expect(page.locator("[data-testid=plate-cropper]")).toHaveCount(0);
+    await expect(page.getByText("plate1.png", { exact: false })).toHaveCount(0);
+    // Nothing staged → the submit button stays present but disabled (label "Upload").
+    await expect(zone.getByRole("button", { name: "Upload", exact: true })).toBeDisabled();
   });
 });

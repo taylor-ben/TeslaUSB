@@ -4,20 +4,89 @@ import { BulkDeleteBar } from "../components/BulkDeleteBar";
 import { useScreenHook } from "../components/screenHook";
 import { useFullWidthScreen } from "../hooks/useFullWidthScreen";
 import { MediaUploadZone } from "../components/MediaUploadZone";
+import { useCallback, useEffect, useRef, useState } from "preact/hooks";
 import { api } from "../api/client";
 import { fmtBytes, useMediaCategory } from "../hooks/useMediaCategory";
+import { PlateCropper, type PlateCropRequest, type PlateCropResult } from "../components/PlateCropper";
+import { deriveBaseName, isCompliantPng } from "../lib/plateCrop";
 import "../styles/license-plates.css";
+
+async function loadImageFromFile(file: File): Promise<{ img: HTMLImageElement; url: string }> {
+  const url = URL.createObjectURL(file);
+  return await new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve({ img, url });
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error(`Could not read ${file.name}`));
+    };
+    img.src = url;
+  });
+}
 
 /**
  * Custom License Plates screen (route `/license_plates`).
  *
  * Reads `GET /api/plates` on mount — PNG images under `LicensePlate/` on p2.
  * Install (POST) and remove (DELETE) route through the gadgetd eject-handoff.
- * PNG magic-byte validation is done server-side; client validates extension only.
+ * PNG validity and Tesla constraints are enforced server-side; client can crop
+ * arbitrary image uploads to compliant PNGs before staging.
  */
 export function LicensePlates() {
   useScreenHook("plates");
   useFullWidthScreen();
+  const [cropReq, setCropReq] = useState<PlateCropRequest | null>(null);
+  const cropResolveRef = useRef<((r: PlateCropResult | null) => void) | null>(null);
+  const activeUrlRef = useRef<string | null>(null);
+  const [imgError, setImgError] = useState<string | null>(null);
+
+  // On unmount (e.g. browser-back while the cropper is open) settle any pending
+  // crop and revoke the in-flight object URL so it can't leak.
+  useEffect(() => () => {
+    cropResolveRef.current?.(null);
+    cropResolveRef.current = null;
+    if (activeUrlRef.current) {
+      URL.revokeObjectURL(activeUrlRef.current);
+      activeUrlRef.current = null;
+    }
+  }, []);
+
+  const transformFiles = useCallback(async (incoming: File[]): Promise<File[]> => {
+    const out: File[] = [];
+    setImgError(null);
+    for (const file of incoming) {
+      let img: HTMLImageElement;
+      let url: string;
+      try {
+        ({ img, url } = await loadImageFromFile(file));
+      } catch {
+        setImgError(`Could not read ${file.name}.`);
+        continue;
+      }
+      activeUrlRef.current = url;
+      const compliant = isCompliantPng(file.type, img.naturalWidth, img.naturalHeight);
+      if (compliant) {
+        URL.revokeObjectURL(url);
+        activeUrlRef.current = null;
+        const base = deriveBaseName(file.name);
+        out.push(file.name === `${base}.png` ? file : new File([file], `${base}.png`, { type: "image/png" }));
+        continue;
+      }
+      const result = await new Promise<PlateCropResult | null>((resolve) => {
+        cropResolveRef.current = resolve;
+        setCropReq({ file, img });
+      });
+      URL.revokeObjectURL(url);
+      activeUrlRef.current = null;
+      setCropReq(null);
+      cropResolveRef.current = null;
+      if (result) out.push(new File([result.blob], result.name, { type: "image/png" }));
+    }
+    return out;
+  }, []);
+
+  const onCropConfirm = useCallback((r: PlateCropResult) => { cropResolveRef.current?.(r); }, []);
+  const onCropCancel = useCallback(() => { cropResolveRef.current?.(null); }, []);
 
   const cat = useMediaCategory({
     fetchList: api.plates,
@@ -25,6 +94,7 @@ export function LicensePlates() {
     remove: api.removePlate,
     bulkDelete: api.bulkDeletePlates,
     accept: [".png"],
+    transformFiles,
   });
 
   return (
@@ -77,15 +147,21 @@ export function LicensePlates() {
           <button class="action-btn" style="font-size:12px;padding:2px 8px;" onClick={cat.clearNotice}>Dismiss</button>
         </div>
       )}
+      {imgError && (
+        <div class="settings-section" role="alert" style="color: var(--accent-error);">
+          {imgError}{" "}
+          <button class="action-btn" style="font-size:12px;padding:2px 8px;" onClick={() => setImgError(null)}>Dismiss</button>
+        </div>
+      )}
 
       {/* ── Upload zone ── */}
       <MediaUploadZone
         cat={cat}
         testId="license-plates-dropzone"
-        accept=".png,image/png"
+        accept="image/png,image/jpeg,image/webp,image/gif,image/bmp"
         icon="image"
-        title="Choose PNG files (≤ 512 KB each)"
-        hint="PNG only. Tesla output: 420x200 or 420x100 — drag & drop or pick multiple"
+        title="Choose an image — we'll crop it to 420×200 or 420×100"
+        hint="Any image; we crop to a Tesla-compliant PNG. Drag & drop or pick multiple."
       />
 
       {/* ── Confirm remove dialog ── */}
@@ -199,6 +275,7 @@ export function LicensePlates() {
           </>
         )}
       </div>
+      <PlateCropper request={cropReq} onConfirm={onCropConfirm} onCancel={onCropCancel} />
     </div>
   );
 }
