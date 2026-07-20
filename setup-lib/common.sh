@@ -65,6 +65,11 @@ TESLAUSB_STATE_DIR="${TESLAUSB_PREFIX}/var/lib/teslausb"
 TESLAUSB_BOOT_DIR="${TESLAUSB_PREFIX}/boot/firmware"
 TESLAUSB_BOOT_CONFIG="${TESLAUSB_BOOT_DIR}/config.txt"
 TESLAUSB_MODULES_LOAD="${TESLAUSB_PREFIX}/etc/modules-load.d/teslausb-gadget.conf"
+# NetworkManager Wi-Fi hardening drop-in (wifid spec §7.3): persists power-save-off
+# + the uap0 unmanaged rule so the concurrent AP+STA barriers survive a fresh OS.
+# Admin conf.d is authoritative over the vendor dir, so the numeric prefix is only
+# for human ordering, not correctness.
+TESLAUSB_NM_WIFI_CONF="${TESLAUSB_PREFIX}/etc/NetworkManager/conf.d/10-teslausb-wifi.conf"
 TESLAUSB_BOOT_MARKER_BEGIN="# >>> TeslaUSB B-1 (managed) >>>"
 TESLAUSB_BOOT_MARKER_END="# <<< TeslaUSB B-1 (managed) <<<"
 

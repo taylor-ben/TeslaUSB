@@ -162,3 +162,41 @@ EOF
     rm -f "$tmp"
     BOOT_CHANGED=1
 }
+
+# configure_networkmanager_wifi — persist the two Wi-Fi hardening barriers the
+# concurrent AP+STA overlay needs to survive a fresh OS (wifid spec §7.3). On the
+# single-radio Pi Zero 2 W:
+#   * [connection] wifi.powersave=2 — never let the Wi-Fi chip sleep out from under
+#     the AP vif (barrier #1). wifid also asserts this every desired tick at
+#     runtime; the persisted default keeps it off from first boot, before wifid
+#     starts and across NM STA reconnects/roams.
+#   * [keyfile] unmanaged-devices=interface-name:uap0 — keep NetworkManager off the
+#     AP overlay vif so it never races hostapd for uap0 (barrier #4). wifid does a
+#     best-effort runtime `nmcli` unmanage; this rule guarantees it even before
+#     wifid runs (see wifid overlay.rs).
+# Managed drop-in in the admin conf.d (authoritative over the vendor dir). Takes
+# effect on the next boot, which a fresh install performs for the dwc2 overlay; it
+# is intentionally NOT reloaded here (an nmcli/NM reload could disturb the STA link
+# the install runs over). Idempotent: content-compared, so a converged re-run
+# rewrites nothing (no backup churn).
+configure_networkmanager_wifi() {
+    local tmp
+    tmp="$(mktemp)"
+    cat > "$tmp" <<'EOF'
+# TeslaUSB B-1: Wi-Fi hardening for concurrent AP+STA (managed; wifid spec §7.3)
+# Single-radio Pi Zero 2 W: never sleep the Wi-Fi chip or manage the AP overlay vif.
+[connection]
+wifi.powersave=2
+
+[keyfile]
+unmanaged-devices=interface-name:uap0
+EOF
+
+    if [ -e "${TESLAUSB_NM_WIFI_CONF}" ] && cmp -s "$tmp" "${TESLAUSB_NM_WIFI_CONF}"; then
+        rm -f "$tmp"
+        return 0
+    fi
+
+    mut_install_file "$tmp" "$TESLAUSB_NM_WIFI_CONF" 0644
+    rm -f "$tmp"
+}

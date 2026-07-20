@@ -149,8 +149,13 @@ external client (DHCP lease `192.168.4.32`, gateway ping 3/3, `client_count:1`) 
 the STA stayed associated (−58..−62 dBm, gateway-reachable) and SSH never dropped; uploads capped
 `ap_concurrent`; zero teardown churn, zero "unknown interface uap0".
 
-**Provisioning follow-up:** persist power-save-off (NM `wifi.powersave=2`) and the
-`unmanaged-devices=interface-name:uap0` rule via `setup.sh` so the barriers survive a fresh OS.
+**Provisioning (DONE 2026-07-20):** `setup.sh` install mode persists power-save-off
+(NM `[connection] wifi.powersave=2`, barrier #1) and the
+`[keyfile] unmanaged-devices=interface-name:uap0` rule (barrier #4) as a managed admin
+drop-in `/etc/NetworkManager/conf.d/10-teslausb-wifi.conf`
+(`setup-lib/system.sh::configure_networkmanager_wifi`) so the barriers survive a fresh OS.
+Idempotent + dry-run-safe; takes effect on the install's dwc2 reboot (not reloaded live, so
+the install never disturbs the STA link it runs over). Covered by the installer host tests.
 
 **Known pre-existing follow-ups (out of scope of the concurrency work, tracked separately):**
 channel-follow reconfigure lacks a live-channel re-read guard (stale-channel `-52` risk on a

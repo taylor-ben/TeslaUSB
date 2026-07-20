@@ -2150,10 +2150,15 @@ LUNs) is the single make-or-break that still needs the car.**
 >   `ap_concurrent`. Earlier same effort: join/forget/reorder mutation proof 3/3 (2026-07-16). Evidence:
 >   `files/hw-results.md`, `files/ipflush-clientjoin-evidence.txt`.
 > - **REMAINING (not in `edea143`; keeps the §4.13 items above `[ ]`):** captive-portal redirect
->   (Apple/Android/Windows/generic); AP auto-restore timer ("never lock out"); first-run provisioning
->   persistence in `setup.sh` (NM `wifi.powersave=2` + `unmanaged-devices=interface-name:uap0` so the four
->   barriers survive a fresh OS); pre-existing follow-ups **F3** (channel-follow live-channel guard) + **FA**
->   (one-tick throttle publish-before-bring-up, self-heals) — both documented in spec §7.3 + `hw-results.md`.
+>   (Apple/Android/Windows/generic); AP auto-restore timer ("never lock out"); pre-existing follow-ups
+>   **F3** (channel-follow live-channel guard) + **FA** (one-tick throttle publish-before-bring-up,
+>   self-heals) — both documented in spec §7.3 + `hw-results.md`.
+> - **✅ DONE 2026-07-20 — first-run provisioning persistence in `setup.sh`:** install mode now writes a
+>   managed NM admin drop-in (`/etc/NetworkManager/conf.d/10-teslausb-wifi.conf`,
+>   `setup-lib/system.sh::configure_networkmanager_wifi`) persisting `[connection] wifi.powersave=2`
+>   (barrier #1) + `[keyfile] unmanaged-devices=interface-name:uap0` (barrier #4) so the concurrent AP+STA
+>   barriers survive a fresh OS. Idempotent + dry-run-safe; takes effect on the install's dwc2 reboot (not
+>   reloaded live). Verified by the installer host tests (installer 81/81, shellcheck clean). Spec §7.3.
 
 
 ### 4.14 Failed Jobs — `Requirements.md` §4.14

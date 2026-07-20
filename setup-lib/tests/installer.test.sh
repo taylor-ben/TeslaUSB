@@ -64,6 +64,9 @@ assert_grep 'dtoverlay=dwc2,dr_mode=peripheral' "${TESLAUSB_PREFIX}/boot/firmwar
 assert_grep 'dr_mode=host' "${TESLAUSB_PREFIX}/boot/firmware/config.txt" "inert [cm5] host line preserved"
 assert_grep 'dwc2'         "${TESLAUSB_PREFIX}/etc/modules-load.d/teslausb-gadget.conf" "modules-load has dwc2"
 assert_grep 'libcomposite' "${TESLAUSB_PREFIX}/etc/modules-load.d/teslausb-gadget.conf" "modules-load has libcomposite"
+assert_file_exists "${TESLAUSB_PREFIX}/etc/NetworkManager/conf.d/10-teslausb-wifi.conf" "install writes the NM Wi-Fi hardening drop-in (wifid §7.3)"
+assert_grep 'wifi\.powersave=2' "${TESLAUSB_PREFIX}/etc/NetworkManager/conf.d/10-teslausb-wifi.conf" "NM drop-in disables Wi-Fi power save (barrier #1)"
+assert_grep 'unmanaged-devices=interface-name:uap0' "${TESLAUSB_PREFIX}/etc/NetworkManager/conf.d/10-teslausb-wifi.conf" "NM drop-in keeps NM off the uap0 AP vif (barrier #4)"
 if ls "${TESLAUSB_PREFIX}/boot/firmware/"config.txt.b1-backup-* >/dev/null 2>&1; then
     _ok "config.txt backup sidecar created"
 else
@@ -87,6 +90,16 @@ cat > "${TESLAUSB_PREFIX}/etc/modules-load.d/teslausb-gadget.conf" <<'EOF'
 dwc2
 libcomposite
 EOF
+mkdir -p "${TESLAUSB_PREFIX}/etc/NetworkManager/conf.d"
+cat > "${TESLAUSB_PREFIX}/etc/NetworkManager/conf.d/10-teslausb-wifi.conf" <<'EOF'
+# TeslaUSB B-1: Wi-Fi hardening for concurrent AP+STA (managed; wifid spec §7.3)
+# Single-radio Pi Zero 2 W: never sleep the Wi-Fi chip or manage the AP overlay vif.
+[connection]
+wifi.powersave=2
+
+[keyfile]
+unmanaged-devices=interface-name:uap0
+EOF
 rc=0; run_setup install --artifact-dir "$rel" --bootstrap-image --allow-unverified --yes >/dev/null 2>&1 || rc=$?
 assert_eq "$rc" 0 "install --bootstrap-image (preconfigured) succeeds"
 assert_nogrep 'dr_mode=otg' "${TESLAUSB_PREFIX}/boot/firmware/config.txt" "preconfigured bootstrap does not write dr_mode=otg"
@@ -94,6 +107,11 @@ if [ "$(find "${TESLAUSB_PREFIX}/boot/firmware" -maxdepth 1 -name 'config.txt.b1
     _ok "preconfigured bootstrap creates no new config backup"
 else
     _fail "preconfigured bootstrap creates no new config backup"
+fi
+if [ "$(find "${TESLAUSB_PREFIX}/etc/NetworkManager/conf.d" -maxdepth 1 -name '10-teslausb-wifi.conf.b1-backup-*' | wc -l | tr -d ' ')" = "0" ]; then
+    _ok "preconfigured install rewrites no NM Wi-Fi drop-in (idempotent, no backup)"
+else
+    _fail "preconfigured install rewrites no NM Wi-Fi drop-in (idempotent, no backup)"
 fi
 assert_grep 'start gadgetd\.service' "$SYSTEMCTL_LOG" "already-configured bootstrap starts the gadget (BOOT_CHANGED=0)"
 cleanup_sandbox "$sbx"
@@ -208,6 +226,7 @@ assert_eq "$(wc -c < "$TESLAUSB_AUDIT" | tr -d ' ')" 0 "dry-run executed NO muta
 assert_eq "$(wc -c < "$SYSTEMCTL_LOG" | tr -d ' ')" 0 "dry-run invoked NO systemctl"
 assert_grep 'dr_mode=host' "${TESLAUSB_PREFIX}/boot/firmware/config.txt" "dry-run keeps existing boot config"
 assert_nogrep 'dtoverlay=dwc2,dr_mode=peripheral' "${TESLAUSB_PREFIX}/boot/firmware/config.txt" "dry-run does not append dwc2 overlay"
+assert_file_absent "${TESLAUSB_PREFIX}/etc/NetworkManager/conf.d/10-teslausb-wifi.conf" "dry-run does not write the NM Wi-Fi drop-in"
 assert_file_absent "${TESLAUSB_PREFIX}/etc/modules-load.d/teslausb-gadget.conf" "dry-run does not write modules-load file"
 cleanup_sandbox "$sbx"
 
