@@ -1,5 +1,41 @@
 # TeslaUSB B-1 — Build Status (vs. `Requirements.md`)
 
+> ## 🔎 RECONCILIATION (2026-07-20) — C1 core (2-LUN acceptance) is PROVEN by the live system; build-order top items are stale
+>
+> A read-only survey of the live production card (`cybertruckusb.local`, the SAME
+> card in continuous in-car service July 2 → now — NOT a fresh install) corrected the
+> record. Evidence (all read-only, this session; appended to `files/hw-results.md`):
+> - **C1 · 2-LUN LUN-acceptance = PROVEN.** The composed gadget is already two LUNs —
+>   `lun.0`=`teslacam.img` `ro=0` (RW) + `lun.1`=`media.img` `ro=1` (RO) — `configured`
+>   and recording to TeslaCam **for weeks**. The car demonstrably accepts the second
+>   read-only media LUN. The "make-or-break" architectural risk is **retired**.
+> - **Media WRITE at a cold/deferred window = PROVEN LIVE** (F5/F4): a real
+>   `POST /api/wraps` round-tripped through the gadgetd eject-handoff into `media.img`
+>   with the RO mount suspended/rebuilt and `lun.0`/TeslaCam **untouched** (see §4.9
+>   Wrap-upload DONE + the F5 line + `files/hw-results.md`).
+> - **The ONLY genuine remaining C1/C2 car unknown = hot mid-use media-LUN eject
+>   tolerance** (`--allow-hot-handoff`: eject/rebind `lun.1` while the car has the drive
+>   enumerated and is recording). Production currently **defers** media writes to a cold
+>   window (car ejects) and applies them there — which is already proven — so this is a
+>   latency *optimization*, not a blocker. Tracked below as the re-scoped C1 remainder.
+>
+> **Build-order drift found (see "Recommended build order" — annotated there):** #0 C1
+> core is proven (above); #1 Phase-0 foundation (F2→F4) is done (F4/F5 proven); #2 "Fix
+> Lock Chimes page" (§4.5) is essentially **complete** on the bench (active card,
+> library playback, upload, delete, rename, edit/re-trim, set-active, groups, schedules,
+> random-mode all `[x]`). So the first genuinely-open *new* bench work is later in the
+> list. **§4.9 "Tracked-plate list (privacy/redaction)" is de-prioritized as
+> speculative** — v1 has NO tracked-plate string list / redaction / ALPR feature to port
+> and there is no downstream consumer of the toggle; building it now would be a CRUD list
+> + a boolean nothing reads (violates the charter's "nothing speculative"). **RESOLVED
+> (2026-07-20): the §4.9 *plate-image* spec drift is corrected.** Online research (Tesla
+> `custom-wraps` repo issue #13 + Cybertruck Owners Club, car-proven on Cybertruck/Model Y
+> 2025.44.25.1) confirmed the real Tesla spec = v1's shipped values: **420×200 (NA)/
+> 420×100 (EU/Italy), name ≤32 alnum, up to 10, ≤512 KB, PNG**. Requirements.md §4.9 (which
+> had the wrong 420×75/492×75/≤12/≤5) AND the B-1 validators (`media_upload.rs`
+> `PLATE_DIMENSIONS`/`validate_plate_filename`, `plates.rs` `PLATES_MAX_FILES`) + the SPA
+> hints + tests were all corrected to the real spec.
+
 > ## ✅ DONE (2026-07-14) — server-side SEI telemetry HUD (§4.2) COMPLETE + LIVE-VERIFIED on device
 >
 > **§4.2 telemetry HUD is ticked below.** The map route-click overlay HUD was live-
@@ -39,6 +75,28 @@
 >    load ~3, webd briefly refused new SYNs (kernel backlog) → a few dropped health/
 >    stream polls in the browser console. webd never crashed (NRestarts=0). Capacity/
 >    perf note: consider a smaller size cap or accept-loop priority; harmless today.
+>
+> ### Addendum (2026-07-14 afternoon) — always-front DEPLOYED+COMMITTED; "recent HUD blank" is PARKED-EXPECTED
+> - **`7f3f4b8` (always-front) is committed + pushed + deployed** (SPA bundle
+>   `index-DhvO0eM5.js` live; webd `NRestarts=0`; rollback dead-man cancelled on green).
+> - **Correction to an earlier assumption:** `GET /api/clips/:id/telemetry?camera=X`
+>   *honors* the camera param (parses THAT camera's H.264), returning `[]` when it lacks
+>   SEI. Telemetry VALUES are **camera-independent** (same speed/gear/steering embedded
+>   redundantly across a clip's angles). So always-front is the right default: front is
+>   the most-often-populated angle, and its data is correct for any displayed camera.
+> - **KEY FINDING (byte-scan of archived front .mp4 for the Tesla SEI marker `42 42 69`):**
+>   **Tesla embeds drive-telemetry SEI only while DRIVING; parked/Sentry footage carries
+>   none.** Same-evening proof — DRIVING 19:06 = 725 markers ✅ / PARKED 19:34 = 1 (noise)
+>   ❌ / DRIVING 19:49 (4493) = 724 ✅ / PARKED 07-13 (4600) = 0 ❌. The car's last drive
+>   was 07-12 (`/api/days`: 07-13 = 0 trips); every recent clip is parked → blank HUD is
+>   **expected, not a bug**. The HUD is verified working on all drives ≤07-12; the **next
+>   drive** is the decisive live check. Evidence: `files/hw-results.md` (2026-07-14 entry).
+> - **Minor known regression (documented, not urgent):** always-front blanks the HUD on
+>   *camera-switch* for the narrow subset of DRIVE clips whose FRONT specifically lacks SEI
+>   (e.g. 4441). Default front viewing unchanged. OPTIONAL Tier-3 webd fix available
+>   (server-side camera fallback — when the requested camera has 0 SEI, try the clip's
+>   other cameras; GPT-5.5 requirements captured). Deferred: Tier-3 binary swap to the live
+>   recording Pi shouldn't ship unattended for a rare edge case.
 >
 > ### (history) 2026-07-13 — endpoint BUILT + unit-tested (340 webd) + Playwright GREEN (90/90); webd endpoint + SPA already LIVE on device
 >
@@ -341,9 +399,10 @@
 > Parity-audit progress: **Slice 2 (indexer-liveness health dot)**, **A5 (Music
 > rename-during-move)**, **A6 (Chimes "Edit"/re-trim)** + **A7 (EventPlayer
 > download progress)** shipped & live-verified 2026-06-26.
-> Next bucket-A SPA item: **A8 (LightShows mobile checkbox overlap — needs design
-> decision first)** — verify each against V1 source before building (see
-> `files/v1-parity-audit.md`).
+> Next bucket-A SPA item: **A8 (LightShows mobile checkbox overlap) — ✅ RESOLVED
+> 2026-07-20** (shared `media-card-table` card layout already handles it; `light-shows.spec.ts`
+> 24/24 both viewports — see §4.8). Verify each remaining item against V1 source before
+> building (see `files/v1-parity-audit.md`).
 >
 > Build/test via podman from PowerShell (see copilot-instructions.md) — never local WSL/cargo.
 >
@@ -1822,12 +1881,15 @@ LUNs) is the single make-or-break that still needs the car.**
   Table column widths rebalanced for the new Play column [visual gate].)**
 - [ ] Upload `.fseq`/audio single ≤100 MB, or **ZIP ≤500 MB** auto-extracted+flattened. **(gated: ZIP upload backend — Tier-C A1)**
 - [x] Delete files/shows (incl. bulk). **(bulk-delete proven)**
-- [ ] **FOLLOW-UP (pre-existing layout bug, found during the shell-parity lane):**
-  `spa/test/uat/light-shows.spec.ts:262` ("row checkbox sits in its own column, not over the
-  show name") FAILS at **mobile-375** — the select checkbox renders at x≈332 (right side) instead
-  of before the name (x≈43). Confirmed pre-existing (reproduces on baseline `Shell`, unrelated to
-  the health-dot change). Desktop-1280 passes. Needs a `light-shows.css` row-grid fix so the
-  checkbox column precedes the name at narrow widths.
+- [x] **FOLLOW-UP (pre-existing layout bug) — RESOLVED (verified 2026-07-20).** The
+  `light-shows.spec.ts` layout test ("row checkbox never overlaps the show name — own
+  column on desktop, pinned right on mobile") now **PASSES at both viewports**. The shared
+  `bulk-delete.css` `@media (max-width:640px)` `media-card-table` card layout (`td.bulk-check-col`
+  absolutely pinned top-right + `td.media-card-title { padding-right: 36px }` reserved gutter),
+  which the light-shows table opts into via its `media-card-table` class, already satisfies the
+  requirement — no `light-shows.css` change was needed. Full `light-shows.spec.ts` = **24/24**
+  (desktop-1280 + mobile-375). The earlier "checkbox at x≈332" note was stale (the test was
+  since rewritten to the pinned-right mobile design + the shared card layout landed).
 
 ### 4.9 Wraps & License Plates — `Requirements.md` §4.9
 
@@ -1849,9 +1911,12 @@ LUNs) is the single make-or-break that still needs the car.**
   `files/hw-results.md`.)**
 - [x] Wrap delete (incl. bulk). **(proven)**
 - [ ] **Plates (images):** list w/ thumbnails, upload, delete `.png` ≤512 KB,
-  exactly 420×75 (NA)/492×75 (EU), name ≤12 alnum, ≤5. **(partial: validation A1 done;
-  thumbnail Preview column DONE — `<img>` wired + Playwright `naturalWidth>0` (license-plates.spec.ts);
-  upload caps + cropper deferred — A2)**
+  exactly 420×200 (NA)/420×100 (EU/Italy), name ≤32 alnum, ≤10. **(validation + count
+  cap DONE to the real Tesla spec — `media_upload.rs` `PLATE_DIMENSIONS`=420×200/420×100
+  + `validate_plate_filename` ≤32 alnum + `plates.rs` `PLATES_MAX_FILES=10` with exact
+  `rel_path` replace exception, all rejecting `422` pre-handoff; thumbnail Preview column
+  DONE (`<img>` + Playwright `naturalWidth>0`). Corrected 2026-07-20 from the wrong
+  420×75/492×75/≤12/≤5 that matched no real source — see the §4.9 banner. Cropper deferred — A2)**
 - [ ] **Tracked-plate list (privacy/redaction):** add/edit/delete (uppercase ≤16,
   label ≤64, notes ≤240, dedupe), bulk delete, redaction toggle. **(not started)**
 
@@ -2203,8 +2268,16 @@ LUNs) is the single make-or-break that still needs the car.**
 
 ### Tier-C hardware/operator gates (block multiple items; cannot be done autonomously)
 
-- [ ] **C1 · 2.1 LUN-acceptance vehicle spike** — does the car accept a SECOND
-  read-only media LUN? Make-or-break; unblocks all calibration + F1. **(C)**
+- [x] **C1 · 2.1 LUN-acceptance vehicle spike** — does the car accept a SECOND
+  read-only media LUN? **CORE PROVEN 2026-07-20** by the live production system (2-LUN
+  gadget `lun.0` teslacam RW + `lun.1` media RO, `configured`, recording for weeks) +
+  the F5 `POST /api/wraps` cold-window media-write round-trip (TeslaCam untouched). The
+  make-or-break risk is retired; F1/calibration are unblocked. See the RECONCILIATION
+  banner at top + `files/hw-results.md`. **(C)**
+- [ ] **C1-hot · hot mid-use media-LUN eject tolerance** (`--allow-hot-handoff`) — the
+  re-scoped C1 remainder: eject/rebind `lun.1` while the car has the drive enumerated and
+  is recording. Production defers media writes to a cold window (already proven), so this
+  is a latency optimization, not a blocker. Still needs the car. **(C)**
 - [ ] **C2 · WiFi TX-cap (2.6) + governor defaults (2.7)** at-vehicle. **(C)**
 - [x] **C3 · Real Tesla footage validation** (replace synthetic SMPTE). **PASSED
   2026-06-23 (device in-car, Sentry ON, real footage).** C3 caught that the Phase-1
@@ -2228,23 +2301,26 @@ LUNs) is the single make-or-break that still needs the car.**
 
 ## Recommended build order (folds in the review guidance)
 
-> **C1 is make-or-break and comes FIRST.** The entire two-image / `lun.1`-media
-> direction (and therefore F1 migration, the RO `media.img` mount, and every
-> "lun.1-only" safety claim) is invalid if the car won't accept a second
-> read-only LUN. Run the C1 vehicle spike up front. Bench development of the
-> Phase-0 slice (F2–F4) and the Lock-Chimes UI can proceed **in parallel** on the
-> bench, but nothing media may be marked proven on the live device until C1 + F1
-> pass.
+> **C1 was make-or-break — and its CORE is now PROVEN (2026-07-20).** The two-image /
+> `lun.1`-media direction is validated by the live production system: the car accepts a
+> second read-only LUN (2-LUN gadget recording for weeks) and cold-window media writes
+> round-trip through the eject-handoff (F5). The architectural risk is retired. The ONLY
+> remaining car-gated C1 unknown is **hot mid-use eject tolerance** (C1-hot, an
+> optimization — production defers writes to a cold window, which is proven). Bench
+> development of media reads/writes at the cold window may now proceed and be marked
+> proven; only the hot-handoff path stays gated on the vehicle.
 
 0. **C1 · 2.1 LUN-acceptance vehicle spike (FIRST, blocking the direction).**
-   If PASS → proceed to F1 migration. If FAIL → re-open the media-LUN
-   architecture before building further.
+   **✅ CORE PROVEN 2026-07-20** (live 2-LUN gadget + F5 cold-window write). Direction
+   validated → F1 migration unblocked. Only C1-hot (hot mid-use eject) remains car-gated.
 1. **Phase 0 foundation slice** (F2→F3→F4) — `lun.1 ro=1` + RO media mount +
    handoff read-drain. Develop on the bench in parallel with C1; lands live after
    F1. Unlocks every media *read* (active-chime player, library/music/boombox/
    lightshow playback, wrap/plate thumbnails) with simple `std::fs`.
-2. **Fix Lock Chimes page** (§4.5 active card + library playback) — first visible
-   win on the new read path; highest current divergence from v1.
+2. **Fix Lock Chimes page** (§4.5 active card + library playback) — **✅ DONE on the
+   bench** (active card, library playback, upload, delete, rename, edit/re-trim,
+   set-active, groups, schedules, random-mode all `[x]`; only the A3d.5 car re-enum
+   half is Tier-C/C6). This build-order line is satisfied.
 3. **retentiond serve loop (B1)** → archive RecentClips → unblocks live-clip map
    playback (§4.2 #2) and storage-health/analytics alerts.
 4. **lun.0 `ReadFile` fallback** (only the not-yet-archived window) — small, per
