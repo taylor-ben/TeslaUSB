@@ -2808,6 +2808,31 @@ fn valid_wrap_png(w: u32, h: u32) -> Vec<u8> {
     data
 }
 
+/// POST a multipart body to `/api/plates` and return `(status, parsed-json)`.
+async fn post_plates(app: &Router, body: Vec<u8>) -> (StatusCode, Value) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/plates")
+                .header(
+                    axum::http::header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={BOUNDARY}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, value)
+}
+
 /// POST a multipart body and return `(status, parsed-json)`.
 async fn post_chime(app: &Router, body: Vec<u8>) -> (StatusCode, Value) {
     let resp = app
@@ -3736,6 +3761,128 @@ async fn get_plates_degrades_on_v1_catalog() {
     let (status, body) = get_json(&app, "/api/plates").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["items"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn plates_upload_rejected_when_full() {
+    let fx = wraps_fixture(
+        Reply::Json(json!({ "state": "queued", "job_id": "m-1" })),
+        &[
+            ("slot1", "LicensePlate/plate1.png", "plate1.png", 1),
+            ("slot1", "LicensePlate/plate2.png", "plate2.png", 1),
+            ("slot1", "LicensePlate/plate3.png", "plate3.png", 1),
+            ("slot1", "LicensePlate/plate4.png", "plate4.png", 1),
+            ("slot1", "LicensePlate/plate5.png", "plate5.png", 1),
+            ("slot1", "LicensePlate/plate6.png", "plate6.png", 1),
+            ("slot1", "LicensePlate/plate7.png", "plate7.png", 1),
+            ("slot1", "LicensePlate/plate8.png", "plate8.png", 1),
+            ("slot1", "LicensePlate/plate9.png", "plate9.png", 1),
+            ("slot1", "LicensePlate/plate10.png", "plate10.png", 1),
+        ],
+    );
+    let body = multipart_body_with_content_type(
+        "plate11.png",
+        "image/png",
+        &[("file", &valid_wrap_png(420, 200))],
+    );
+
+    let (status, body) = post_plates(&fx.app, body).await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(body["error"]["code"], "plates_full");
+    assert!(fx.last.lock().unwrap().is_none(), "gadgetd not contacted");
+}
+
+#[tokio::test]
+async fn plates_replace_allowed_when_full() {
+    let fx = wraps_fixture(
+        Reply::Json(json!({ "state": "queued", "job_id": "m-1" })),
+        &[
+            ("slot1", "LicensePlate/plate1.png", "plate1.png", 1),
+            ("slot1", "LicensePlate/plate2.png", "plate2.png", 1),
+            ("slot1", "LicensePlate/plate3.png", "plate3.png", 1),
+            ("slot1", "LicensePlate/plate4.png", "plate4.png", 1),
+            ("slot1", "LicensePlate/plate5.png", "plate5.png", 1),
+            ("slot1", "LicensePlate/plate6.png", "plate6.png", 1),
+            ("slot1", "LicensePlate/plate7.png", "plate7.png", 1),
+            ("slot1", "LicensePlate/plate8.png", "plate8.png", 1),
+            ("slot1", "LicensePlate/plate9.png", "plate9.png", 1),
+            ("slot1", "LicensePlate/plate10.png", "plate10.png", 1),
+        ],
+    );
+    let body = multipart_body_with_content_type(
+        "plate3.png",
+        "image/png",
+        &[("file", &valid_wrap_png(420, 100))],
+    );
+
+    let (status, body) = post_plates(&fx.app, body).await;
+
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(body["state"], "queued");
+    assert!(fx.last.lock().unwrap().is_some(), "gadgetd contacted");
+}
+
+#[tokio::test]
+async fn plates_under_cap_reaches_gadgetd() {
+    let fx = wraps_fixture(
+        Reply::Json(json!({ "state": "queued", "job_id": "m-1" })),
+        &[
+            ("slot1", "LicensePlate/plate1.png", "plate1.png", 1),
+            ("slot1", "LicensePlate/plate2.png", "plate2.png", 1),
+            ("slot1", "LicensePlate/plate3.png", "plate3.png", 1),
+            ("slot1", "LicensePlate/plate4.png", "plate4.png", 1),
+            ("slot1", "LicensePlate/plate5.png", "plate5.png", 1),
+            ("slot1", "LicensePlate/plate6.png", "plate6.png", 1),
+            ("slot1", "LicensePlate/plate7.png", "plate7.png", 1),
+            ("slot1", "LicensePlate/plate8.png", "plate8.png", 1),
+            ("slot1", "LicensePlate/plate9.png", "plate9.png", 1),
+        ],
+    );
+    let body = multipart_body_with_content_type(
+        "plate10.png",
+        "image/png",
+        &[("file", &valid_wrap_png(420, 200))],
+    );
+
+    let (status, body) = post_plates(&fx.app, body).await;
+
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(body["state"], "queued");
+    assert!(fx.last.lock().unwrap().is_some(), "gadgetd contacted");
+}
+
+#[tokio::test]
+async fn plates_nested_same_name_is_not_a_replace_at_capacity() {
+    // A nested `LicensePlate/old/plate10.png` shares the bare name `plate10.png`
+    // with the incoming root-level upload but is a DISTINCT destination path. At
+    // capacity it must NOT be treated as a replace (which would bypass the cap).
+    let fx = wraps_fixture(
+        Reply::Json(json!({ "state": "queued", "job_id": "m-1" })),
+        &[
+            ("slot1", "LicensePlate/plate1.png", "plate1.png", 1),
+            ("slot1", "LicensePlate/plate2.png", "plate2.png", 1),
+            ("slot1", "LicensePlate/plate3.png", "plate3.png", 1),
+            ("slot1", "LicensePlate/plate4.png", "plate4.png", 1),
+            ("slot1", "LicensePlate/plate5.png", "plate5.png", 1),
+            ("slot1", "LicensePlate/plate6.png", "plate6.png", 1),
+            ("slot1", "LicensePlate/plate7.png", "plate7.png", 1),
+            ("slot1", "LicensePlate/plate8.png", "plate8.png", 1),
+            ("slot1", "LicensePlate/plate9.png", "plate9.png", 1),
+            ("slot1", "LicensePlate/old/plate10.png", "plate10.png", 1),
+        ],
+    );
+    let body = multipart_body_with_content_type(
+        "plate10.png",
+        "image/png",
+        &[("file", &valid_wrap_png(420, 200))],
+    );
+
+    let (status, body) = post_plates(&fx.app, body).await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(body["error"]["code"], "plates_full");
+    assert!(fx.last.lock().unwrap().is_none(), "gadgetd not contacted");
 }
 
 #[tokio::test]

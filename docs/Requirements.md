@@ -316,8 +316,8 @@ The user can:
 
 1. **Custom plate images** the car can display:
    - **List with thumbnails**, **upload**, **delete** plate **PNGs**: **`.png`
-     only**, **≤ 512 KB**, dimensions **exactly 420×75 (NA)** or **492×75 (EU)**,
-     filename **≤ 12 alphanumeric chars** (no spaces/dashes/underscores), **up to 5**
+     only**, **≤ 512 KB**, dimensions **exactly 420×200 (NA)** or **420×100 (EU/Italy)**,
+     filename **≤ 32 alphanumeric chars** (no spaces/dashes/underscores), **up to 10**
      plates. *Outcome:* validated and atomically published to the license-plate
      folder; clear error if dimensions/size/name/count are wrong.
 2. **Tracked-plate list (privacy / redaction):** a small database of plate strings

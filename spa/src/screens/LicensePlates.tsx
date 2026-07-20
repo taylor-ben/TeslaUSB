@@ -57,11 +57,11 @@ export function LicensePlates() {
             <strong>Size:</strong> 512 KB maximum
           </li>
           <li>
-            <strong>Dimensions:</strong> 420x75 (North America) or 492x75
+            <strong>Dimensions:</strong> 420x200 (North America) or 420x100
             (Europe / Italy)
           </li>
           <li>
-            <strong>Count:</strong> Up to 5 plates at a time
+            <strong>Count:</strong> Up to 10 plates at a time
           </li>
         </ul>
         <p class="license-plates-info-note">
@@ -85,7 +85,7 @@ export function LicensePlates() {
         accept=".png,image/png"
         icon="image"
         title="Choose PNG files (≤ 512 KB each)"
-        hint="PNG only. Tesla output: 420x75 or 492x75 — drag & drop or pick multiple"
+        hint="PNG only. Tesla output: 420x200 or 420x100 — drag & drop or pick multiple"
       />
 
       {/* ── Confirm remove dialog ── */}

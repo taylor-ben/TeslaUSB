@@ -77,10 +77,10 @@ test.describe("license plates UAT", () => {
     ).toContainText("PNG only");
     await expect(
       page.locator("[data-testid=license-plates-requirements]"),
-    ).toContainText("420x75");
+    ).toContainText("420x200");
     await expect(
       page.locator("[data-testid=license-plates-requirements]"),
-    ).toContainText("492x75");
+    ).toContainText("420x100");
 
     // Upload form is live (not disabled).
     const drop = page.locator("[data-testid=license-plates-dropzone]");

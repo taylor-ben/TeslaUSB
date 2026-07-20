@@ -1,7 +1,7 @@
 //! `GET /api/plates` · `POST /api/plates` · `DELETE /api/plates/:name`
 //!
 //! License plate images live under `LicensePlate/` on the MEDIA (p2) partition.
-//! Tesla supports up to 5 plates; only `.png` files are accepted (≤ 512 KiB).
+//! Tesla supports up to 10 plates; only `.png` files are accepted (≤ 512 KiB).
 //! PNG magic bytes (`\x89PNG\r\n\x1a\n`) are verified before any gadget round-trip.
 
 use axum::Json;
@@ -23,6 +23,10 @@ const PLATES_DIR: &str = "LicensePlate";
 /// Maximum accepted license plate image size (512 KiB).
 const PLATES_MAX_BYTES: usize = 512 * 1024;
 
+/// Tesla renders at most 10 license plates; reject uploads beyond this. A
+/// re-upload of an existing (exact) name is a replace and is always allowed.
+const PLATES_MAX_FILES: usize = 10;
+
 /// Axum `DefaultBodyLimit` for the POST route (4 MiB — defence-in-depth).
 pub(crate) const PLATES_BODY_LIMIT: usize = 4 * 1024 * 1024;
 
@@ -37,8 +41,9 @@ pub(crate) async fn list_plates(
 /// `POST /api/plates` — install a license plate PNG at
 /// `LicensePlate/<sanitised_filename>`.
 ///
-/// Enforces v1 parity rules before any gadget round-trip: PNG magic, a 1-12
-/// alphanumeric filename, and exact `420x75` (NA) or `492x75` (EU) dimensions.
+/// Enforces the real Tesla rules before any gadget round-trip: PNG magic, a
+/// 1-32 alphanumeric filename, and exact `420x200` (NA) or `420x100` (EU/Italy)
+/// dimensions.
 pub(crate) async fn install_plate(
     State(state): State<AppState>,
     multipart: Multipart,
@@ -51,6 +56,28 @@ pub(crate) async fn install_plate(
     validate_plate_dimensions(&bytes)?;
 
     let rel_path = format!("{PLATES_DIR}/{name}");
+
+    // Capacity: at most PLATES_MAX_FILES plates total. An exact re-upload of the
+    // same destination path is a replace (net count unchanged) and is permitted
+    // even at capacity; a new path at capacity is rejected before any gadgetd
+    // handoff. The dedupe identity is the full destination `rel_path`, not the
+    // bare file name, so a nested same-named file can't masquerade as a replace
+    // and bypass the cap. The comparison is exact (case-sensitive) to match the
+    // case-sensitive p2 store. The catalog count trails an in-flight install by
+    // one index pass; the resulting TOCTOU under truly concurrent distinct
+    // uploads is accepted (a single-operator appliance installs one at a time).
+    let existing = crate::route::read(state.catalog.clone(), crate::query::list_plates).await?;
+    let is_replace = existing.iter().any(|item| item.rel_path == rel_path);
+    if !is_replace && existing.len() >= PLATES_MAX_FILES {
+        return Err(ApiError::status(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "plates_full",
+            format!(
+                "License plate folder already holds the maximum of {PLATES_MAX_FILES} images; delete one before uploading another"
+            ),
+        ));
+    }
+
     crate::route::run_install(state, "plate_install", PARTITION_MEDIA, rel_path, bytes).await
 }
 

@@ -263,10 +263,11 @@ pub(crate) fn png_dimensions(bytes: &[u8]) -> Result<(u32, u32), ApiError> {
     Ok((width, height))
 }
 
-/// Accepted license-plate pixel dimensions (v1 parity): North America
-/// `420×75` or Europe/Italy `492×75`. Tesla renders the plate at a fixed
-/// aspect, so off-size images are rejected rather than silently stretched.
-const PLATE_DIMENSIONS: &[(u32, u32)] = &[(420, 75), (492, 75)];
+/// Accepted license-plate pixel dimensions (real Tesla spec, car-proven on
+/// Cybertruck/Model Y): North America `420×200` or Europe/Italy `420×100`.
+/// Tesla renders the plate at a fixed aspect, so off-size images are rejected
+/// rather than silently stretched.
+const PLATE_DIMENSIONS: &[(u32, u32)] = &[(420, 200), (420, 100)];
 
 /// Validate that a license-plate PNG is exactly one of the accepted sizes.
 ///
@@ -279,7 +280,7 @@ pub(crate) fn validate_plate_dimensions(bytes: &[u8]) -> Result<(), ApiError> {
     Err(ApiError::status(
         StatusCode::UNPROCESSABLE_ENTITY,
         "invalid_dimensions",
-        format!("license plate must be 420x75 (North America) or 492x75 (Europe); got {w}x{h}"),
+        format!("license plate must be 420x200 (North America) or 420x100 (Europe/Italy); got {w}x{h}"),
     ))
 }
 
@@ -304,8 +305,8 @@ pub(crate) fn validate_wrap_dimensions(bytes: &[u8]) -> Result<(), ApiError> {
     ))
 }
 
-/// Validate a license-plate base filename against v1's rule: at most 12
-/// characters, ASCII letters and digits only (no spaces, dashes, underscores,
+/// Validate a license-plate base filename against the real Tesla rule: at most
+/// 32 characters, ASCII letters and digits only (no spaces, dashes, underscores,
 /// or dots). The `.png` extension is excluded from the count and check — pass
 /// the already-`sanitise_filename`d name; this strips a single trailing
 /// `.png`/`.PNG` before validating.
@@ -317,14 +318,14 @@ pub(crate) fn validate_plate_filename(name: &str) -> Result<(), ApiError> {
         .or_else(|| name.strip_suffix(".PNG"))
         .unwrap_or(name);
     let ok =
-        !stem.is_empty() && stem.len() <= 12 && stem.chars().all(|c| c.is_ascii_alphanumeric());
+        !stem.is_empty() && stem.len() <= 32 && stem.chars().all(|c| c.is_ascii_alphanumeric());
     if ok {
         return Ok(());
     }
     Err(ApiError::status(
         StatusCode::UNPROCESSABLE_ENTITY,
         "invalid_filename",
-        "license-plate name must be 1-12 letters or digits only (no spaces, dashes, or underscores)"
+        "license-plate name must be 1-32 letters or digits only (no spaces, dashes, or underscores)"
             .to_owned(),
     ))
 }
@@ -458,14 +459,17 @@ mod tests {
 
     #[test]
     fn plate_dimensions_accepts_na_and_eu() {
-        super::validate_plate_dimensions(&png_header(420, 75)).unwrap();
-        super::validate_plate_dimensions(&png_header(492, 75)).unwrap();
+        super::validate_plate_dimensions(&png_header(420, 200)).unwrap();
+        super::validate_plate_dimensions(&png_header(420, 100)).unwrap();
     }
 
     #[test]
     fn plate_dimensions_rejects_other_sizes() {
         assert!(super::validate_plate_dimensions(&png_header(512, 512)).is_err());
-        assert!(super::validate_plate_dimensions(&png_header(420, 76)).is_err());
+        assert!(super::validate_plate_dimensions(&png_header(420, 201)).is_err());
+        // The former (incorrect) B-1 sizes must now be rejected.
+        assert!(super::validate_plate_dimensions(&png_header(420, 75)).is_err());
+        assert!(super::validate_plate_dimensions(&png_header(492, 75)).is_err());
     }
 
     #[test]
@@ -483,13 +487,13 @@ mod tests {
     }
 
     #[test]
-    fn plate_filename_enforces_v1_rule() {
+    fn plate_filename_enforces_tesla_rule() {
         super::validate_plate_filename("ABC123.png").unwrap();
         super::validate_plate_filename("plate1").unwrap();
-        // 12 chars exactly (stem), excluding extension.
-        super::validate_plate_filename("ABCDEFGH1234.png").unwrap();
-        // 13 chars → too long.
-        assert!(super::validate_plate_filename("ABCDEFGH12345.png").is_err());
+        // 32 chars exactly (stem), excluding extension.
+        super::validate_plate_filename("ABCDEFGHIJKLMNOPQRSTUVWXYZ012345.png").unwrap();
+        // 33 chars → too long.
+        assert!(super::validate_plate_filename("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456.png").is_err());
         // Dashes / underscores / spaces are forbidden.
         assert!(super::validate_plate_filename("my-plate.png").is_err());
         assert!(super::validate_plate_filename("my_plate.png").is_err());
