@@ -31,6 +31,7 @@ import { resolve } from "node:path";
 const ALLOWED_API = new Set([
   "/api/storage",
   "/api/storage/health",
+  "/api/recording/encryption",
   "/api/system/metrics",
   "/api/system/health",
   // The app shell (Shell.tsx) polls gadget status on every page mount to drive
@@ -156,6 +157,16 @@ async function routeProbes(page: Page) {
   await page.route("**/api/storage", (r) => r.fulfill(json(STORAGE_FIXTURE)));
   await page.route("**/api/system/metrics", (r) => r.fulfill(json(METRICS_FIXTURE)));
   await page.route("**/api/system/health", (r) => r.fulfill(json(SYS_HEALTH_FIXTURE)));
+  await page.route("**/api/recording/encryption", (r) =>
+    r.fulfill(
+      json({
+        encrypting: false,
+        latest_encrypted_at: null,
+        latest_plain_at: null,
+        encrypted_clip_count: 0,
+      }),
+    ),
+  );
   await page.route("**/api/storage/health", (r) => r.fulfill(json(STORAGE_HEALTH_FIXTURE)));
 }
 
@@ -419,6 +430,9 @@ test.describe("storage health UAT", () => {
     // Prove the four read-only probes are actually wired in.
     expect(seen.has("/api/storage"), "/api/storage was never requested").toBe(true);
     expect(seen.has("/api/storage/health"), "/api/storage/health never requested").toBe(true);
+    expect(seen.has("/api/recording/encryption"), "/api/recording/encryption never requested").toBe(
+      true,
+    );
     expect(seen.has("/api/system/metrics"), "/api/system/metrics never requested").toBe(true);
     expect(seen.has("/api/system/health"), "/api/system/health never requested").toBe(true);
 

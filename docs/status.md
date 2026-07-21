@@ -28,10 +28,20 @@
 > (2026-07-21, operator-consented; `mv`-aside→verify→`rm` under a GPT-5.5-reviewed plan — genuine
 > footage 07-13/07-14 intact, `/data` now 50 G free). Working tree reverted (fix NOT committed).
 > Evidence: `files/hw-results.md` (EncryptedClips ROOT-CAUSE + rollback + reclaim blocks).
-> **Follow-up (design separately, not started):** have TeslaUSB DETECT `EncryptedClips` presence
-> and surface an SPA warning ("your car is encrypting dashcam footage; TeslaUSB can't archive it
-> — disable Encrypt Dashcam Recordings"), using a distinct locked/encrypted archive state and
-> **never** storing Tesla credentials in retentiond.
+> **Follow-up — ✅ DONE + DEPLOYED + LIVE-VERIFIED (2026-07-21):** TeslaUSB now DETECTS
+> `EncryptedClips` and surfaces an SPA warning banner. **Backend:** `GET /api/recording/encryption`
+> → `{encrypting, latest_encrypted_at, latest_plain_at, encrypted_clip_count}` (webd
+> `dto.rs`/`query.rs`/`route.rs`; static SQL keyed off `canonical_key LIKE '%/EncryptedClips/%'`;
+> `encrypting` = newest encrypted clip ≥ newest plain clip → self-clears when the car resumes
+> writing plain clips). **SPA:** `EncryptionBanner` on `/storage` (StorageHealth.tsx) renders a warn
+> banner **"Dashcam encryption is on"** above the recording banner when encrypting, naming the exact
+> in-car toggle (Controls → Safety → Encrypt Dashcam Recordings); returns null otherwise. **No Tesla
+> credentials anywhere** (detection only, off `canonical_key`). Gates: podman `cargo test -p webd`
+> **457 passed** (+2); SPA `tsc` clean; Playwright full suite **539 passed** + 2 new UAT specs.
+> Deployed under hardware-test rails (webd `0835b6b2` + SPA `index-D6gdk3aZ.js`, rollback dead-man
+> cancelled on green); **live-verified on device** — endpoint 200 `encrypting:true` (315 encrypted
+> clips), banner renders both viewports, console 0/0, `GET /api/recording/encryption` 200 wired.
+> Evidence: `files/hw-results.md` + `files/enc-banner-live-{desktop-1280,mobile-375}.png`.
 
 > ## 🔎 RECONCILIATION (2026-07-20) — C1 core (2-LUN acceptance) is PROVEN by the live system; build-order top items are stale
 >

@@ -173,6 +173,14 @@ export interface Analytics {
   video_stats?: VideoStats;
 }
 
+/** `GET /api/recording/encryption` — dashcam-encryption detection. */
+export interface EncryptionStatus {
+  encrypting: boolean;
+  latest_encrypted_at: number | null;
+  latest_plain_at: number | null;
+  encrypted_clip_count: number;
+}
+
 /** `GET /api/settings` raw pref row. */
 export interface Pref {
   key: string;

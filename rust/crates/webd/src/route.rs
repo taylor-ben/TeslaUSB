@@ -26,7 +26,8 @@ use tower_http::services::{ServeDir, ServeFile};
 
 use crate::daybucket::{local_day_bounds, parse_tz};
 use crate::dto::{
-    AnalyticsDto, ClipDto, DaySummary, EventDto, Page, PrefDto, TripDetailDto, TripDto,
+    AnalyticsDto, ClipDto, DaySummary, EncryptionStatusDto, EventDto, Page, PrefDto, TripDetailDto,
+    TripDto,
 };
 use crate::error::ApiError;
 use crate::gadget::{self, DeleteRefusal, MutationOutcome, TransportError};
@@ -144,6 +145,7 @@ pub(crate) fn router(state: AppState, static_dir: PathBuf) -> Router {
         .route("/jobs", get(jobs_stream))
         .route("/jobs/failed", get(jobs_failed))
         .route("/analytics", get(analytics))
+        .route("/recording/encryption", get(encryption_status))
         .route("/settings", get(settings).put(put_setting))
         .merge(crate::chime_scheduler::routes())
         .merge(crate::chime_library::routes())
@@ -460,6 +462,13 @@ async fn clip_detail(
 
 async fn analytics(State(state): State<AppState>) -> Result<Json<AnalyticsDto>, ApiError> {
     let out = read(state.catalog, query::analytics).await?;
+    Ok(Json(out))
+}
+
+async fn encryption_status(
+    State(state): State<AppState>,
+) -> Result<Json<EncryptionStatusDto>, ApiError> {
+    let out = read(state.catalog, query::encryption_status).await?;
     Ok(Json(out))
 }
 

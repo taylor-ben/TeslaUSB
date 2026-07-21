@@ -3,6 +3,7 @@ import { Fragment } from "preact";
 import { Icon } from "../components/Icon";
 import { api } from "../api/client";
 import type {
+  EncryptionStatus,
   FilesystemEntry,
   GovernorInfo,
   StorageHealth as StorageHealthDto,
@@ -336,6 +337,32 @@ function RecordingBanner({
   );
 }
 
+function EncryptionBanner({ enc }: { enc: EncryptionStatus | null }) {
+  if (!enc || !enc.encrypting) return null;
+  return (
+    <section
+      class="storage-banner storage-banner-warn"
+      id="storage-encryption-banner"
+      data-banner-level="warn"
+      role="status"
+    >
+      <span class="storage-banner-icon" aria-hidden="true">
+        <Icon name={BANNER_ICON.warn} />
+      </span>
+      <div class="storage-banner-text">
+        <span class="storage-banner-title">Dashcam encryption is on</span>
+        <span class="storage-banner-detail">
+          Your Tesla is encrypting its dashcam clips, so TeslaUSB can’t save or
+          play them. To let TeslaUSB archive your footage again, turn off
+          Controls → Safety → Encrypt Dashcam Recordings in the car. Clips
+          recorded while encryption was on stay viewable only in the car or at
+          Tesla’s dashcam viewer.
+        </span>
+      </div>
+    </section>
+  );
+}
+
 /** The two USB image files (dashcam + media) and the archived-footage library all
  *  live on the one SD card. This card makes that composition explicit so a
  *  near-full card is understandable and actionable, not mysterious. Falls back to
@@ -517,6 +544,7 @@ function VolumeCard({
 export function StorageHealth() {
   const [info, setInfo] = useState<StorageInfo | null>(null);
   const [health, setHealth] = useState<StorageHealthDto | null>(null);
+  const [enc, setEnc] = useState<EncryptionStatus | null>(null);
   const [metrics, setMetrics] = useState<SystemMetrics | null>(null);
   const [sysHealth, setSysHealth] = useState<SystemHealth | null>(null);
 
@@ -526,6 +554,7 @@ export function StorageHealth() {
     // leaves only that card unknown without logging (zero-console gate).
     api.storage(ctrl.signal).then(setInfo).catch(() => {});
     api.storageHealth(ctrl.signal).then(setHealth).catch(() => {});
+    api.encryptionStatus(ctrl.signal).then(setEnc).catch(() => {});
     api.systemMetrics(ctrl.signal).then(setMetrics).catch(() => {});
     api.systemHealth(ctrl.signal).then(setSysHealth).catch(() => {});
     return () => ctrl.abort();
@@ -559,6 +588,7 @@ export function StorageHealth() {
         </p>
       </header>
 
+      <EncryptionBanner enc={enc} />
       <RecordingBanner primary={primary} governor={info?.governor ?? null} />
 
       <SdCompositionCard primary={primary} dashcam={dashcam} media={media} />

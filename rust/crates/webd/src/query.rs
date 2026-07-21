@@ -7,8 +7,8 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use crate::daybucket::civil_day;
 use crate::dto::{
     AnalyticsDto, AngleDto, Bbox, ClipDto, DaySummary, DayTripCount, EventDto, EventTypeCount,
-    FolderClassStat, InstalledChimeDto, MediaItemDto, PrefDto, SeverityCount, TripDetailDto,
-    TripDto, TripPointDto, VideoStats,
+    EncryptionStatusDto, FolderClassStat, InstalledChimeDto, MediaItemDto, PrefDto, SeverityCount,
+    TripDetailDto, TripDto, TripPointDto, VideoStats,
 };
 use crate::polyline;
 use jiff::tz::TimeZone;
@@ -560,6 +560,37 @@ pub(crate) fn analytics(conn: &Connection) -> Result<AnalyticsDto, rusqlite::Err
     })
 }
 
+/// `GET /api/recording/encryption`: detect whether the newest cataloged clip is
+/// currently under `TeslaCam/EncryptedClips/`.
+pub(crate) fn encryption_status(conn: &Connection) -> Result<EncryptionStatusDto, rusqlite::Error> {
+    let latest_encrypted_at: Option<i64> = conn.query_row(
+        "SELECT MAX(started_at) FROM clips WHERE canonical_key LIKE '%/EncryptedClips/%'",
+        [],
+        |r| r.get(0),
+    )?;
+    let latest_plain_at: Option<i64> = conn.query_row(
+        "SELECT MAX(started_at) FROM clips WHERE canonical_key NOT LIKE '%/EncryptedClips/%'",
+        [],
+        |r| r.get(0),
+    )?;
+    let encrypted_clip_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM clips WHERE canonical_key LIKE '%/EncryptedClips/%'",
+        [],
+        |r| r.get(0),
+    )?;
+    let encrypting = match (latest_encrypted_at, latest_plain_at) {
+        (Some(encrypted), Some(plain)) => encrypted >= plain,
+        (Some(_), None) => true,
+        _ => false,
+    };
+    Ok(EncryptionStatusDto {
+        encrypting,
+        latest_encrypted_at,
+        latest_plain_at,
+        encrypted_clip_count,
+    })
+}
+
 /// Footage aggregates over `clips` ⋈ `angles` — totals plus a per-folder-class
 /// breakdown, all derived from indexed `size_bytes` (read-only; no filesystem
 /// walk). A clip with no angle rows still counts toward `total_clips` and its
@@ -1020,7 +1051,8 @@ mod tests {
     use crate::daybucket::{local_day_bounds, parse_tz};
 
     use super::{
-        Keyset, SnapshotResource, get_clip, list_chime_library, list_clips, list_days,
+        Keyset, SnapshotResource, encryption_status, get_clip, list_chime_library, list_clips,
+        list_days,
         list_days_tz, list_standalone_day_events, list_standalone_day_events_range, list_trips,
         list_trips_tz, snapshot_max_id,
     };
@@ -1049,6 +1081,16 @@ mod tests {
              is_sentry, duration_s, availability, created_at, updated_at) \
              VALUES (?1, ?2, ?3, ?4, 'slot0', 'SavedClips', 0, 60.0, 'present', 0, 0)",
             params![id, format!("clip-{id}"), started_at, started_at + 60],
+        )
+        .unwrap();
+    }
+
+    fn insert_clip_with_key(conn: &Connection, id: i64, canonical_key: &str, started_at: i64) {
+        conn.execute(
+            "INSERT INTO clips (id, canonical_key, started_at, ended_at, partition, folder_class, \
+             is_sentry, duration_s, availability, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, 'slot0', 'RecentClips', 0, 60.0, 'present', 0, 0)",
+            params![id, canonical_key, started_at, started_at + 60],
         )
         .unwrap();
     }
@@ -1204,6 +1246,50 @@ mod tests {
         let day = days.iter().find(|item| item.day == "1970-01-02").unwrap();
         assert_eq!(day.trip_count, 0);
         assert_eq!(day.event_count, 1);
+    }
+
+    #[test]
+    fn encryption_status_detects_current_encryption_and_self_clears() {
+        let conn = test_conn();
+
+        // (a) only plain clips
+        insert_clip_with_key(&conn, 1, "0:TeslaCam/RecentClips/2026-07-20_10-00-00", 100);
+        let plain_only = encryption_status(&conn).unwrap();
+        assert!(!plain_only.encrypting);
+        assert_eq!(plain_only.latest_encrypted_at, None);
+        assert_eq!(plain_only.latest_plain_at, Some(100));
+        assert_eq!(plain_only.encrypted_clip_count, 0);
+
+        // (b) plain at 100 then encrypted at 200
+        insert_clip_with_key(
+            &conn,
+            2,
+            "0:TeslaCam/EncryptedClips/RecentClips/2026-07-21_13-57-32",
+            200,
+        );
+        let encrypted_latest = encryption_status(&conn).unwrap();
+        assert!(encrypted_latest.encrypting);
+        assert_eq!(encrypted_latest.latest_encrypted_at, Some(200));
+        assert_eq!(encrypted_latest.latest_plain_at, Some(100));
+        assert_eq!(encrypted_latest.encrypted_clip_count, 1);
+
+        // (c) newer plain clip self-clears the warning
+        insert_clip_with_key(&conn, 3, "0:TeslaCam/RecentClips/2026-07-21_14-02-00", 300);
+        let self_cleared = encryption_status(&conn).unwrap();
+        assert!(!self_cleared.encrypting);
+        assert_eq!(self_cleared.latest_encrypted_at, Some(200));
+        assert_eq!(self_cleared.latest_plain_at, Some(300));
+        assert_eq!(self_cleared.encrypted_clip_count, 1);
+    }
+
+    #[test]
+    fn encryption_status_is_false_on_empty_catalog() {
+        let conn = test_conn();
+        let status = encryption_status(&conn).unwrap();
+        assert!(!status.encrypting);
+        assert_eq!(status.latest_encrypted_at, None);
+        assert_eq!(status.latest_plain_at, None);
+        assert_eq!(status.encrypted_clip_count, 0);
     }
 
     #[test]

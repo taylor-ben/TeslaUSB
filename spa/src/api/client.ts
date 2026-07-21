@@ -19,6 +19,7 @@ import type {
   Clip,
   ClipsParams,
   DaySummary,
+  EncryptionStatus,
   EventItem,
   EventsParams,
   GadgetStatus,
@@ -268,6 +269,9 @@ export const api = {
 
   storageHealth: (signal?: AbortSignal) =>
     getJson<StorageHealth>("/api/storage/health", signal),
+
+  encryptionStatus: (signal?: AbortSignal) =>
+    getJson<EncryptionStatus>("/api/recording/encryption", signal),
 
   wifiStatus: (signal?: AbortSignal) =>
     getJson<WifiStatus>("/api/wifi/status", signal),

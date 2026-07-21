@@ -273,6 +273,24 @@ pub(crate) struct AnalyticsDto {
     pub video_stats: VideoStats,
 }
 
+/// Dashcam-encryption detection (`GET /api/recording/encryption`).
+///
+/// Tesla firmware can encrypt dashcam clips at rest under
+/// `TeslaCam/EncryptedClips/`; `TeslaUSB` cannot decode or archive those.
+/// This reports whether the car is *currently* writing encrypted clips so
+/// the SPA can warn the operator to disable the setting.
+#[derive(Debug, Serialize)]
+pub(crate) struct EncryptionStatusDto {
+    /// True when the newest recorded clip is encrypted (car is encrypting now).
+    pub encrypting: bool,
+    /// `started_at` (epoch seconds) of the newest encrypted clip, or `None`.
+    pub latest_encrypted_at: Option<i64>,
+    /// `started_at` (epoch seconds) of the newest non-encrypted clip, or `None`.
+    pub latest_plain_at: Option<i64>,
+    /// Number of encrypted clips currently in the catalog.
+    pub encrypted_clip_count: i64,
+}
+
 /// One raw `prefs` row (`GET /api/settings`). Returned verbatim — `webd` does
 /// not interpret or reshape settings (those policies are owned by other
 /// services and are ASK-FIRST).
