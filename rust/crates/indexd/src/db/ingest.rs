@@ -364,9 +364,15 @@ fn register_clip_with_disposition(
     )?;
 
     if disposition == RegistrationDisposition::Live {
-        // FU-2 owns explicit finalization-aware un-quarantine. A LIVE register
-        // over an existing QUARANTINED row currently resurrects it; this is
-        // only reachable if candidate-selection exclusion is bypassed.
+        // QUARANTINED->LIVE self-heal (ADR-0005): retentiond's volume-source
+        // candidate seam re-offers every currently-stable RecentClips clip each
+        // cycle, and a `quarantined` durable marker allows retry (only a
+        // `complete_live` marker suppresses recopy). So once the car finalizes a
+        // segment that was copied mid-write, the driver re-copies it, the probe
+        // now passes, and it re-registers LIVE and reaches this branch -- which
+        // flips the QUARANTINED row to LIVE and promotes the angles to archive.
+        // The reverse direction (LIVE -> QUARANTINED) stays guarded above so a
+        // later premature copy can never demote an already-healthy clip.
         for angle in &registration.angles {
             upsert_angle_force_archive(
                 &tx,
@@ -1676,6 +1682,93 @@ mod tests {
             .unwrap();
         assert_eq!(view_kind, "archive");
         assert_eq!(file_ref, "archive/2026-06-19/clip-live-kept/front.mp4");
+    }
+
+    #[test]
+    fn register_archived_clip_over_quarantined_flips_to_live_and_promotes_angles() {
+        let mut conn = open_in_memory().unwrap();
+        let registration = archive_registration(
+            "slot0:TeslaCam/RecentClips/2026-06-19/clip-heal",
+            "archive/2026-06-19/clip-heal",
+            "archive/2026-06-19/clip-heal/front.mp4",
+        );
+        let clip_id = upsert_clip(
+            &conn,
+            &clip_facts(
+                "slot0:TeslaCam/RecentClips/2026-06-19/clip-heal",
+                1_718_805_600,
+                FolderClass::RecentClips,
+            ),
+        )
+        .unwrap();
+        upsert_angle_scan_preserving(
+            &conn,
+            clip_id,
+            &AngleFacts {
+                camera: "front".to_owned(),
+                file_ref: "TeslaCam/RecentClips/clip-heal/front.mp4".to_owned(),
+                view_kind: "ro_usb".to_owned(),
+                offset_ms: 0,
+                duration_s: Some(60.0),
+                size_bytes: Some(1024),
+            },
+        )
+        .unwrap();
+
+        // A premature (mid-write) copy is quarantined; the angle stays ro_usb.
+        let (q_clip_id, q_item_id) = register_quarantined_clip(&mut conn, &registration).unwrap();
+        assert_eq!(q_clip_id, clip_id);
+        let q_state: String = conn
+            .query_row(
+                "SELECT delete_state FROM archive_items WHERE id = ?1",
+                [q_item_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(q_state, "QUARANTINED");
+
+        // QUARANTINED->LIVE self-heal (ADR-0005 marker retry): once the car
+        // finalizes the segment the driver re-copies and re-registers LIVE. The
+        // reverse transition flips QUARANTINED -> LIVE and promotes the angle to
+        // archive, reusing the same rows.
+        let (live_clip_id, live_item_id) = register_archived_clip(&mut conn, &registration).unwrap();
+        assert_eq!(live_clip_id, clip_id);
+        assert_eq!(
+            live_item_id, q_item_id,
+            "the quarantined archive item is reused, not duplicated"
+        );
+
+        let (delete_state, durable): (String, i64) = conn
+            .query_row(
+                "SELECT delete_state, durable FROM archive_items WHERE id = ?1",
+                [live_item_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(delete_state, "LIVE");
+        assert_eq!(durable, 0);
+
+        let (view_kind, file_ref): (String, String) = conn
+            .query_row(
+                "SELECT view_kind, file_ref FROM angles WHERE clip_id = ?1 AND camera = 'front'",
+                [clip_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(view_kind, "archive");
+        assert_eq!(file_ref, "archive/2026-06-19/clip-heal/front.mp4");
+
+        for (table, expected) in [
+            ("clips", 1_i64),
+            ("angles", 1),
+            ("archive_items", 1),
+            ("archive_item_clips", 1),
+        ] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, expected, "row count for {table}");
+        }
     }
 
     #[test]

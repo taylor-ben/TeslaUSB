@@ -1532,9 +1532,9 @@ LUNs) is the single make-or-break that still needs the car.**
   `webd` 404), so a non-decodable copy is never served as a playable `archive` angle.
   Bytes are kept (zero clip loss); `remove_dest` stays reserved for copy failures.
   Fail-closed (old `indexd` rejects the verb → defer pending, never poison-dropped;
-  deploy `indexd` before `retentiond`). Re-archive loop prevented (candidate SELECT
-  excludes non-`DELETED` `archive_items`; pending `canonical_key` dedupe holds during
-  retry). Spec: `contracts/indexd-archive-register.md` §9. Verified (podman):
+  deploy `indexd` before `retentiond`). Re-archive loop prevented (durable
+  `complete_live` marker suppresses recopy for a matching `source_fingerprint`,
+  ADR-0005; pending `canonical_key` dedupe holds during retry). Spec: `contracts/indexd-archive-register.md` §9. Verified (podman):
   retentiond 126+14, indexd 68, teslausb-core 343 tests pass + clippy `-D warnings`
   clean; key test `archive_driver::tests::probe_error_routes_to_quarantine_without_copy_failure_or_remove`.
   Reviews: GPT-5.5 `moov-design-review` (design) + `moov-review`/`moov-review2` (diff).
@@ -1543,9 +1543,51 @@ LUNs) is the single make-or-break that still needs the car.**
   - [ ] **FU-1** — remediate clips force-promoted to `archive` *before* this gate
     (live clip-5 stubs stay playable-but-broken until a narrow Guard-A exception +
     re-validation driver downgrades them; low urgency, superseded at C3).
-  - [ ] **FU-2** — finalization-aware archiving + explicit `QUARANTINED→LIVE`
-    un-quarantine (gate selection on `mp4probe.complete`; allow re-archival when
-    source bytes change so a not-yet-finalized segment isn't permanently quarantined).
+  - [x] **FU-2** — **`QUARANTINED→LIVE` self-heal is already satisfied in production
+    (ADR-0005); no candidate-selection change was required.** The "permanently
+    quarantined" worry was true only of the pre-ADR-0004 SQLite candidate seam
+    (`retentiond::candidates::SqliteCandidateReader`, whose `SELECT` excluded every
+    non-`DELETED` `archive_items` row) — but **ADR-0005 retired that seam** and it now
+    has no production caller (dead code; see FU-2d). The shipped daemon enumerates
+    candidates directly from the volume image (`volume_source::VolumeCandidateSource`,
+    ADR-0005 §Decision.1) **level-triggered** (`select_stable_records` re-offers every
+    currently-stable clip each cycle) and dedups via durable archive markers where only
+    a `complete_live` marker suppresses recopy — a `quarantined` marker **always allows
+    retry** (ADR-0005 §Crash-isolation). So once the car finalizes a mid-write segment,
+    the driver re-copies it, the probe passes, it re-registers LIVE, and `indexd` flips
+    the `archive_items` row `QUARANTINED→LIVE` + promotes the angles in place
+    (`ingest::register_clip_with_disposition`; the reverse `LIVE→QUARANTINED` stays
+    guarded). Regression-locked by `indexd` test
+    `register_archived_clip_over_quarantined_flips_to_live_and_promotes_angles` (podman
+    `cargo test -p indexd` = 158 green, 2026-07-21). **Discovered via a Tier-3
+    doubt-driven review** (`fu2b-diff-review`, gpt-5.6-sol) that caught an initial fix
+    misdirected at the dead SQLite seam; that dead-code change was reverted, leaving only
+    the ingest regression test.
+  - [ ] **FU-2a** — *(deferred; churn-avoidance only, not a correctness fix)* gate
+    candidate selection on `mp4probe.complete` so a still-writing segment isn't copied
+    prematurely in the first place. Completeness isn't persisted per RecentClips angle
+    today (needs scannerd + a schema change). Low priority now that FU-2's self-heal
+    makes any premature quarantine transient.
+  - [ ] **FU-2c** — *(real follow-up, Tier-3 recording/archive path — needs a design
+    pass + GPT-5.5 second opinion + likely hardware validation)* **bound quarantine
+    retry in the marker path.** Because a `quarantined` marker always allows retry and
+    `select_stable_records` is level-triggered, a clip that is *stable but never becomes
+    decodable* (genuinely truncated/corrupt) is re-copied **and** re-quarantined **every
+    cycle forever** — wasted I/O + flash wear on the recording-critical `/data` card +
+    eviction pressure from repeatedly staging unusable bytes. Pre-existing ADR-0005
+    behavior, not a regression. Fix direction: gate `quarantined` retry on a
+    **`source_fingerprint` change** (retry only when the car actually wrote more — the
+    literal "allow re-archival when source bytes change" from the old FU-2 wording, but
+    in the *marker* path, not the dead SQLite seam) and/or a capped backoff + persisted
+    quarantine reason. Raised by `fu2b-diff-review` (gpt-5.6-sol) findings High-#2/#3.
+    (The review also flagged encrypted clips, but session HW evidence shows
+    `EncryptedClips` mp4s probe/stream fine, so the real trigger is corrupt/truncated
+    segments.) Clock-step (finding High-#4) applies to any time-based marker retry on
+    the RTC-less Pi — treat `now < updated_at` as expired.
+  - [ ] **FU-2d** — *(cleanup)* remove the dead pre-ADR-0004 SQLite candidate seam
+    `retentiond::candidates::SqliteCandidateReader` (+ its tests). ADR-0005 replaced it
+    with `VolumeCandidateSource`; it has no production caller. Left in place for now
+    (flagged, not silently deleted mid-lane).
   - [ ] **FU-3** — per-angle partial archive (archive good angles, quarantine only bad).
   - [ ] **FU-4** — quarantined-byte accounting metric (never auto-delete).
   - [ ] **FU-5** — strict nested-box extent validation in the MP4 probe, applied
