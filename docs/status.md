@@ -1548,6 +1548,15 @@ LUNs) is the single make-or-break that still needs the car.**
   on-device (catalog has 0 events / 0 GPS fixes); covered by UAT 66/66. The
   `ro_usb` test clips are 49 KB synthetic stubs (don't decode — data, not code;
   streaming/gate wiring proven 206/200).
+  **UPGRADED 2026-07-21 — synthetic-stub caveat RETIRED (proven live on real full-size
+  footage).** Against live webd `6a0630f6` (in-car, Sentry ON, recording untouched), the
+  fallback streamed a REAL 26 MB `ro_usb` clip (12010 `EncryptedClips/RecentClips/2026-07-21_11-05-29`,
+  camera `back`): `HEAD /stream` → **200** `video/mp4` `content-length:26390528` == catalog
+  (§5 dual size-gate passed), `Range: bytes=0-65535` → **206** `content-range bytes 0-65535/26390528`
+  with 57297/65536 non-zero real bytes. Archive control (clip 5811, disk) → 200 CL 26326240; bogus
+  clip/camera → **404** fail-closed. Also exercises the NEW Tesla `EncryptedClips/` path. webd has no
+  route to lun.0 bytes except the scannerd ReadFile socket ⇒ conclusive. Evidence: `files/hw-results.md`
+  (2026-07-21 "lun.0 ReadFile live-clip fallback" block).
 - [x] Switch camera angle (position preserved where possible). **(proven)**
 - [x] Navigate clips within an event (prev/next). **(A6b proven)**
 - [x] Telemetry HUD overlay (SEI: speed/gear/brake/throttle/steering/AP-FSD), synced. **(DONE + LIVE-VERIFIED 2026-07-14. The client-side path re-downloaded the whole 54–79 MB MP4 to parse SEI → dead over the in-car link; replaced by a server-side `webd` endpoint `GET /api/clips/{id}/telemetry?camera=` that SEI-walks on the Pi and returns KB of JSON; HUD repositioned to the top-center 2-row Tesla card + graceful "No telemetry" empty-state. `cargo test -p webd` 340/0 incl. 4 telemetry tests; full `trip-map`+`event-player` Playwright 90/90 both viewports; tsc/vite clean. webd endpoint + SPA live on `cybertruckusb.local`. Live-verified in headless Chromium against the device via the real route-click flow: HUD renders top-center + matches real SEI (clip 4493 `56 mph` == `sampleAt` at 5 timestamps) + time-syncs (clip 4441 `40→0→20→45 mph` across seeks, wheel rotates); H.264 decodes 2896×1876; screenshots 375+1280; no-SEI endpoint returns `[]` live; webd stable NRestarts=0, no panics. See the 2026-07-14 DONE block up top. Two non-blocking follow-ups noted (both benign): video-panel "Loading…" hang was DISPROVEN as a regression (fresh reload loads all tabs in ~130ms; only a wedged long-lived test tab hung) + webd transient connection-refusal is a symptom of the known scanner-storm load.)**
@@ -2292,6 +2301,11 @@ LUNs) is the single make-or-break that still needs the car.**
   only on bench; NOT proven on the live device, which is still single-LUN —
   gated:F1+C1)**
 - [ ] **#2** Recorded (live) TeslaCam clips readable for the map. **(gated:B1 then lun.0 ReadFile)**
+  **READ HALF PROVEN LIVE 2026-07-21** — a real 26 MB `ro_usb` clip streams through the lun.0
+  ReadFile fallback (exact catalog Content-Length, 206 range with real bytes, fail-closed 404s;
+  see the §4.9 fallback item + `files/hw-results.md`). Remaining for a full tick: the
+  browser-decode-on-the-map proof (Playwright — Chromium decodes a live `ro_usb` clip via the map
+  route-click overlay), which is **drive-gated** (device parked → no trips/GPS routes to click).
 - [ ] **#3** Media upload/delete ejects lun.1 only. **(partial: bench-proven;
   gated:F1+C1 for the live second LUN, and F4 read-drain)**
 - [ ] **#4** All media in images incl. chime library. **(gated:F3 + chime-lib move)**
