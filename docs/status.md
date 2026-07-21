@@ -2329,10 +2329,23 @@ LUNs) is the single make-or-break that still needs the car.**
   isn't built — closes when F3 + chime-lib move land)**
 - [x] **Atomic writes** (temp→fsync→validate→rename, car-readable perms). **(proven:
   gadgetd `install_file` atomic; `create_dir_all` parent fix proven on hw)**
-- [ ] **Filename safety** (reject `/`, `..`, NUL; per-category rules; reject symlinks). **(partial:
-  jail proven in gadgetd; per-category rules — verify each)**
-- [ ] **Validation/error codes:** 413 oversize, 400 bad, 404 missing, 409 dup, 500
-  IO, 503 not-impl; flash+redirect for forms, JSON for AJAX. **(partial: audit each route)**
+- [x] **Filename safety** (reject `/`, `..`, NUL; per-category rules; reject symlinks). **(verified
+  2026-07-21: jail proven in gadgetd; `sanitise_filename` rejects empty/`.`/`..`/>255 B/non-ASCII/NUL/`/`/`\`;
+  per-category validators enforced — boombox/chime-lib/lightshow `check_extension`, plates/wraps add
+  `validate_*_filename`+PNG magic+dimensions, music adds `validate_music_subpath` (rejects abs/`.`/`..`/NUL/`\`/ctrl),
+  chime dest is the fixed `LockChime.wav`; symlinks structurally impossible — uploads yield a bare sanitized
+  single-component name and `move_music` canonicalizes+jails under the media root)**
+- [x] **Validation/error codes:** 413 oversize, 400 bad, 404 missing, 409 dup, 500
+  IO, 503 not-impl; flash+redirect for forms, JSON for AJAX. **(reconciled 2026-07-21:
+  per-file byte-oversize now returns **413** `file_too_large`/`chime_too_large` at all 4 webd sites
+  (media_upload `read_file_upload` → boombox/lightshows/plates/wraps/chime-lib, chimes, music streamed +
+  move-source), aligning with axum's outer `DefaultBodyLimit` and the SPA `classifyMediaFailure` 413 branch;
+  **507** `insufficient_storage` retained for genuine disk exhaustion (music streamed staging headroom);
+  **422** retained by design for semantic validation (invalid_wav/png/dimensions/filename/timezone/mode)
+  and category count-caps (`*_full`/`batch_too_large`) — the SPA renders 400≡422 as the server's specific
+  message and 507 as generic-retryable, so those stay precise; flash+redirect is N/A on B-1 (JSON-only SPA,
+  no server-rendered forms). webd 457 tests pass incl. `install_chime_oversize_is_413_before_handoff`,
+  `boombox_upload_rejected_when_too_large`, `stream_file_field_to_tempfile_enforces_cap` asserting 413.)**
 - [ ] **Change propagation** (soft medium-change for dirs; re-enumeration for chime),
   never stalling TeslaCam. **(see §1.1)**
 

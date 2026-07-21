@@ -48,7 +48,7 @@ const CHIME_MAX_BYTES: usize = 1024 * 1024;
 /// route (8 MiB). Defense-in-depth above the 1 MiB logical cap: it bounds the
 /// total decoded multipart body (including the drain of any unexpected fields)
 /// while leaving the 1 MiB per-field guard as the binding oversize signal — so a
-/// realistically-too-large chime (1–8 MiB) is reported as `422 chime_too_large`
+/// realistically-too-large chime (1–8 MiB) is reported as `413 chime_too_large`
 /// rather than a generic body-limit rejection. A body above this ceiling is a
 /// `400 invalid_multipart` backstop.
 pub(crate) const CHIME_BODY_LIMIT: usize = 8 * 1024 * 1024;
@@ -116,7 +116,7 @@ pub(crate) async fn remove_chime(
 
 /// Read the single `file` field from the multipart body, enforcing the size cap
 /// incrementally. A missing `file` field is a `400`; a second `file` field is a
-/// `400`; exceeding [`CHIME_MAX_BYTES`] is a `422`. Unknown fields are drained
+/// `400`; exceeding [`CHIME_MAX_BYTES`] is a `413`. Unknown fields are drained
 /// and ignored. All reads happen BEFORE any staging or gadget round-trip.
 async fn read_chime_upload(mut multipart: Multipart) -> Result<Vec<u8>, ApiError> {
     let mut found: Option<Vec<u8>> = None;
@@ -138,7 +138,7 @@ async fn read_chime_upload(mut multipart: Multipart) -> Result<Vec<u8>, ApiError
             let projected = buf.len().saturating_add(chunk.len());
             if projected > CHIME_MAX_BYTES {
                 return Err(ApiError::status(
-                    StatusCode::UNPROCESSABLE_ENTITY,
+                    StatusCode::PAYLOAD_TOO_LARGE,
                     "chime_too_large",
                     format!("lock chime exceeds the {CHIME_MAX_BYTES}-byte limit"),
                 ));
@@ -151,7 +151,7 @@ async fn read_chime_upload(mut multipart: Multipart) -> Result<Vec<u8>, ApiError
 }
 
 /// Map a multipart decode error (malformed body or the body-limit backstop) to
-/// a `400`. The normal oversize path trips the `422` logical cap first; this is
+/// a `400`. The normal oversize path trips the `413` logical cap first; this is
 /// the hard-limit / protocol-error fallback.
 #[allow(clippy::needless_pass_by_value)] // by-value matches `Result::map_err`'s FnOnce
 fn map_multipart_err(err: MultipartError) -> ApiError {

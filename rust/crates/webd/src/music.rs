@@ -166,7 +166,7 @@ pub(crate) async fn stream_file_field_to_tempfile(
         if total + chunk.len() > max_bytes {
             while let Ok(Some(_)) = field.chunk().await {}
             return Err(ApiError::status(
-                StatusCode::UNPROCESSABLE_ENTITY,
+                StatusCode::PAYLOAD_TOO_LARGE,
                 "file_too_large",
                 format!("file exceeds {max_bytes} bytes"),
             ));
@@ -551,7 +551,7 @@ pub(crate) async fn move_music(
     }
     if meta.len() > MUSIC_MAX_BYTES as u64 {
         return Err(ApiError::status(
-            StatusCode::UNPROCESSABLE_ENTITY,
+            StatusCode::PAYLOAD_TOO_LARGE,
             "file_too_large",
             format!("source file exceeds {MUSIC_MAX_BYTES} bytes"),
         ));

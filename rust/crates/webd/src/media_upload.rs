@@ -61,7 +61,7 @@ pub(crate) fn plan_bulk_delete(dir: &str, names: &[String]) -> Result<Vec<String
 ///
 /// Unknown extra fields are drained and ignored (consistent with the chimes
 /// handler). A missing `file` field is `400 missing_file`; exceeding `max_bytes`
-/// is `422 file_too_large`.
+/// is `413 file_too_large`.
 pub(crate) async fn read_file_upload(
     mut multipart: Multipart,
     field_name: &str,
@@ -107,11 +107,11 @@ pub(crate) async fn read_file_upload(
                 // early while the client is still streaming the body causes the
                 // connection to be reset mid-upload, which the browser surfaces
                 // as a network failure ("couldn't reach the device") rather than
-                // the real 422. The remaining bytes are bounded by the route's
+                // the real 413. The remaining bytes are bounded by the route's
                 // `DefaultBodyLimit`, so this drain is cheap.
                 while let Ok(Some(_)) = stream.chunk().await {}
                 return Err(ApiError::status(
-                    StatusCode::UNPROCESSABLE_ENTITY,
+                    StatusCode::PAYLOAD_TOO_LARGE,
                     "file_too_large",
                     format!("file exceeds {max_bytes} bytes"),
                 ));

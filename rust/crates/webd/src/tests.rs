@@ -2935,15 +2935,15 @@ async fn install_chime_bad_reply_is_502_and_recorded_and_cleaned_up() {
 }
 
 #[tokio::test]
-async fn install_chime_oversize_is_422_before_handoff() {
+async fn install_chime_oversize_is_413_before_handoff() {
     let fx = chime_fixture(Reply::Json(
         json!({ "handoff_id": "h-1", "result": "done" }),
     ));
     // 1 MiB + 1 byte: over the logical cap but under the 2 MiB body limit, so the
-    // incremental size guard trips with 422 before any staging/handoff.
+    // incremental size guard trips with 413 before any staging/handoff.
     let oversize = vec![0u8; 1024 * 1024 + 1];
     let (status, body) = post_chime(&fx.app, multipart_body(&[("file", &oversize)])).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(body["error"]["code"], "chime_too_large");
     assert!(fx.last.lock().unwrap().is_none(), "gadgetd not contacted");
     assert!(staging_is_empty(&fx.staging), "no staged file");
@@ -3513,7 +3513,7 @@ async fn boombox_upload_rejected_when_too_large() {
     )
     .await;
 
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(body["error"]["code"], "file_too_large");
     assert!(fx.last.lock().unwrap().is_none(), "gadgetd not contacted");
 }
@@ -5308,7 +5308,7 @@ async fn stream_file_field_to_tempfile_enforces_cap() {
         .await
         .unwrap();
     let body: Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(body["error"]["code"], "file_too_large");
     drop(named);
     assert_dir_empty_or_absent(&staging);
