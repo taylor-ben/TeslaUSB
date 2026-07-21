@@ -24,9 +24,10 @@
 > card (**2.8 GB landed, quarantined `NoFtyp`**) and would drive the eviction governor to delete
 > genuine old *playable* footage to make room. Restored the known-good binary (`eae6a5be…`);
 > retentiond active, 0 failed, governor back to `AlreadyHealthy` steady-state, **no ciphertext
-> copied** going forward. The 2.8 GB of already-copied 07-21 ciphertext is **preserved** (not
-> auto-deleted); operator can reclaim it. Working tree reverted (fix NOT committed). Evidence:
-> `files/hw-results.md` (2026-07-21 EncryptedClips ROOT-CAUSE + rollback block).
+> copied** going forward. The 2.8 GB of already-copied 07-21 ciphertext was **reclaimed**
+> (2026-07-21, operator-consented; `mv`-aside→verify→`rm` under a GPT-5.5-reviewed plan — genuine
+> footage 07-13/07-14 intact, `/data` now 50 G free). Working tree reverted (fix NOT committed).
+> Evidence: `files/hw-results.md` (EncryptedClips ROOT-CAUSE + rollback + reclaim blocks).
 > **Follow-up (design separately, not started):** have TeslaUSB DETECT `EncryptedClips` presence
 > and surface an SPA warning ("your car is encrypting dashcam footage; TeslaUSB can't archive it
 > — disable Encrypt Dashcam Recordings"), using a distinct locked/encrypted archive state and
