@@ -1,5 +1,37 @@
 # TeslaUSB B-1 — Build Status (vs. `Requirements.md`)
 
+> ## 🔴 ROOT-CAUSED (2026-07-21) — dashcam footage "missing since 07-14" = Tesla firmware now ENCRYPTS clips at rest (NOT a TeslaUSB bug). Fix is in-car.
+>
+> **Symptom (operator's #1 pain):** archived dashcam video stops at 2026-07-14; recent
+> drives (e.g. the 07-19 Detroit trip) never appear in the archive.
+> **Root cause (definitive — catalog + raw-byte + web-confirmed):** a Tesla firmware update
+> (feature added 2026.20; installed on this car ~07-14) turned **ON** dashcam encryption. The
+> car now writes clips to `TeslaCam/EncryptedClips/RecentClips/` as **E2E-encrypted** files
+> (per-camera; small proprietary header incl. a `CONSOLE` marker + plaintext length, then a
+> uniform high-entropy payload — **zero** MP4 `ftyp`/`moov`/`mdat` boxes). scannerd parses
+> **0/185** of them (vs **3919/3922** of the legacy plain clips); every camera fails the MP4
+> playability probe (`NoFtyp`). **TeslaUSB cannot decode or archive these as playable video** —
+> decryption is only possible via the in-car Dashcam Viewer padlock or `dashcam.tesla.com` with
+> the linked Tesla account (keys are account-tied, not derivable offline). **A Tesla change, not
+> a TeslaUSB bug.**
+> **OPERATOR FIX (the real solution):** in the car → **Controls → Safety → Encrypt Dashcam
+> Recordings → OFF.** The car then resumes writing plain `.mp4` to `TeslaCam/RecentClips/` and
+> TeslaUSB archives normally again. Clips already recorded encrypted (07-14 → whenever it's
+> disabled) are viewable only via `dashcam.tesla.com`.
+> **Action taken (2026-07-21):** a one-file enumeration change that made retentiond copy the
+> `EncryptedClips` clips into the SD archive was **ROLLED BACK** — its premise (plain MP4 in a
+> new folder) was false; it was copying ~180 MB/clip of ciphertext into the recording-critical
+> card (**2.8 GB landed, quarantined `NoFtyp`**) and would drive the eviction governor to delete
+> genuine old *playable* footage to make room. Restored the known-good binary (`eae6a5be…`);
+> retentiond active, 0 failed, governor back to `AlreadyHealthy` steady-state, **no ciphertext
+> copied** going forward. The 2.8 GB of already-copied 07-21 ciphertext is **preserved** (not
+> auto-deleted); operator can reclaim it. Working tree reverted (fix NOT committed). Evidence:
+> `files/hw-results.md` (2026-07-21 EncryptedClips ROOT-CAUSE + rollback block).
+> **Follow-up (design separately, not started):** have TeslaUSB DETECT `EncryptedClips` presence
+> and surface an SPA warning ("your car is encrypting dashcam footage; TeslaUSB can't archive it
+> — disable Encrypt Dashcam Recordings"), using a distinct locked/encrypted archive state and
+> **never** storing Tesla credentials in retentiond.
+
 > ## 🔎 RECONCILIATION (2026-07-20) — C1 core (2-LUN acceptance) is PROVEN by the live system; build-order top items are stale
 >
 > A read-only survey of the live production card (`cybertruckusb.local`, the SAME
