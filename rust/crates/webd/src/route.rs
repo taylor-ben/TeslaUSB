@@ -30,6 +30,7 @@ use crate::dto::{
 };
 use crate::error::ApiError;
 use crate::gadget::{self, DeleteRefusal, MutationOutcome, TransportError};
+use crate::jobs;
 use crate::jobs::{JobEvent, JobState, JobStatus};
 use crate::{AppState, Catalog, query};
 
@@ -662,26 +663,46 @@ async fn delete_clip(
 /// directory is canonicalized so the returned guard's path is absolute (it is
 /// consumed by `gadgetd` in a different process), and symlinks in the ancestry
 /// are resolved. The returned guard unlinks the file when dropped.
-fn stage_upload(dir: &std::path::Path, bytes: &[u8]) -> std::io::Result<tempfile::NamedTempFile> {
+pub(crate) fn new_staging_tempfile(
+    dir: &std::path::Path,
+) -> std::io::Result<tempfile::NamedTempFile> {
     std::fs::create_dir_all(dir)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     }
-    // Canonicalize AFTER creation so `source_path` handed to gadgetd is absolute
-    // regardless of `WEBD_CACHE_DIR` being relative.
     let dir = std::fs::canonicalize(dir)?;
-    let mut tmp = tempfile::Builder::new()
+    tempfile::Builder::new()
         .prefix("upload-")
         .suffix(".partial")
-        .tempfile_in(&dir)?;
+        .tempfile_in(&dir)
+}
+
+fn stage_upload(dir: &std::path::Path, bytes: &[u8]) -> std::io::Result<tempfile::NamedTempFile> {
+    let mut tmp = new_staging_tempfile(dir)?;
     {
         use std::io::Write;
         tmp.as_file_mut().write_all(bytes)?;
         tmp.as_file_mut().sync_all()?;
     }
     Ok(tmp)
+}
+
+pub(crate) fn keep_staged_tempfile(
+    tmp: tempfile::NamedTempFile,
+) -> std::io::Result<(std::path::PathBuf, String)> {
+    let (_file, path) = tmp.keep().map_err(|e| e.error)?;
+    if let Some(source_path) = path.to_str() {
+        let source_path = source_path.to_owned();
+        Ok((path, source_path))
+    } else {
+        let _ = std::fs::remove_file(&path);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "staged path is not valid UTF-8",
+        ))
+    }
 }
 
 /// Stage `bytes` like [`stage_upload`], but DETACH the temp guard so the file
@@ -697,19 +718,7 @@ fn stage_upload_persistent(
     bytes: &[u8],
 ) -> std::io::Result<(std::path::PathBuf, String)> {
     let tmp = stage_upload(dir, bytes)?;
-    // `keep()` disarms the drop-unlink and yields the durable path.
-    let (_file, path) = tmp.keep().map_err(|e| e.error)?;
-    if let Some(source_path) = path.to_str() {
-        let source_path = source_path.to_owned();
-        Ok((path, source_path))
-    } else {
-        // A non-UTF-8 staging path can't be handed to gadgetd; don't leak it.
-        let _ = std::fs::remove_file(&path);
-        Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "staged path is not valid UTF-8",
-        ))
-    }
+    keep_staged_tempfile(tmp)
 }
 
 /// The disposition of an `enqueue_mutation` round-trip, surfaced from the
@@ -721,6 +730,39 @@ enum EnqueueResult {
     Transport(TransportError),
     /// Staging the upload to a durable blob failed before any `gadgetd` call.
     StagingFailed(String),
+}
+
+#[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+fn enqueue_staged_blob(
+    client: &dyn gadget::GadgetClient,
+    jobs: &jobs::JobHub,
+    job_id: u64,
+    kind: &'static str,
+    partition: u8,
+    rel_path: &str,
+    path: std::path::PathBuf,
+    source_path: String,
+) -> EnqueueResult {
+    let request = gadget::enqueue_install_request(partition, rel_path, &source_path);
+    match client.call(request) {
+        Ok(resp) => {
+            let outcome = gadget::map_queue_outcome(&resp);
+            if !matches!(outcome, gadget::QueueOutcome::Queued { .. }) {
+                let _ = std::fs::remove_file(&path);
+            }
+            jobs.publish_job(job_for_queue_outcome(job_id, kind, &outcome));
+            EnqueueResult::Outcome(outcome)
+        }
+        Err(transport) => {
+            let _ = std::fs::remove_file(&path);
+            jobs.publish_job(job_failed(
+                job_id,
+                kind,
+                format!("gadgetd transport: {transport:?}"),
+            ));
+            EnqueueResult::Transport(transport)
+        }
+    }
 }
 
 /// Generic p2-media install primitive (the frictionless write path): stage
@@ -762,31 +804,63 @@ pub(crate) async fn run_install(
                 return EnqueueResult::StagingFailed(detail);
             }
         };
-        let request = gadget::enqueue_install_request(partition, &rel_path, &source_path);
-        match client.call(request) {
-            Ok(resp) => {
-                let outcome = gadget::map_queue_outcome(&resp);
-                // gadgetd only takes ownership of the blob when it accepts the
-                // mutation; on any other outcome webd must unlink it.
-                if !matches!(outcome, gadget::QueueOutcome::Queued { .. }) {
-                    let _ = std::fs::remove_file(&path);
-                }
-                jobs.publish_job(job_for_queue_outcome(job_id, kind, &outcome));
-                EnqueueResult::Outcome(outcome)
-            }
-            Err(transport) => {
-                let _ = std::fs::remove_file(&path);
-                jobs.publish_job(job_failed(
-                    job_id,
-                    kind,
-                    format!("gadgetd transport: {transport:?}"),
-                ));
-                EnqueueResult::Transport(transport)
-            }
-        }
+        enqueue_staged_blob(
+            &*client,
+            &jobs,
+            job_id,
+            kind,
+            partition,
+            &rel_path,
+            path,
+            source_path,
+        )
     })
     .await;
 
+    match join {
+        Ok(EnqueueResult::Outcome(outcome)) => queue_outcome_to_response(&outcome),
+        Ok(EnqueueResult::Transport(transport)) => Err(transport_to_error(transport)),
+        Ok(EnqueueResult::StagingFailed(detail)) => Err(ApiError::status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "staging_failed",
+            detail,
+        )),
+        Err(_) => {
+            state.jobs.publish_job(job_failed(
+                job_id,
+                kind,
+                "blocking task join failed".to_owned(),
+            ));
+            Err(ApiError::Internal)
+        }
+    }
+}
+
+pub(crate) async fn run_install_staged(
+    state: AppState,
+    kind: &'static str,
+    partition: u8,
+    rel_path: String,
+    staged_path: std::path::PathBuf,
+    source_path: String,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let job_id = state.jobs.next_job_id();
+    state.jobs.publish_job(JobStatus::running(job_id, kind));
+    let client = state.gadget.clone();
+    let jobs = state.jobs.clone();
+    let join = tokio::task::spawn_blocking(move || {
+        enqueue_staged_blob(
+            &*client,
+            &jobs,
+            job_id,
+            kind,
+            partition,
+            &rel_path,
+            staged_path,
+            source_path,
+        )
+    })
+    .await;
     match join {
         Ok(EnqueueResult::Outcome(outcome)) => queue_outcome_to_response(&outcome),
         Ok(EnqueueResult::Transport(transport)) => Err(transport_to_error(transport)),

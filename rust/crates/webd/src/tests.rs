@@ -16,7 +16,9 @@
 
 use axum::Router;
 use axum::body::Body;
+use axum::extract::FromRequest;
 use axum::http::{Method, Request, StatusCode};
+use axum::response::IntoResponse;
 use http_body_util::BodyExt;
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
@@ -38,7 +40,7 @@ use crate::wifid_client::WifidClient;
 use crate::{
     Catalog, MediaConfig, build_router, router_with_all_clients,
     router_with_all_clients_and_read_client, router_with_clients, router_with_gadget,
-    router_with_wifid,
+    router_with_gadget_and_probe, router_with_wifid,
 };
 
 /// A live fixture: a seeded catalog + its router. `_dir` keeps the temp files
@@ -4696,6 +4698,8 @@ struct MusicFixture {
     calls: Arc<Mutex<Vec<Value>>>,
     /// Absolute path of the media-ro root; tests may seed additional files/dirs.
     media_ro: std::path::PathBuf,
+    /// Staging directory (`cache/media-staging`) used by music installs.
+    staging: std::path::PathBuf,
 }
 
 /// Build a music fixture with an optional set of pre-seeded media-ro files.
@@ -4703,6 +4707,55 @@ struct MusicFixture {
 /// `files` is a slice of `(relative-path, bytes)` pairs seeded under the
 /// media-ro root (e.g. `("Music/A/x.mp3", b"fake")`).
 fn music_fixture_with_media(files: &[(&str, &[u8])]) -> MusicFixture {
+    // Route the general music-install fixtures through an ample-space probe so
+    // `ensure_staging_headroom` (which now runs on every POST /api/music) stays
+    // deterministic regardless of the test runner's actual free disk space.
+    music_fixture_with_media_and_probe(files, ample_space_probe())
+}
+
+struct FakeSpaceProbe {
+    stat: Option<crate::sysinfo::FsStat>,
+}
+
+impl crate::sysinfo::SystemProbe for FakeSpaceProbe {
+    fn proc_file(&self, _name: &str) -> Option<String> {
+        None
+    }
+    fn statvfs(&self, _path: &std::path::Path) -> Option<crate::sysinfo::FsStat> {
+        self.stat
+    }
+    fn writable(&self, _path: &std::path::Path) -> bool {
+        false
+    }
+    fn udc_state(&self) -> Option<String> {
+        None
+    }
+    fn mount_for(&self, _path: &std::path::Path) -> Option<crate::sysinfo::MountInfo> {
+        None
+    }
+    fn read_file_string(&self, _path: &std::path::Path) -> Option<String> {
+        None
+    }
+}
+
+/// A `SystemProbe` reporting plenty of free space, for install-path fixtures that
+/// must not depend on the runner's actual disk fullness (or a `None` statvfs on
+/// non-Linux hosts).
+fn ample_space_probe() -> Arc<dyn crate::sysinfo::SystemProbe> {
+    Arc::new(FakeSpaceProbe {
+        stat: Some(crate::sysinfo::FsStat {
+            free_bytes: 400_u64 << 30,
+            total_bytes: 469_u64 << 30,
+            free_inodes: 1_000_000,
+            total_inodes: 1_000_000,
+        }),
+    })
+}
+
+fn music_fixture_with_media_and_probe(
+    files: &[(&str, &[u8])],
+    probe: Arc<dyn crate::sysinfo::SystemProbe>,
+) -> MusicFixture {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("catalog.db");
     {
@@ -4732,13 +4785,23 @@ fn music_fixture_with_media(files: &[(&str, &[u8])]) -> MusicFixture {
         reply: Reply::Json(json!({ "job_id": "m-1", "state": "queued" })),
         calls: Arc::clone(&calls),
     });
-    let app = router_with_gadget(catalog, static_dir, media, gadget);
+    let app = router_with_gadget_and_probe(catalog, static_dir, media, gadget, probe);
+    let staging = dir.path().join("cache").join("media-staging");
     MusicFixture {
         _dir: dir,
         app,
         calls,
         media_ro,
+        staging,
     }
+}
+
+fn assert_dir_empty_or_absent(path: &std::path::Path) {
+    if !path.exists() {
+        return;
+    }
+    let entries: Vec<std::fs::DirEntry> = std::fs::read_dir(path).unwrap().flatten().collect();
+    assert!(entries.is_empty(), "expected empty dir: {}", path.display());
 }
 /// POST a multipart body to `POST /api/music` and return `(status, json)`.
 async fn post_music(app: &Router, body: Vec<u8>) -> (StatusCode, Value) {
@@ -4772,9 +4835,7 @@ fn music_multipart_with_path(mp3_filename: &str, mp3_bytes: &[u8], path: &str) -
     let mut body = Vec::new();
     // Text "path" field — no filename in Content-Disposition.
     body.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
-    body.extend_from_slice(
-        format!("Content-Disposition: form-data; name=\"path\"\r\n\r\n").as_bytes(),
-    );
+    body.extend_from_slice(b"Content-Disposition: form-data; name=\"path\"\r\n\r\n");
     body.extend_from_slice(path.as_bytes());
     body.extend_from_slice(b"\r\n");
     // Binary "file" field.
@@ -4787,6 +4848,24 @@ fn music_multipart_with_path(mp3_filename: &str, mp3_bytes: &[u8], path: &str) -
     );
     body.extend_from_slice(b"Content-Type: audio/mpeg\r\n\r\n");
     body.extend_from_slice(mp3_bytes);
+    body.extend_from_slice(b"\r\n");
+    body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
+    body
+}
+
+fn music_multipart_file_then_path(mp3_filename: &str, mp3_bytes: &[u8], path: &str) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
+    body.extend_from_slice(
+        format!("Content-Disposition: form-data; name=\"file\"; filename=\"{mp3_filename}\"\r\n")
+            .as_bytes(),
+    );
+    body.extend_from_slice(b"Content-Type: audio/mpeg\r\n\r\n");
+    body.extend_from_slice(mp3_bytes);
+    body.extend_from_slice(b"\r\n");
+    body.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
+    body.extend_from_slice(b"Content-Disposition: form-data; name=\"path\"\r\n\r\n");
+    body.extend_from_slice(path.as_bytes());
     body.extend_from_slice(b"\r\n");
     body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
     body
@@ -5086,6 +5165,183 @@ async fn install_music_without_path_is_top_level() {
 
     let req = fx.last.lock().unwrap().clone().unwrap();
     assert_eq!(req["mutation"]["rel_path"], "Music/song.mp3");
+}
+
+#[tokio::test]
+async fn install_music_streams_and_enqueues_small_file() {
+    let fx = music_fixture_with_media(&[]);
+    let small = vec![b'Z'; 1024 * 1024];
+    let body = multipart_body_with_filename("track.mp3", &[("file", &small)]);
+    let (status, _) = post_music(&fx.app, body).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    let calls = fx.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    let req = &calls[0];
+    assert_eq!(req["mutation"]["op"], "install_file");
+    assert_eq!(req["mutation"]["rel_path"], "Music/track.mp3");
+    let source_path = req["mutation"]["source_path"].as_str().unwrap_or_default();
+    assert!(!source_path.is_empty());
+}
+
+#[tokio::test]
+async fn install_music_with_path_before_file() {
+    let fx = music_fixture_with_media(&[]);
+    let body = music_multipart_with_path("track.mp3", b"ID3\x00fake", "Artist");
+    let (status, _) = post_music(&fx.app, body).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    let calls = fx.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["mutation"]["rel_path"], "Music/Artist/track.mp3");
+}
+
+#[tokio::test]
+async fn install_music_with_file_before_path() {
+    let fx = music_fixture_with_media(&[]);
+    let body = music_multipart_file_then_path("track.mp3", b"ID3\x00fake", "Artist");
+    let (status, _) = post_music(&fx.app, body).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    let calls = fx.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["mutation"]["rel_path"], "Music/Artist/track.mp3");
+}
+
+#[tokio::test]
+async fn install_music_low_space_is_507_and_does_not_enqueue() {
+    let probe: Arc<dyn crate::sysinfo::SystemProbe> = Arc::new(FakeSpaceProbe {
+        stat: Some(crate::sysinfo::FsStat {
+            free_bytes: 200_u64 << 20,
+            total_bytes: 469_u64 << 30,
+            free_inodes: 1_000_000,
+            total_inodes: 1_000_000,
+        }),
+    });
+    let fx = music_fixture_with_media_and_probe(&[], probe);
+    let body = multipart_body_with_filename("track.mp3", &[("file", b"ID3\x00fake")]);
+    let (status, resp) = post_music(&fx.app, body).await;
+    assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
+    assert_eq!(resp["error"]["code"], "insufficient_storage");
+    assert!(fx.calls.lock().unwrap().is_empty(), "gadgetd not contacted");
+    assert_dir_empty_or_absent(&fx.staging);
+}
+
+#[tokio::test]
+async fn install_music_statvfs_none_is_507() {
+    let probe: Arc<dyn crate::sysinfo::SystemProbe> = Arc::new(FakeSpaceProbe { stat: None });
+    let fx = music_fixture_with_media_and_probe(&[], probe);
+    let body = multipart_body_with_filename("track.mp3", &[("file", b"ID3\x00fake")]);
+    let (status, resp) = post_music(&fx.app, body).await;
+    assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
+    assert_eq!(resp["error"]["code"], "insufficient_storage");
+    assert!(fx.calls.lock().unwrap().is_empty(), "gadgetd not contacted");
+}
+
+#[tokio::test]
+async fn install_music_ample_space_probe_enqueues() {
+    let probe: Arc<dyn crate::sysinfo::SystemProbe> = Arc::new(FakeSpaceProbe {
+        stat: Some(crate::sysinfo::FsStat {
+            free_bytes: 400_u64 << 30,
+            total_bytes: 469_u64 << 30,
+            free_inodes: 1_000_000,
+            total_inodes: 1_000_000,
+        }),
+    });
+    let fx = music_fixture_with_media_and_probe(&[], probe);
+    let body = multipart_body_with_filename("track.mp3", &[("file", b"ID3\x00fake")]);
+    let (status, _) = post_music(&fx.app, body).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(fx.calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn install_music_bad_extension_cleans_staged_temp() {
+    let fx = music_fixture_with_media(&[]);
+    let body = multipart_body_with_filename("song.txt", &[("file", b"small")]);
+    let (status, _) = post_music(&fx.app, body).await;
+    assert!(status.is_client_error());
+    assert!(fx.calls.lock().unwrap().is_empty(), "gadgetd not contacted");
+    assert_dir_empty_or_absent(&fx.staging);
+}
+
+#[test]
+fn headroom_ok_behaviors() {
+    let need = 256_u64 << 20;
+    let total = 469_u64 << 30;
+    let floor = (total / 20).max(1 << 30);
+    assert!(crate::music::headroom_ok(
+        need + floor + (10_u64 << 20),
+        total,
+        need,
+    ));
+    assert!(!crate::music::headroom_ok(need + floor - 1, total, need));
+    assert!(crate::music::headroom_ok(need + floor, total, need));
+    let tiny_total = 8_u64 << 30;
+    assert!(!crate::music::headroom_ok((1_u64 << 30) + need - 1, tiny_total, need));
+    assert!(crate::music::headroom_ok((1_u64 << 30) + need, tiny_total, need));
+}
+
+#[tokio::test]
+async fn stream_file_field_to_tempfile_enforces_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let staging = dir.path().join("media-staging");
+    let body = multipart_body_with_filename("track.mp3", &[("file", b"12345678901234567890")]);
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/music")
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={BOUNDARY}"),
+        )
+        .body(Body::from(body))
+        .unwrap();
+    let mut multipart = axum::extract::Multipart::from_request(req, &()).await.unwrap();
+    let field = multipart.next_field().await.unwrap().unwrap();
+    let named = crate::route::new_staging_tempfile(&staging).unwrap();
+    let err = crate::music::stream_file_field_to_tempfile(field, &named, 8)
+        .await
+        .unwrap_err();
+    let resp = err.into_response();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(body["error"]["code"], "file_too_large");
+    drop(named);
+    assert_dir_empty_or_absent(&staging);
+}
+
+#[tokio::test]
+async fn read_bounded_text_rejects_oversize() {
+    let mut body = Vec::new();
+    body.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
+    body.extend_from_slice(b"Content-Disposition: form-data; name=\"path\"\r\n\r\n");
+    body.extend_from_slice(b"12345678901234567890");
+    body.extend_from_slice(b"\r\n");
+    body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/music")
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={BOUNDARY}"),
+        )
+        .body(Body::from(body))
+        .unwrap();
+    let mut multipart = axum::extract::Multipart::from_request(req, &()).await.unwrap();
+    let field = multipart.next_field().await.unwrap().unwrap();
+    let err = crate::music::read_bounded_text(field, 8).await.unwrap_err();
+    let resp = err.into_response();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "field_too_large");
 }
 
 // ── nested delete ──────────────────────────────────────────────────────────

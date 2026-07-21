@@ -213,6 +213,7 @@ export interface ChimeHandoffResult {
 
 /** Logical lock-chime size cap mirrored from webd's `CHIME_MAX_BYTES` (1 MiB). */
 export const CHIME_MAX_BYTES = 1024 * 1024;
+export const MUSIC_MAX_BYTES = 256 * 1024 * 1024;
 
 export const api = {
   days: (tz?: string, signal?: AbortSignal) =>
@@ -482,6 +483,13 @@ export const api = {
     signal?: AbortSignal,
     folder?: string,
   ): Promise<MediaHandoffResult> => {
+    if (file.size > MUSIC_MAX_BYTES) {
+      throw new ApiError(
+        413,
+        "file_too_large",
+        "Music file exceeds the 256 MiB limit.",
+      );
+    }
     const form = new FormData();
     form.append("file", file, "name" in file ? file.name : "track.mp3");
     if (folder) form.append("path", folder);

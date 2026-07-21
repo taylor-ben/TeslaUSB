@@ -8,7 +8,7 @@
 //! and remove directories; the move endpoint relocates a file within `Music/`;
 //! the nested-delete endpoint bulk-removes arbitrary-depth files in one handoff.
 //!
-//! Accepted formats: `.mp3`, `.flac`, `.wav`, `.aac`, `.m4a` (≤ 10 MiB).
+//! Accepted formats: `.mp3`, `.flac`, `.wav`, `.aac`, `.m4a` (≤ 256 MiB).
 
 use axum::Json;
 use axum::extract::{Multipart, Path, State};
@@ -22,15 +22,21 @@ use crate::error::ApiError;
 use crate::media_upload::{
     BulkDeleteRequest, MAX_BULK_DELETE, check_extension, plan_bulk_delete, sanitise_filename,
 };
+use crate::sysinfo::SystemProbe;
 
 const PARTITION_MEDIA: u8 = 2;
 const MUSIC_DIR: &str = "Music";
 
-/// Maximum accepted music file size (10 MiB).
-const MUSIC_MAX_BYTES: usize = 10 * 1024 * 1024;
+/// Maximum accepted music file size — the real gadgetd `install_file` ceiling
+/// (`MAX_INSTALL_BYTES` in gadgetd/mutate.rs). gadgetd's check is strict `>`, so
+/// exactly 256 MiB passes.
+const MUSIC_MAX_BYTES: usize = 256 * 1024 * 1024;
 
-/// Axum `DefaultBodyLimit` for the POST route (32 MiB — defence-in-depth).
-pub(crate) const MUSIC_BODY_LIMIT: usize = 32 * 1024 * 1024;
+/// Axum `DefaultBodyLimit` for the POST route (file cap + multipart framing
+/// headroom — defence-in-depth; the incremental file cap fires first at exactly
+/// `MUSIC_MAX_BYTES`).
+pub(crate) const MUSIC_BODY_LIMIT: usize = MUSIC_MAX_BYTES + 8 * 1024 * 1024;
+const MUSIC_PATH_FIELD_MAX: usize = 4096;
 
 const MUSIC_EXTENSIONS: &[&str] = &["mp3", "flac", "wav", "aac", "m4a"];
 
@@ -141,6 +147,111 @@ pub(crate) async fn list_music(
     Ok(Json(MediaListDto { items }))
 }
 
+pub(crate) async fn stream_file_field_to_tempfile(
+    mut field: axum::extract::multipart::Field<'_>,
+    named: &tempfile::NamedTempFile,
+    max_bytes: usize,
+) -> Result<(), ApiError> {
+    use tokio::io::AsyncWriteExt;
+    let std_file = named.reopen().map_err(|_| ApiError::Internal)?;
+    let mut out = tokio::fs::File::from_std(std_file);
+    let mut total: usize = 0;
+    while let Some(chunk) = field.chunk().await.map_err(|e| {
+        ApiError::status(
+            StatusCode::BAD_REQUEST,
+            "invalid_multipart",
+            format!("read error: {e}"),
+        )
+    })? {
+        if total + chunk.len() > max_bytes {
+            while let Ok(Some(_)) = field.chunk().await {}
+            return Err(ApiError::status(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "file_too_large",
+                format!("file exceeds {max_bytes} bytes"),
+            ));
+        }
+        out.write_all(&chunk).await.map_err(|_| ApiError::Internal)?;
+        total += chunk.len();
+    }
+    out.flush().await.map_err(|_| ApiError::Internal)?;
+    out.sync_all().await.map_err(|_| ApiError::Internal)?;
+    Ok(())
+}
+
+pub(crate) async fn read_bounded_text(
+    mut field: axum::extract::multipart::Field<'_>,
+    max: usize,
+) -> Result<String, ApiError> {
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = field.chunk().await.map_err(|e| {
+        ApiError::status(
+            StatusCode::BAD_REQUEST,
+            "invalid_multipart",
+            format!("read error: {e}"),
+        )
+    })? {
+        if buf.len() + chunk.len() > max {
+            while let Ok(Some(_)) = field.chunk().await {}
+            return Err(ApiError::status(
+                StatusCode::BAD_REQUEST,
+                "field_too_large",
+                format!("field exceeds {max} bytes"),
+            ));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    String::from_utf8(buf).map_err(|_| {
+        ApiError::status(
+            StatusCode::BAD_REQUEST,
+            "invalid_field",
+            "field is not valid UTF-8".to_owned(),
+        )
+    })
+}
+
+async fn drain_field(mut field: axum::extract::multipart::Field<'_>) {
+    while let Ok(Some(_)) = field.chunk().await {}
+}
+
+pub(crate) fn headroom_ok(free_bytes: u64, total_bytes: u64, need: u64) -> bool {
+    let floor = (total_bytes / 20).max(1 << 30);
+    free_bytes >= need.saturating_add(floor)
+}
+
+fn existing_ancestor(p: &std::path::Path) -> Option<&std::path::Path> {
+    let mut cur = Some(p);
+    while let Some(c) = cur {
+        if c.exists() {
+            return Some(c);
+        }
+        cur = c.parent();
+    }
+    None
+}
+
+fn ensure_staging_headroom(state: &AppState, need: u64) -> Result<(), ApiError> {
+    let root = state.media.archive_root_path();
+    let probe_path = existing_ancestor(&root).unwrap_or(root.as_path());
+    let probe: &dyn SystemProbe = &*state.sys.probe;
+    let Some(stat) = probe.statvfs(probe_path) else {
+        return Err(ApiError::status(
+            StatusCode::INSUFFICIENT_STORAGE,
+            "insufficient_storage",
+            "cannot determine free space; refusing upload to protect recording".to_owned(),
+        ));
+    };
+    if headroom_ok(stat.free_bytes, stat.total_bytes, need) {
+        Ok(())
+    } else {
+        Err(ApiError::status(
+            StatusCode::INSUFFICIENT_STORAGE,
+            "insufficient_storage",
+            "not enough free space to store this file".to_owned(),
+        ))
+    }
+}
+
 /// `POST /api/music` — install a music file, optionally into a subdirectory.
 ///
 /// Accepts a multipart body with a required `file` field and an optional `path`
@@ -151,8 +262,17 @@ pub(crate) async fn install_music(
     State(state): State<AppState>,
     mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let mut raw_name: Option<String> = None;
-    let mut file_bytes: Option<Vec<u8>> = None;
+    let _permit = state
+        .upload_sem
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| ApiError::Internal)?;
+
+    ensure_staging_headroom(&state, MUSIC_MAX_BYTES as u64)?;
+
+    let staging = state.media.staging_dir();
+    let mut staged: Option<(tempfile::NamedTempFile, String)> = None;
     let mut subfolder: Option<String> = None;
 
     while let Some(field) = multipart.next_field().await.map_err(|e| {
@@ -165,64 +285,36 @@ pub(crate) async fn install_music(
         let field_name = field.name().unwrap_or("").to_owned();
         match field_name.as_str() {
             "file" => {
-                if file_bytes.is_some() {
+                if staged.is_some() {
                     return Err(ApiError::status(
                         StatusCode::BAD_REQUEST,
                         "invalid_multipart",
                         "duplicate 'file' field",
                     ));
                 }
-                let fname =
-                    field.file_name().map_or_else(|| "upload".to_owned(), str::to_owned);
-                let mut buf = Vec::with_capacity(4096);
-                let mut stream = field;
-                while let Some(chunk) = stream.chunk().await.map_err(|e| {
-                    ApiError::status(
-                        StatusCode::BAD_REQUEST,
-                        "invalid_multipart",
-                        format!("read error: {e}"),
-                    )
-                })? {
-                    if buf.len() + chunk.len() > MUSIC_MAX_BYTES {
-                        return Err(ApiError::status(
-                            StatusCode::UNPROCESSABLE_ENTITY,
-                            "file_too_large",
-                            format!("file exceeds {MUSIC_MAX_BYTES} bytes"),
-                        ));
-                    }
-                    buf.extend_from_slice(&chunk);
-                }
-                file_bytes = Some(buf);
-                raw_name = Some(fname);
+                let fname = field.file_name().map_or_else(|| "upload".to_owned(), str::to_owned);
+                let named =
+                    crate::route::new_staging_tempfile(&staging).map_err(|_| ApiError::Internal)?;
+                stream_file_field_to_tempfile(field, &named, MUSIC_MAX_BYTES).await?;
+                staged = Some((named, fname));
             }
             "path" => {
-                let text = field.text().await.map_err(|e| {
-                    ApiError::status(
-                        StatusCode::BAD_REQUEST,
-                        "invalid_multipart",
-                        format!("multipart error: {e}"),
-                    )
-                })?;
+                let text = read_bounded_text(field, MUSIC_PATH_FIELD_MAX).await?;
                 if subfolder.is_none() {
                     subfolder = Some(text);
                 }
             }
-            _ => {
-                let _ = field.bytes().await;
-            }
+            _ => drain_field(field).await,
         }
     }
 
-    let (raw_name, bytes) = match (raw_name, file_bytes) {
-        (Some(n), Some(b)) => (n, b),
-        _ => {
-            return Err(ApiError::status(
-                StatusCode::BAD_REQUEST,
-                "missing_file",
-                "expected a 'file' multipart field",
-            ))
-        }
-    };
+    let (named, raw_name) = staged.ok_or_else(|| {
+        ApiError::status(
+            StatusCode::BAD_REQUEST,
+            "missing_file",
+            "expected a 'file' multipart field",
+        )
+    })?;
 
     let name = sanitise_filename(&raw_name)?;
     check_extension(&name, MUSIC_EXTENSIONS)?;
@@ -234,7 +326,18 @@ pub(crate) async fn install_music(
         format!("{MUSIC_DIR}/{name}")
     };
 
-    crate::route::run_install(state, "music_install", PARTITION_MEDIA, rel_path, bytes).await
+    let (staged_path, source_path) =
+        crate::route::keep_staged_tempfile(named).map_err(|_| ApiError::Internal)?;
+
+    crate::route::run_install_staged(
+        state,
+        "music_install",
+        PARTITION_MEDIA,
+        rel_path,
+        staged_path,
+        source_path,
+    )
+    .await
 }
 
 /// `DELETE /api/music/:name` — remove a top-level music file.

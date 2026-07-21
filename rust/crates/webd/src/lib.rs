@@ -78,6 +78,10 @@ use tokio::sync::Semaphore;
 /// Maximum number of clip-zip exports built concurrently. Bounds blocking-pool
 /// and cache-filesystem pressure from a burst of `GET /api/clips/{id}/export`.
 const MAX_CONCURRENT_EXPORTS: usize = 2;
+/// Only one media install may stage its (up to 256 MiB) blob at a time, so the
+/// pre-stage free-space check is race-free and concurrent uploads can't jointly
+/// exhaust the recording-critical /data card.
+const MAX_CONCURRENT_INSTALL_STAGES: usize = 1;
 
 /// Shared handler state: the read-only catalog handle plus the media config,
 /// export concurrency limiter, system-probe handle, and the `gadgetd` control
@@ -89,6 +93,7 @@ struct AppState {
     catalog: Catalog,
     media: MediaConfig,
     export_sem: Arc<Semaphore>,
+    upload_sem: Arc<Semaphore>,
     sys: SysHandle,
     gadget: Arc<dyn gadget::GadgetClient>,
     scheduler: Arc<dyn scheduler::SchedulerClient>,
@@ -200,6 +205,29 @@ fn router_with_wifid(
     )
 }
 
+#[cfg(test)]
+fn router_with_gadget_and_probe(
+    catalog: Catalog,
+    static_dir: PathBuf,
+    media: MediaConfig,
+    gadget: Arc<dyn gadget::GadgetClient>,
+    probe: Arc<dyn sysinfo::SystemProbe>,
+) -> Router {
+    router_with_all_clients_and_read_client_and_probe(
+        catalog,
+        static_dir,
+        media,
+        gadget,
+        scheduler::default_client(default_scheduler_sock()),
+        indexd_client::default_client(default_indexd_sock()),
+        default_read_client(),
+        default_stats_client(),
+        wifid_client::default_client(default_wifid_sock()),
+        default_chime_library_dir(),
+        probe,
+    )
+}
+
 /// The default `schedulerd` control-socket path (overridable via
 /// `WEBD_SCHEDULERD_SOCK`).
 fn default_scheduler_sock() -> PathBuf {
@@ -302,7 +330,7 @@ fn default_stats_client() -> Arc<dyn stats_client::VolumeStatsClient + Send + Sy
 }
 
 #[allow(clippy::too_many_arguments)]
-fn router_with_all_clients_and_read_client(
+fn router_with_all_clients_and_read_client_and_probe(
     catalog: Catalog,
     static_dir: PathBuf,
     media: MediaConfig,
@@ -313,9 +341,10 @@ fn router_with_all_clients_and_read_client(
     stats_client: Arc<dyn stats_client::VolumeStatsClient + Send + Sync>,
     wifid: Arc<dyn wifid_client::WifidClient>,
     chime_library_dir: PathBuf,
+    probe: Arc<dyn sysinfo::SystemProbe>,
 ) -> Router {
     let sys = SysHandle {
-        probe: Arc::new(sysinfo::LinuxProbe),
+        probe,
         paths: Arc::new(sysinfo::SysPaths {
             archive_root: media.archive_root_path(),
             worker_health_file: std::env::var_os("WEBD_WORKER_HEALTH_FILE")
@@ -337,6 +366,7 @@ fn router_with_all_clients_and_read_client(
         catalog,
         media,
         export_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_EXPORTS)),
+        upload_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_INSTALL_STAGES)),
         sys,
         gadget,
         scheduler,
@@ -353,4 +383,32 @@ fn router_with_all_clients_and_read_client(
         chime_enforcer::spawn(state.clone());
     }
     route::router(state, static_dir)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn router_with_all_clients_and_read_client(
+    catalog: Catalog,
+    static_dir: PathBuf,
+    media: MediaConfig,
+    gadget: Arc<dyn gadget::GadgetClient>,
+    scheduler: Arc<dyn scheduler::SchedulerClient>,
+    indexd: Arc<dyn indexd_client::IndexdClient>,
+    read_client: Arc<dyn read_client::ReadFileClient + Send + Sync>,
+    stats_client: Arc<dyn stats_client::VolumeStatsClient + Send + Sync>,
+    wifid: Arc<dyn wifid_client::WifidClient>,
+    chime_library_dir: PathBuf,
+) -> Router {
+    router_with_all_clients_and_read_client_and_probe(
+        catalog,
+        static_dir,
+        media,
+        gadget,
+        scheduler,
+        indexd,
+        read_client,
+        stats_client,
+        wifid,
+        chime_library_dir,
+        Arc::new(sysinfo::LinuxProbe),
+    )
 }

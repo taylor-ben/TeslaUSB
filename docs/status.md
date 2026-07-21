@@ -1809,6 +1809,32 @@ LUNs) is the single make-or-break that still needs the car.**
   music.spec.ts` incl. mocked-list player test asserting preload=none + encoded src +
   cache-bust + NO content-fetch on render; 14 passed, clean console/network)**
 - [ ] Upload `.mp3/.flac/.wav/.aac/.m4a`, up to **2 GB**, **16 MB chunked** upload. **(gated: chunked-upload backend — Tier-C remainder A1/A2)**
+  - **(2026-07-21: streamed single-shot ceiling raised 10 MiB → 256 MiB + memory-safety fix + disk-exhaustion guards — honest partial toward the "2 GB" headline; box stays `[ ]`.)**
+    `POST /api/music` previously buffered the WHOLE upload in a `Vec<u8>` in RAM (OOM risk) and
+    capped it at 10 MiB. Now it streams the multipart `file` field straight to a durable staging
+    tempfile (`stream_file_field_to_tempfile` via `reopen()`+`flush`+`sync_all`) — never >~one
+    network chunk in RAM — capped at **256 MiB**, the real gadgetd `MAX_INSTALL_BYTES` ceiling
+    (strict `>`, so exactly 256 MiB passes; gadgetd unchanged). Recording-card protection:
+    `ensure_staging_headroom` statvfs's the nearest existing ancestor of the archive root and
+    refuses with **507** (fail-closed on `None`) unless `max(1 GiB, 5% of card)` stays free after
+    the file; a permits=1 `upload_sem` serializes install stages so the free-space check is
+    race-free and two concurrent large uploads can't jointly exhaust `/data`. The `path` field is
+    bounded (4096, 400) and unknown fields drained O(1). route.rs DRY-refactored
+    (`new_staging_tempfile`/`keep_staged_tempfile`/`enqueue_staged_blob`/`run_install_staged`);
+    `run_install` behavior preserved byte-for-byte. SPA: `client.ts` pre-checks `file.size` (413)
+    and `useMediaCategory` maps 507/`insufficient_storage` → "Not enough space…" (retryable).
+    Gates (podman warm vols): `cargo test -p webd` **455 passed** incl. new streaming / cap→422 /
+    507-fail-closed / statvfs-None / path-order / bad-extension-cleans-temp tests + cheap
+    cap-parameterized unit tests (no 256 MiB body); clippy **zero new** (180 ≤ 182 baseline);
+    SPA `tsc --noEmit` + `vite build` clean. Code review (gpt-5-class, adversarial on the 7
+    security axes) found **no production defects**; reconciled 1 low test-robustness item
+    (general-path music fixtures now use an ample-space probe so unit tests don't couple to the
+    runner's free disk). **Deferred (why):** true 2 GB chunked/resumable is architecturally
+    blocked — media writes land only in the ~5 s cold-window LUN eject and `media.img` is ~1 GiB,
+    so it needs the extended-handoff + §4.11 `media.img` resize + a car-parked gate. **CI/HW-gate:**
+    E2E music-upload Playwright UAT + live ≤256 MiB round-trip stay CI/hardware-gated — the UAT
+    harness needs a locally-built `webd` (unix-socket crates don't build on the Windows bench) and
+    the binary isn't deployed yet.)**
   - **(2026-06-17: drag-and-drop + multi-file selection now work.** The drop zone was a
     styled div with no DnD handlers and a single-file input. Wired real
     `onDragOver/Enter/Leave/Drop` (reads `dataTransfer.files`, `.dragging` highlight) +

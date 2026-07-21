@@ -61,6 +61,12 @@ export function classifyMediaFailure(err: unknown): MediaFailure {
         retryable: false,
       };
     }
+    if (err.status === 507 || err.code === "insufficient_storage") {
+      return {
+        message: "Not enough space on the device to store this file.",
+        retryable: true,
+      };
+    }
     if (err.status === 400 || err.status === 422) {
       return { message: err.message, retryable: false };
     }
