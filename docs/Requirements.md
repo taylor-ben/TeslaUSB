@@ -312,21 +312,19 @@ The user can:
   libs) and atomically published to the wraps folder; appears in the list.
 - **Delete** wraps (including bulk delete). *Outcome:* removed from the wraps folder.
 
-**License Plates** — this page has **two distinct functions** in v1:
+**License Plates** — **custom plate images** the car can display:
 
-1. **Custom plate images** the car can display:
-   - **List with thumbnails**, **upload**, **delete** plate **PNGs**: **`.png`
-     only**, **≤ 512 KB**, dimensions **exactly 420×200 (NA)** or **420×100 (EU/Italy)**,
-     filename **≤ 32 alphanumeric chars** (no spaces/dashes/underscores), **up to 10**
-     plates. *Outcome:* validated and atomically published to the license-plate
-     folder; clear error if dimensions/size/name/count are wrong.
-2. **Tracked-plate list (privacy / redaction):** a small database of plate strings
-   the user wants the system to recognize.
-   - **Add / edit / delete** tracked plates (plate text normalized to uppercase
-     alphanumeric ≤ 16 chars; optional label ≤ 64 and notes ≤ 240; duplicates
-     rejected). **Bulk delete** supported.
-   - **Toggle plate redaction** on/off. *Outcome:* the redaction setting is saved
-     and applied by downstream processing.
+- **List with thumbnails**, **upload**, **delete** plate **PNGs**: **`.png`
+  only**, **≤ 512 KB**, dimensions **exactly 420×200 (NA)** or **420×100 (EU/Italy)**,
+  filename **≤ 32 alphanumeric chars** (no spaces/dashes/underscores), **up to 10**
+  plates. *Outcome:* validated and atomically published to the license-plate
+  folder; clear error if dimensions/size/name/count are wrong.
+
+> **Removed from scope 2026-07-21 (operator decision):** an earlier draft of this
+> section listed a second "tracked-plate list (privacy / redaction)" function. It is
+> **not** in v1 (`scripts/web/templates/license_plates.html` has zero tracked-plate or
+> redaction code) and nothing downstream would consume the redaction toggle, so it is
+> dropped rather than built as a form wired to nothing.
 
 > Both wraps and plate images are **atomically published** (write-temp → fsync →
 > rename, `chmod 0644`) so a successful upload can never leave a torn file the car

@@ -24,10 +24,10 @@
 > Lock Chimes page" (§4.5) is essentially **complete** on the bench (active card,
 > library playback, upload, delete, rename, edit/re-trim, set-active, groups, schedules,
 > random-mode all `[x]`). So the first genuinely-open *new* bench work is later in the
-> list. **§4.9 "Tracked-plate list (privacy/redaction)" is de-prioritized as
-> speculative** — v1 has NO tracked-plate string list / redaction / ALPR feature to port
-> and there is no downstream consumer of the toggle; building it now would be a CRUD list
-> + a boolean nothing reads (violates the charter's "nothing speculative"). **RESOLVED
+> list. **§4.9 "Tracked-plate list (privacy/redaction)" — REMOVED from scope
+> (operator decision 2026-07-21).** Confirmed NOT in v1 (`license_plates.html` has zero
+> tracked-plate/redaction code) with no downstream consumer of the toggle; dropped from
+> `Requirements.md` §4.9 rather than built as a form wired to nothing. **RESOLVED
 > (2026-07-20): the §4.9 *plate-image* spec drift is corrected.** Online research (Tesla
 > `custom-wraps` repo issue #13 + Cybertruck Owners Club, car-proven on Cybertruck/Model Y
 > 2025.44.25.1) confirmed the real Tesla spec = v1's shipped values: **420×200 (NA)/
@@ -1053,7 +1053,7 @@ green). What remains in the list below is one of: (a) **live-hardware foundation
 (Phase 0 F1–F6, operator-run via `hardware-test`); (b) **gated backends** (cloud
 sync §4.14, WiFi §4.16 — need their daemon serve loops); or (c) **new
 full-stack features** that need a webd route **+ SPA screen + Playwright** (LightShow
-"set active" §4.10:324, Tracked-plate list §4.9:344, Chime rename §4.5:278). Each (c)
+"set active" §4.10:324, Chime rename §4.5:278). Each (c)
 is a multi-surface lane — pick ONE and run the full Opus→mai→GPT-5.5→Playwright loop.
 `chimelib-to-img` (req #4) stays NOT autonomous (needs F5 write path + hardware).
 Confirm direction with the operator before starting a gated/Tier-C migration.
@@ -1924,8 +1924,6 @@ LUNs) is the single make-or-break that still needs the car.**
   drag/resize, live preview, `toBlob` PNG export. Playwright 30/30 both viewports (375+1280) —
   compliant-bypass, crop-confirm, region-toggle, cancel; cropper modal visually verified
   clean at 375px. v1 parity ported from `origin/main:scripts/web/templates/license_plates.html`.)**
-- [ ] **Tracked-plate list (privacy/redaction):** add/edit/delete (uppercase ≤16,
-  label ≤64, notes ≤240, dedupe), bulk delete, redaction toggle. **(not started)**
 
 ### 4.10 Cloud Archive — `Requirements.md` §4.10
 
