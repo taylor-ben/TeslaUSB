@@ -1584,10 +1584,18 @@ LUNs) is the single make-or-break that still needs the car.**
     `EncryptedClips` mp4s probe/stream fine, so the real trigger is corrupt/truncated
     segments.) Clock-step (finding High-#4) applies to any time-based marker retry on
     the RTC-less Pi — treat `now < updated_at` as expired.
-  - [ ] **FU-2d** — *(cleanup)* remove the dead pre-ADR-0004 SQLite candidate seam
-    `retentiond::candidates::SqliteCandidateReader` (+ its tests). ADR-0005 replaced it
-    with `VolumeCandidateSource`; it has no production caller. Left in place for now
-    (flagged, not silently deleted mid-lane).
+  - [x] **FU-2d** — *(cleanup, done 2026-07-21)* removed the dead pre-ADR-0004 SQLite
+    candidate seam `retentiond::candidates::SqliteCandidateReader` (+ `CandidateError`,
+    the private `duration_from_real`/`i64_to_u64_saturating`/`map_sqlite_error` helpers,
+    the `BUSY_TIMEOUT` const, and its `#[cfg(test)] mod tests`). ADR-0005 replaced it with
+    `VolumeCandidateSource`; it had no production caller. `candidates.rs` now carries only
+    the shared contract (`Candidate`/`CandidateAngle`/`CandidateSource`, kept byte-identical)
+    — 392→62 lines. This orphaned the `rusqlite` (bundled SQLite C) and dev-`indexd`
+    dependencies, both dropped from `retentiond/Cargo.toml`, shrinking the archiver binary
+    and aligning it with ADR-0005's "self-sufficient, no indexd/SQLite dep" goal. Verified in
+    podman: `cargo test -p retentiond` = 50 green (was 52; the 2 removed were the reader's own
+    tests), `candidates.rs` clippy-clean (crate-wide `--all-targets -D warnings` still trips on
+    pre-existing baseline debt in untouched `main.rs`/`archive.rs`/`archive_driver.rs`/`watchdog.rs`).
   - [ ] **FU-3** — per-angle partial archive (archive good angles, quarantine only bad).
   - [ ] **FU-4** — quarantined-byte accounting metric (never auto-delete).
   - [ ] **FU-5** — strict nested-box extent validation in the MP4 probe, applied
