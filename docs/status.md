@@ -1568,22 +1568,34 @@ LUNs) is the single make-or-break that still needs the car.**
     prematurely in the first place. Completeness isn't persisted per RecentClips angle
     today (needs scannerd + a schema change). Low priority now that FU-2's self-heal
     makes any premature quarantine transient.
-  - [ ] **FU-2c** — *(real follow-up, Tier-3 recording/archive path — needs a design
-    pass + GPT-5.5 second opinion + likely hardware validation)* **bound quarantine
-    retry in the marker path.** Because a `quarantined` marker always allows retry and
-    `select_stable_records` is level-triggered, a clip that is *stable but never becomes
-    decodable* (genuinely truncated/corrupt) is re-copied **and** re-quarantined **every
-    cycle forever** — wasted I/O + flash wear on the recording-critical `/data` card +
-    eviction pressure from repeatedly staging unusable bytes. Pre-existing ADR-0005
-    behavior, not a regression. Fix direction: gate `quarantined` retry on a
-    **`source_fingerprint` change** (retry only when the car actually wrote more — the
-    literal "allow re-archival when source bytes change" from the old FU-2 wording, but
-    in the *marker* path, not the dead SQLite seam) and/or a capped backoff + persisted
-    quarantine reason. Raised by `fu2b-diff-review` (gpt-5.6-sol) findings High-#2/#3.
-    (The review also flagged encrypted clips, but session HW evidence shows
-    `EncryptedClips` mp4s probe/stream fine, so the real trigger is corrupt/truncated
-    segments.) Clock-step (finding High-#4) applies to any time-based marker retry on
-    the RTC-less Pi — treat `now < updated_at` as expired.
+  - [x] **FU-2c** — *(done 2026-07-21, Tier-3 recording/archive path)* **bounded the
+    quarantined-marker re-copy retry.** A `quarantined` marker used to always allow retry
+    and `select_stable_records` is level-triggered, so a *stable but never decodable* clip
+    (genuinely truncated/corrupt) was re-copied **and** re-quarantined **every cycle
+    forever** — wasted I/O + flash wear on the recording-critical `/data` card. Fix
+    (`archive_driver.rs`): `marker_is_complete_live` → `marker_suppresses_recopy` now also
+    suppresses a `Quarantined` marker's re-copy, but ONLY when the fingerprint matches AND
+    the quarantine was **deterministic** (`probe_deterministic`: every probe failure was
+    `Unplayable`, none `ProbeIo`) AND within a **3600 s backoff** of the marker's
+    `updated_at`. A transient `ProbeIo` quarantine still retries every cycle; a **changed
+    `source_fingerprint`** re-copies immediately (ADR-0005 self-heal); and a **backward
+    clock** (`now < updated_at`, the RTC-less Pi finding High-#4) is treated as expired so
+    it can never strand self-heal. Backoff (not permanent suppression) is deliberate: the
+    source fingerprint captures the FAT allocation chain + metadata + timestamps but **NOT
+    content bytes**, so a periodic re-copy past the backoff is the self-heal backstop for a
+    same-fingerprint in-place rewrite. `probe_deterministic` is persisted via
+    `#[serde(default)]` (no `MARKER_SCHEMA` bump; pre-upgrade markers load `false`, retry
+    once, then self-correct). Process: GPT-5.5 design second opinion (ADOPT-WITH-CHANGES —
+    it caught that the fingerprint is allocation+metadata, not content, so permanent
+    suppression was replaced by the bounded backoff) → gpt-5.3-codex impl → GPT-5.5 diff
+    review (APPROVE). Verified in podman: `cargo test -p retentiond` = **194 green** incl.
+    5 new tests (`deterministic_quarantine_same_fingerprint_suppresses_within_backoff`,
+    `…_recopies_after_backoff`, `…_changed_fingerprint_recopies_within_backoff`,
+    `…_expired_when_clock_steps_back_recopies`,
+    `transient_probe_io_quarantine_retries_every_cycle`); `archive_driver.rs` clippy-clean
+    on changed lines (crate-wide `-D warnings` still trips only on pre-existing baseline
+    debt in untouched code). NOT yet hardware-validated on a real corrupt clip (deploy/verify
+    gate, separate from code-complete).
   - [x] **FU-2d** — *(cleanup, done 2026-07-21)* removed the dead pre-ADR-0004 SQLite
     candidate seam `retentiond::candidates::SqliteCandidateReader` (+ `CandidateError`,
     the private `duration_from_real`/`i64_to_u64_saturating`/`map_sqlite_error` helpers,

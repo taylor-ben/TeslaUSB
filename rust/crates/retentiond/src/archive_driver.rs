@@ -28,6 +28,15 @@ const PRUNE_EVERY_CYCLES: u32 = 5;
 const PRUNE_MAX_DELETIONS_PER_CYCLE: usize = 16;
 const STATE_SCHEMA: u32 = 1;
 const MARKER_SCHEMA: u32 = 1;
+/// How long a deterministically-unplayable, unchanged-fingerprint quarantine
+/// suppresses its own re-copy before retentiond re-copies + re-probes it again.
+/// Bounds the wasted SD I/O of re-copying a permanently-corrupt clip every cycle
+/// to at most once per this window, while still periodically re-copying so a
+/// same-fingerprint in-place self-heal (the source fingerprint captures the FAT
+/// allocation chain + metadata + timestamps, NOT content bytes) is eventually
+/// caught. Transient probe-I/O quarantines are never subject to this and keep
+/// retrying every cycle.
+const QUARANTINE_RECOPY_BACKOFF_S: i64 = 3600;
 const MARKER_DIR: &str = ".retentiond/markers";
 const OUTBOX_FILE: &str = ".retentiond/register-outbox.json";
 const STAGING_DIR: &str = ".retentiond/staging";
@@ -125,6 +134,8 @@ struct ClipMarker {
     volume_serial: u32,
     partition: String,
     status: MarkerStatus,
+    #[serde(default)]
+    probe_deterministic: bool,
     updated_at: i64,
     angles: Vec<MarkerAngle>,
 }
@@ -133,6 +144,8 @@ struct ClipMarker {
 struct MarkerSummary {
     source_fingerprint: String,
     status: MarkerStatus,
+    probe_deterministic: bool,
+    updated_at: i64,
     last_seen_epoch: i64,
     missed_scans: u32,
 }
@@ -246,7 +259,7 @@ pub fn archive_recent_capped(
             continue;
         }
 
-        if marker_is_complete_live(state, &candidate) {
+        if marker_suppresses_recopy(state, &candidate, now_epoch_s) {
             continue;
         }
 
@@ -297,6 +310,7 @@ pub fn archive_recent_capped(
                     state,
                     &candidate,
                     MarkerStatus::Partial,
+                    false,
                     marker_angles,
                     now_epoch_s,
                 );
@@ -318,6 +332,7 @@ pub fn archive_recent_capped(
                         state,
                         &candidate,
                         MarkerStatus::Partial,
+                        false,
                         marker_angles,
                         now_epoch_s,
                     );
@@ -398,6 +413,7 @@ fn finalize_registration(
             state,
             registration.candidate,
             MarkerStatus::CompleteLive,
+            false,
             registration.marker_angles,
             registration.now_epoch_s,
         );
@@ -424,6 +440,10 @@ fn finalize_registration(
             .join(",");
         log_quarantine_warning(&reg.canonical_key, &failure_detail);
         report.quarantined_undecodable = report.quarantined_undecodable.saturating_add(1);
+        let probe_deterministic = !probe_failures.is_empty()
+            && probe_failures
+                .iter()
+                .all(|failure| matches!(failure.reason, ProbeFailureReason::Unplayable(_)));
         if let Err(err) =
             stage_outbox_registration(state, &reg, RegistrationDisposition::Quarantine)
         {
@@ -435,6 +455,7 @@ fn finalize_registration(
             state,
             registration.candidate,
             MarkerStatus::Quarantined,
+            probe_deterministic,
             registration.marker_angles,
             registration.now_epoch_s,
         );
@@ -744,6 +765,8 @@ fn load_markers_if_needed(state: &mut DriverState) {
             MarkerSummary {
                 source_fingerprint: marker.source_fingerprint,
                 status: marker.status,
+                probe_deterministic: marker.probe_deterministic,
+                updated_at: marker.updated_at,
                 last_seen_epoch: marker.updated_at,
                 missed_scans: 0,
             },
@@ -797,12 +820,42 @@ fn stage_outbox_registration(
     write_json_durable(&path, &persisted)
 }
 
-fn marker_is_complete_live(state: &DriverState, candidate: &Candidate) -> bool {
+/// Whether an existing marker means this candidate does NOT need to be re-copied
+/// this cycle.
+///
+/// A matching-fingerprint `CompleteLive` marker suppresses unconditionally. A
+/// `Quarantined` marker suppresses only when the quarantine was deterministic
+/// (every probe failure was `Unplayable`, none `ProbeIo`) AND we are still within
+/// the re-copy backoff window. The backoff — rather than permanent suppression —
+/// is deliberate: the source fingerprint captures the clip's FAT allocation
+/// chain, directory metadata, and timestamps, but NOT its content bytes, so an
+/// in-place rewrite that leaves size/VDL/mtime unchanged keeps the same
+/// fingerprint. Periodically re-copying past the backoff is the self-heal
+/// backstop for that (rare) case; a transient `ProbeIo` quarantine is never
+/// suppressed so it keeps retrying every cycle as before.
+fn marker_suppresses_recopy(
+    state: &DriverState,
+    candidate: &Candidate,
+    now_epoch_s: i64,
+) -> bool {
     let Some(marker) = state.markers.get(&candidate.canonical_key) else {
         return false;
     };
-    marker.status == MarkerStatus::CompleteLive
-        && marker.source_fingerprint == candidate.source_fingerprint
+    if marker.source_fingerprint != candidate.source_fingerprint {
+        return false;
+    }
+    match marker.status {
+        MarkerStatus::CompleteLive => true,
+        MarkerStatus::Quarantined => {
+            // Elapsed in [0, BACKOFF) suppresses. A negative elapsed (now <
+            // updated_at) means the RTC-less Pi's clock stepped backward — treat
+            // that as EXPIRED (do not suppress) so a backward clock can never
+            // strand a clip's self-heal.
+            let elapsed = now_epoch_s.saturating_sub(marker.updated_at);
+            marker.probe_deterministic && (0..QUARANTINE_RECOPY_BACKOFF_S).contains(&elapsed)
+        }
+        MarkerStatus::Partial => false,
+    }
 }
 
 #[cfg(test)]
@@ -821,6 +874,7 @@ fn write_marker(
     state: &mut DriverState,
     candidate: &Candidate,
     status: MarkerStatus,
+    probe_deterministic: bool,
     angles: Vec<MarkerAngle>,
     now_epoch_s: i64,
 ) {
@@ -835,6 +889,7 @@ fn write_marker(
         volume_serial: candidate.source_volume_serial,
         partition: candidate.partition.clone(),
         status,
+        probe_deterministic,
         updated_at: now_epoch_s,
         angles,
     };
@@ -852,6 +907,8 @@ fn write_marker(
         MarkerSummary {
             source_fingerprint: candidate.source_fingerprint.clone(),
             status,
+            probe_deterministic,
+            updated_at: now_epoch_s,
             last_seen_epoch: now_epoch_s,
             missed_scans: 0,
         },
@@ -993,8 +1050,9 @@ mod tests {
     use super::{
         ClipMarker, CycleReport, DriverState, MARKER_SCHEMA, MAX_REGISTER_ATTEMPTS, MarkerAngle,
         MarkerStatus, MarkerSummary, OUTBOX_FILE, PRUNE_EVERY_CYCLES, PRUNE_GRACE_SECS,
-        PRUNE_MIN_MISSED_SCANS, PersistedOutbox, RegistrationDisposition, archive_recent_capped,
-        archive_recent_once, basename, marker_path, read_marker,
+        PRUNE_MIN_MISSED_SCANS, PersistedOutbox, QUARANTINE_RECOPY_BACKOFF_S,
+        RegistrationDisposition, archive_recent_capped, archive_recent_once, basename, marker_path,
+        read_marker,
     };
 
     const KEY: &str = "0:TeslaCam/RecentClips/2026-06-19_10-00-00";
@@ -1085,6 +1143,7 @@ mod tests {
             volume_serial: candidate.source_volume_serial,
             partition: candidate.partition.clone(),
             status,
+            probe_deterministic: false,
             updated_at,
             angles: vec![MarkerAngle {
                 camera: "front".to_owned(),
@@ -1778,33 +1837,143 @@ mod tests {
     }
 
     #[test]
-    fn probe_failure_writes_quarantined_marker_and_retries_copy() {
+    fn deterministic_quarantine_same_fingerprint_suppresses_within_backoff() {
+        const BACK_DEST: &str =
+            "RecentClips/2026-06-19/2026-06-19_10-00-00/2026-06-19_10-00-00-back.mp4";
         let candidates = FakeCandidates::default();
         let candidate = sample_candidate();
         candidates.set(vec![candidate.clone()]);
         let store = FakeStore::default();
-        store.set_unplayable(
-            "RecentClips/2026-06-19/2026-06-19_10-00-00/2026-06-19_10-00-00-back.mp4",
-            UnplayableReason::NoMoov,
-        );
+        store.set_unplayable(BACK_DEST, UnplayableReason::NoMoov);
         let register = FakeRegister::default();
         let archive_root = new_archive_root();
         let mut state = DriverState::with_archive_root(&archive_root);
 
-        let first = archive_recent_once(&candidates, &store, &register, &mut state, 1).unwrap();
+        let first = archive_recent_once(&candidates, &store, &register, &mut state, 1000).unwrap();
         assert_eq!(first.quarantined_undecodable, 1);
         let marker = read_marker(&state, &candidate).expect("quarantined marker");
         assert_eq!(marker.status, MarkerStatus::Quarantined);
-
+        assert!(marker.probe_deterministic);
         let copies_after_first = store.copies.borrow().len();
-        let second = archive_recent_once(&candidates, &store, &register, &mut state, 2).unwrap();
+
+        let second =
+            archive_recent_once(&candidates, &store, &register, &mut state, 1000 + 60).unwrap();
+        assert_eq!(store.copies.borrow().len(), copies_after_first);
+        assert_eq!(second.quarantined_undecodable, 0);
+
+        let _ = fs::remove_dir_all(archive_root);
+    }
+
+    #[test]
+    fn deterministic_quarantine_recopies_after_backoff() {
+        const BACK_DEST: &str =
+            "RecentClips/2026-06-19/2026-06-19_10-00-00/2026-06-19_10-00-00-back.mp4";
+        let candidates = FakeCandidates::default();
+        let candidate = sample_candidate();
+        candidates.set(vec![candidate.clone()]);
+        let store = FakeStore::default();
+        store.set_unplayable(BACK_DEST, UnplayableReason::NoMoov);
+        let register = FakeRegister::default();
+        let archive_root = new_archive_root();
+        let mut state = DriverState::with_archive_root(&archive_root);
+
+        let first = archive_recent_once(&candidates, &store, &register, &mut state, 1000).unwrap();
+        assert_eq!(first.quarantined_undecodable, 1);
+        let copies_after_first = store.copies.borrow().len();
+
+        let second = archive_recent_once(
+            &candidates,
+            &store,
+            &register,
+            &mut state,
+            1000 + QUARANTINE_RECOPY_BACKOFF_S + 1,
+        )
+        .unwrap();
+        assert!(store.copies.borrow().len() > copies_after_first);
         assert_eq!(second.quarantined_undecodable, 1);
-        assert!(
-            store.copies.borrow().len() > copies_after_first,
-            "quarantined marker must not suppress retry copy"
-        );
-        let marker2 = read_marker(&state, &candidate).expect("quarantined marker");
-        assert_ne!(marker2.status, MarkerStatus::CompleteLive);
+        let marker = read_marker(&state, &candidate).expect("quarantined marker");
+        assert!(marker.probe_deterministic);
+
+        let _ = fs::remove_dir_all(archive_root);
+    }
+
+    #[test]
+    fn deterministic_quarantine_expired_when_clock_steps_back_recopies() {
+        const BACK_DEST: &str =
+            "RecentClips/2026-06-19/2026-06-19_10-00-00/2026-06-19_10-00-00-back.mp4";
+        let candidates = FakeCandidates::default();
+        let candidate = sample_candidate();
+        candidates.set(vec![candidate.clone()]);
+        let store = FakeStore::default();
+        store.set_unplayable(BACK_DEST, UnplayableReason::NoMoov);
+        let register = FakeRegister::default();
+        let archive_root = new_archive_root();
+        let mut state = DriverState::with_archive_root(&archive_root);
+
+        let first = archive_recent_once(&candidates, &store, &register, &mut state, 1000).unwrap();
+        assert_eq!(first.quarantined_undecodable, 1);
+        let copies_after_first = store.copies.borrow().len();
+
+        // RTC-less Pi clock steps backward (now < marker.updated_at): the backoff
+        // must be treated as expired so self-heal is never stranded.
+        let second = archive_recent_once(&candidates, &store, &register, &mut state, 500).unwrap();
+        assert!(store.copies.borrow().len() > copies_after_first);
+        assert_eq!(second.quarantined_undecodable, 1);
+
+        let _ = fs::remove_dir_all(archive_root);
+    }
+
+    #[test]
+    fn deterministic_quarantine_changed_fingerprint_recopies_within_backoff() {
+        const BACK_DEST: &str =
+            "RecentClips/2026-06-19/2026-06-19_10-00-00/2026-06-19_10-00-00-back.mp4";
+        let candidates = FakeCandidates::default();
+        let candidate = sample_candidate();
+        candidates.set(vec![candidate.clone()]);
+        let store = FakeStore::default();
+        store.set_unplayable(BACK_DEST, UnplayableReason::NoMoov);
+        let register = FakeRegister::default();
+        let archive_root = new_archive_root();
+        let mut state = DriverState::with_archive_root(&archive_root);
+
+        let first = archive_recent_once(&candidates, &store, &register, &mut state, 1000).unwrap();
+        assert_eq!(first.quarantined_undecodable, 1);
+        let copies_after_first = store.copies.borrow().len();
+        candidates.set(vec![replacement_candidate_with_fingerprint(
+            &candidate,
+            "test-fingerprint-b",
+        )]);
+
+        let _second =
+            archive_recent_once(&candidates, &store, &register, &mut state, 1000 + 60).unwrap();
+        assert!(store.copies.borrow().len() > copies_after_first);
+
+        let _ = fs::remove_dir_all(archive_root);
+    }
+
+    #[test]
+    fn transient_probe_io_quarantine_retries_every_cycle() {
+        const BACK_DEST: &str =
+            "RecentClips/2026-06-19/2026-06-19_10-00-00/2026-06-19_10-00-00-back.mp4";
+        let candidates = FakeCandidates::default();
+        let candidate = sample_candidate();
+        candidates.set(vec![candidate.clone()]);
+        let store = FakeStore::default();
+        store.set_probe_error(BACK_DEST);
+        let register = FakeRegister::default();
+        let archive_root = new_archive_root();
+        let mut state = DriverState::with_archive_root(&archive_root);
+
+        let first = archive_recent_once(&candidates, &store, &register, &mut state, 1000).unwrap();
+        assert_eq!(first.quarantined_undecodable, 1);
+        let marker = read_marker(&state, &candidate).expect("quarantined marker");
+        assert!(!marker.probe_deterministic);
+        let copies_after_first = store.copies.borrow().len();
+
+        let second =
+            archive_recent_once(&candidates, &store, &register, &mut state, 1000 + 60).unwrap();
+        assert!(store.copies.borrow().len() > copies_after_first);
+        assert_eq!(second.quarantined_undecodable, 1);
 
         let _ = fs::remove_dir_all(archive_root);
     }
@@ -2193,6 +2362,7 @@ mod tests {
             volume_serial: candidate.source_volume_serial,
             partition: candidate.partition.clone(),
             status: MarkerStatus::CompleteLive,
+            probe_deterministic: false,
             updated_at: 10,
             angles: Vec::new(),
         };
@@ -2242,6 +2412,8 @@ mod tests {
             MarkerSummary {
                 source_fingerprint: candidate.source_fingerprint.clone(),
                 status: MarkerStatus::CompleteLive,
+                probe_deterministic: false,
+                updated_at: 0,
                 last_seen_epoch: 0,
                 missed_scans: PRUNE_MIN_MISSED_SCANS,
             },
