@@ -1629,6 +1629,13 @@ LUNs) is the single make-or-break that still needs the car.**
     `storage_passes_through_quarantined_summary`); `tsc --noEmit` clean; SPA UAT
     `storage-health.spec.ts` **20/20** across desktop-1280 + mobile-375 (2 new
     quarantined tests + the zero-console/no-non-2xx gate).
+    **DEPLOYED + LIVE-VERIFIED 2026-07-22** on `cybertruckusb.local` (webd
+    `4c0b66fa…`, SPA `index-N4pwsV1b.js`; device was a strict ancestor of HEAD, no
+    regression): `/api/storage.quarantined` returns `{count:16,bytes:2942816256}` and
+    the StorageHealth card renders `Quarantined (never auto-deleted): 16 clips · 2.7 GB`
+    live; console 0/0; dead-man cancelled on green. Evidence:
+    `files/hw-results.md` (2026-07-22 DEPLOY block) + `files/fu4-live-storage-desktop.png`.
+    NO git push.
   - [ ] **FU-5** — strict nested-box extent validation in the MP4 probe, applied
     consistently across `scannerd::mp4probe` + `retentiond::probe` (today both reuse
     `teslausb_core::sei::mp4::find_box*`, which clamps child extents; theoretical gap
