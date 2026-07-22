@@ -1666,11 +1666,22 @@ LUNs) is the single make-or-break that still needs the car.**
     **Residual (by design):** malformed-but-parseable nested boxes may pass — this is
     tolerance, not a quarantine-gate defect. No code change; no deploy. (Mirrors the
     FU-2 lesson: don't spend a Tier-3 cycle "fixing" a theoretical/unreachable gap.)
-  - [ ] **FU-6** — slot-aware archive path (pre-existing). `archive_item_path_for_candidate`
-    drops the `slot:` prefix, so two clips on different slots sharing a timestamp would
-    collide on one archive path. Unreachable in the single-slot RecentClips topology and
-    never loses source footage (car volume read-only), but the path scheme should include
-    the slot. Predates this gate (affected the LIVE path equally).
+  - [ ] **FU-6** — slot-aware archive path (pre-existing). *(Deferred 2026-07-22;
+    unreachable in the current single-slot topology — gate on multi-slot archiving.)*
+    `archive_item_path_for_candidate` builds `RecentClips/{date}/{timestamp}` from the
+    candidate's `canonical_key`, dropping the `slot:` prefix, so two clips on different
+    slots sharing a timestamp would collide on one archive path. Today only slot-0
+    `RecentClips` is archived (`folder_class` is hardcoded `"RecentClips"`), so every
+    candidate shares one slot and the collision cannot occur; source footage is never at
+    risk (car volume read-only) and each archived clip stores its own `archive.path`
+    per-row, so no latent corruption accrues. The path scheme *is* a persisted
+    cross-daemon contract (retentiond writes the on-disk folder + `ArchiveRegistration.
+    archive.path`; indexd stores it in `archive_items.path`; webd serves from it), so
+    changing it to defend a topology that doesn't exist is speculative per the
+    simplicity-first charter. **Correct trigger:** fold the slot into the path scheme as
+    part of introducing multi-slot archiving (e.g. SavedClips/SentryClips or multi-slot
+    RecentClips), when it becomes reachable. Predates this gate (affected the LIVE path
+    equally).
 - [ ] **scannerd: confirm the `min(ValidDataLength, DataLength)` read clamp cannot
   truncate real Tesla footage.** No clamp gap on the synthetic test image
   (`VDL==DataLength`), but if a real car ever leaves `ValidDataLength` stale-small with
