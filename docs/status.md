@@ -1636,10 +1636,36 @@ LUNs) is the single make-or-break that still needs the car.**
     live; console 0/0; dead-man cancelled on green. Evidence:
     `files/hw-results.md` (2026-07-22 DEPLOY block) + `files/fu4-live-storage-desktop.png`.
     NO git push.
-  - [ ] **FU-5** — strict nested-box extent validation in the MP4 probe, applied
-    consistently across `scannerd::mp4probe` + `retentiond::probe` (today both reuse
-    `teslausb_core::sei::mp4::find_box*`, which clamps child extents; theoretical gap
-    not reachable by the truncation failure mode the gate targets).
+  - [x] **FU-5** — strict nested-box extent validation in the MP4 probe. **CLOSED
+    2026-07-22 as not-a-defect (deliberate v1-parity tolerance) — not implemented.**
+    Tier-3 two-model reconciliation (Opus 4.8 + an independent GPT-5.5 second opinion)
+    both concluded the nested-extent clamp in `teslausb_core::sei::mp4::find_box*`
+    (`effective_end = box_end.min(end)`, mp4.rs:298) is NOT reachable by a realistic
+    Tesla clip failure mode that would false-PASS the quarantine gate:
+    - The only production gate is `retentiond::probe::probe_file_playability`
+      (`scannerd::mp4probe` is the read-only diagnostic-spike tool per main.rs:82-83,
+      not a gate). That gate already STRICTLY rejects the reachable truncation
+      signature at the top level — `header.box_end > file_len` →
+      `MoovExtentBeyondEof`/`MalformedTopLevelBox` (probe.rs:82-90) — before any
+      nested clamp runs, plus NoMoov/NoFtyp/NoMdat.
+    - The clamp only executes inside an already-bounded `moov_body`, on nested
+      trak/mdia/mdhd. If it clamps away the real `mdhd`, `find_box_path`/`parse_mdhd`
+      fail → `MoovUnparseable` → correctly Unplayable. A "pass" requires a genuine
+      `mdhd` with `timescale > 0` actually present — i.e. the clip IS structurally
+      complete at the level the gate checks. A nested-child-overstates-parent-but-
+      moov-fits-file layout is not a truncation/copy signature Tesla's muxer produces.
+    - Tightening to strict-reject would ADD false-QUARANTINE risk on real footage with
+      benign structural quirks (free/wide/skip padding, edit lists) — worse than the
+      (unreachable) false-pass on a zero-clip-loss system, and it contradicts the
+      deliberate v1-mirroring tolerance (mp4.rs:294-297).
+    - Blast-radius: `find_box` is SHARED production code — besides the retentiond gate
+      it drives scannerd's production SEI walk (`seiwalk.rs`/`seiscan.rs`, the GPS/
+      telemetry extraction on the `serve` path). Changing its clamp semantics globally
+      would also risk false SEI-extraction failures (lost GPS/telemetry visibility),
+      compounding the net-negative trade.
+    **Residual (by design):** malformed-but-parseable nested boxes may pass — this is
+    tolerance, not a quarantine-gate defect. No code change; no deploy. (Mirrors the
+    FU-2 lesson: don't spend a Tier-3 cycle "fixing" a theoretical/unreachable gap.)
   - [ ] **FU-6** — slot-aware archive path (pre-existing). `archive_item_path_for_candidate`
     drops the `slot:` prefix, so two clips on different slots sharing a timestamp would
     collide on one archive path. Unreachable in the single-slot RecentClips topology and
