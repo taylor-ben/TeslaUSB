@@ -73,14 +73,29 @@ async fn system_metrics(State(state): State<AppState>) -> Json<SystemMetrics> {
 async fn storage(State(state): State<AppState>) -> Json<Storage> {
     let sys = state.sys;
     let stats = state.stats_client;
+    let catalog = state.catalog.clone();
     let out = tokio::task::spawn_blocking(move || {
-        sysinfo::storage(sys.probe.as_ref(), sys.paths.as_ref(), stats.as_ref())
+        let quarantined = catalog
+            .connect()
+            .ok()
+            .and_then(|conn| crate::query::quarantined_summary(&conn).ok())
+            .map(|s| sysinfo::QuarantinedDto {
+                count: s.count,
+                bytes: s.bytes,
+            });
+        sysinfo::storage(
+            sys.probe.as_ref(),
+            sys.paths.as_ref(),
+            stats.as_ref(),
+            quarantined,
+        )
     })
     .await
     .unwrap_or_else(|_| Storage {
         filesystems: Vec::new(),
         volumes: Vec::new(),
         governor: None,
+        quarantined: None,
     });
     Json(out)
 }

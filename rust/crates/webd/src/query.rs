@@ -1043,6 +1043,42 @@ pub(crate) fn list_wraps(conn: &Connection) -> Result<Vec<MediaItemDto>, rusqlit
         .collect::<Result<Vec<_>, _>>()
 }
 
+/// Count and total on-card footprint of quarantined archive items.
+///
+/// Quarantined items are genuinely-corrupt clips that `retentiond` copied to the
+/// archive but never promotes to LIVE and never auto-deletes (they may still
+/// self-heal to LIVE if the source is later re-finalized). This read-only
+/// aggregate surfaces how much such data stands on the recording-critical
+/// `/data` card. FU-4 is accounting only — it triggers no deletion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct QuarantinedSummary {
+    pub count: u64,
+    pub bytes: u64,
+}
+
+/// Aggregate the quarantined archive items (`delete_state = 'QUARANTINED'`),
+/// index-backed by `idx_archive_state`. `size_bytes` is `NOT NULL DEFAULT 0`
+/// and `COALESCE(...,0)` also covers the zero-row case, so the sum is never
+/// NULL. Counts/sums are non-negative; a defensive `try_from` clamps to 0
+/// instead of panicking.
+pub(crate) fn quarantined_summary(
+    conn: &Connection,
+) -> Result<QuarantinedSummary, rusqlite::Error> {
+    conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(size_bytes), 0) \
+         FROM archive_items WHERE delete_state = 'QUARANTINED'",
+        [],
+        |row| {
+            let count: i64 = row.get(0)?;
+            let bytes: i64 = row.get(1)?;
+            Ok(QuarantinedSummary {
+                count: u64::try_from(count).unwrap_or(0),
+                bytes: u64::try_from(bytes).unwrap_or(0),
+            })
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use jiff::Timestamp;
@@ -1052,9 +1088,8 @@ mod tests {
 
     use super::{
         Keyset, SnapshotResource, encryption_status, get_clip, list_chime_library, list_clips,
-        list_days,
-        list_days_tz, list_standalone_day_events, list_standalone_day_events_range, list_trips,
-        list_trips_tz, snapshot_max_id,
+        list_days, list_days_tz, list_standalone_day_events, list_standalone_day_events_range,
+        list_trips, list_trips_tz, quarantined_summary, snapshot_max_id,
     };
 
     fn seed_media_rows(conn: &Connection, rows: &[(&str, &str, &str, i64)]) {
@@ -1177,6 +1212,58 @@ mod tests {
             vec!["a.wav", "b.wav"]
         );
         assert!(items.iter().all(|item| item.rel_path.starts_with("Chimes/") && item.rel_path.matches('/').count() == 1));
+    }
+
+    #[test]
+    fn quarantined_summary_counts_only_quarantined_and_sums_bytes() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO archive_items \
+             (folder_class, path, size_bytes, archived_at, delete_state, created_at, updated_at) \
+             VALUES ('RecentClips', 'a', 100, 0, 'QUARANTINED', 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO archive_items \
+             (folder_class, path, size_bytes, archived_at, delete_state, created_at, updated_at) \
+             VALUES ('RecentClips', 'b', 250, 0, 'QUARANTINED', 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO archive_items \
+             (folder_class, path, size_bytes, archived_at, delete_state, created_at, updated_at) \
+             VALUES ('RecentClips', 'c', 999, 0, 'LIVE', 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO archive_items \
+             (folder_class, path, size_bytes, archived_at, delete_state, created_at, updated_at) \
+             VALUES ('RecentClips', 'd', 500, 0, 'DELETED', 0, 0)",
+            [],
+        )
+        .unwrap();
+
+        let s = quarantined_summary(&conn).unwrap();
+        assert_eq!(s.count, 2);
+        assert_eq!(s.bytes, 350);
+    }
+
+    #[test]
+    fn quarantined_summary_zero_when_none_quarantined() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO archive_items \
+             (folder_class, path, size_bytes, archived_at, delete_state, created_at, updated_at) \
+             VALUES ('RecentClips', 'x', 42, 0, 'LIVE', 0, 0)",
+            [],
+        )
+        .unwrap();
+        let s = quarantined_summary(&conn).unwrap();
+        assert_eq!(s.count, 0);
+        assert_eq!(s.bytes, 0);
     }
 
     #[test]

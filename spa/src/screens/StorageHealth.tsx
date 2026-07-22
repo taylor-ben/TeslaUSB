@@ -792,6 +792,15 @@ export function StorageHealth() {
             wired in.
           </p>
         )}
+        {info?.quarantined != null && (
+          <p class="storage-note" data-testid="quarantined-data">
+            {info.quarantined.count === 0
+              ? "No quarantined clips."
+              : `Quarantined (never auto-deleted): ${info.quarantined.count} ${
+                  info.quarantined.count === 1 ? "clip" : "clips"
+                } \u00b7 ${humanBytes(info.quarantined.bytes)}`}
+          </p>
+        )}
       </section>
         </div>
       </details>

@@ -1609,7 +1609,26 @@ LUNs) is the single make-or-break that still needs the car.**
     tests), `candidates.rs` clippy-clean (crate-wide `--all-targets -D warnings` still trips on
     pre-existing baseline debt in untouched `main.rs`/`archive.rs`/`archive_driver.rs`/`watchdog.rs`).
   - [ ] **FU-3** — per-angle partial archive (archive good angles, quarantine only bad).
-  - [ ] **FU-4** — quarantined-byte accounting metric (never auto-delete).
+  - [x] **FU-4** — quarantined-byte accounting metric (never auto-delete). **DONE 2026-07-21.**
+    Read-only observability: `GET /api/storage` now carries a `quarantined:
+    {count, bytes} | null` block aggregating `archive_items WHERE
+    delete_state='QUARANTINED'` (the genuinely-corrupt clips `retentiond` keeps
+    and never auto-deletes), rendered as a line in the SPA StorageHealth
+    "Retention headroom" card. Pure accounting — no write/delete, no retention
+    behaviour change. **Honest optionality:** `None`/`null` when the catalog read
+    fails (never fabricated `0`); a genuinely-empty catalog yields
+    `{count:0,bytes:0}` → "No quarantined clips.". webd:
+    `query::quarantined_summary` (index-backed by `idx_archive_state`; i64→u64 via
+    `try_from().unwrap_or(0)`), `sysinfo::QuarantinedDto` + a `Storage.quarantined`
+    param, computed in the `health.rs` `/api/storage` handler from `state.catalog`
+    inside `spawn_blocking` (any DB error ⇒ `None`). SPA: `QuarantinedInfo` type +
+    a `[data-testid="quarantined-data"]` line. Implemented (gpt-5.3-codex),
+    reviewed (gpt-5.4-mini, no findings). Gates: podman `cargo test -p webd`
+    **460 pass** (incl. `quarantined_summary_counts_only_quarantined_and_sums_bytes`,
+    `quarantined_summary_zero_when_none_quarantined`,
+    `storage_passes_through_quarantined_summary`); `tsc --noEmit` clean; SPA UAT
+    `storage-health.spec.ts` **20/20** across desktop-1280 + mobile-375 (2 new
+    quarantined tests + the zero-console/no-non-2xx gate).
   - [ ] **FU-5** — strict nested-box extent validation in the MP4 probe, applied
     consistently across `scannerd::mp4probe` + `retentiond::probe` (today both reuse
     `teslausb_core::sei::mp4::find_box*`, which clamps child extents; theoretical gap

@@ -91,6 +91,7 @@ const STORAGE_FIXTURE = {
     },
   ],
   governor: null,
+  quarantined: { count: 0, bytes: 0 },
 };
 
 const GOVERNOR_FIXTURE = {
@@ -377,6 +378,45 @@ test.describe("storage health UAT", () => {
     await expect(page.locator("#storage-governor")).toContainText("projected free");
     await expect(page.locator('[data-testid="governor-last"]')).toContainText("would free");
 
+    assertCleanConsole(probe);
+  });
+
+  test("renders empty quarantined-data note when no quarantined clips", async ({
+    page,
+    probe,
+  }) => {
+    await routeProbes(page);
+    await gotoStorage(page);
+    const details = page.locator("#storage-device-health");
+    await details.locator("summary").click();
+    await expect(page.locator('[data-testid="quarantined-data"]')).toBeVisible();
+    await expect(page.locator('[data-testid="quarantined-data"]')).toContainText(
+      "No quarantined clips.",
+    );
+    assertCleanConsole(probe);
+  });
+
+  test("renders quarantined-data summary when quarantined clips exist", async ({
+    page,
+    probe,
+  }) => {
+    await routeProbes(page);
+    const json = (body: unknown) => ({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(body),
+    });
+    await page.route("**/api/storage", (r) =>
+      r.fulfill(
+        json({ ...STORAGE_FIXTURE, quarantined: { count: 2, bytes: 536_870_912 } }),
+      ),
+    );
+    await gotoStorage(page);
+    const details = page.locator("#storage-device-health");
+    await details.locator("summary").click();
+    await expect(page.locator('[data-testid="quarantined-data"]')).toContainText(
+      "Quarantined (never auto-deleted): 2 clips",
+    );
     assertCleanConsole(probe);
   });
 

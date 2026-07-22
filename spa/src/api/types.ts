@@ -416,12 +416,26 @@ export interface GovernorInfo {
   last_items: number;
 }
 
+/** Quarantined-data accounting from `GET /api/storage`.
+ *  Quarantined archive items are genuinely-corrupt clips the device keeps and
+ *  never auto-deletes (they may still self-heal). Mirrors `QuarantinedDto` in
+ *  `rust/crates/webd/src/sysinfo.rs`. */
+export interface QuarantinedInfo {
+  /** Number of quarantined archive items. */
+  count: number;
+  /** Their total on-card footprint in bytes. */
+  bytes: number;
+}
+
 /** `GET /api/storage`. */
 export interface StorageInfo {
   filesystems: FilesystemEntry[];
   /** The two USB drives (TESLACAM + MEDIA); empty on an older webd. */
   volumes: UsbVolumeInfo[];
   governor: GovernorInfo | null;
+  /** Quarantined-data accounting; null when the catalog read failed, absent on
+   *  an older webd. */
+  quarantined?: QuarantinedInfo | null;
 }
 
 /** `GET /api/storage/health`. Wear telemetry is best-effort read-only probes. */

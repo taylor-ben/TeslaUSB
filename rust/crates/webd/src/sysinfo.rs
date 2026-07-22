@@ -371,6 +371,18 @@ pub struct UsbVolumeDto {
     pub stable: bool,
 }
 
+/// Quarantined-data accounting for `GET /api/storage`. Quarantined archive items
+/// are genuinely-corrupt clips the device keeps (never auto-deleted) and that may
+/// still self-heal to LIVE. `null`/`None` in the response when the catalog read
+/// failed — honest optionality, never fabricated as zero.
+#[derive(Debug, Serialize)]
+pub struct QuarantinedDto {
+    /// Number of `delete_state = 'QUARANTINED'` archive items.
+    pub count: u64,
+    /// Their total on-card footprint in bytes.
+    pub bytes: u64,
+}
+
 /// `GET /api/storage`: the filesystems `webd` can `statvfs` directly. The
 /// governor tier is owned by `retentiond`; unreadable/invalid status degrades
 /// to `governor: null` (not fabricated).
@@ -382,6 +394,9 @@ pub struct Storage {
     pub volumes: Vec<UsbVolumeDto>,
     /// `retentiond` governor status when available and schema-valid.
     pub governor: Option<serde_json::Value>,
+    /// Quarantined-data accounting (catalog-sourced). `None` when the catalog
+    /// read failed.
+    pub quarantined: Option<QuarantinedDto>,
 }
 
 /// Mirror of retentiond's `retentiond.governor.json` (schema 1). Parsed then
@@ -1016,6 +1031,7 @@ pub fn storage(
     probe: &dyn SystemProbe,
     paths: &SysPaths,
     stats: &dyn VolumeStatsClient,
+    quarantined: Option<QuarantinedDto>,
 ) -> Storage {
     let candidates = [Path::new("/"), paths.archive_root.as_path()];
     let mut filesystems: Vec<FilesystemDto> = Vec::new();
@@ -1074,6 +1090,7 @@ pub fn storage(
         filesystems,
         volumes: vec![dashcam, media],
         governor: read_governor(probe, paths),
+        quarantined,
     }
 }
 
@@ -2000,7 +2017,7 @@ tmpfs /run tmpfs rw 0 0
         let stats = FakeStatsClient {
             outcome: Some(VolumeStatsOutcome::Unavailable),
         };
-        let s = storage(&probe, &paths(), &stats);
+        let s = storage(&probe, &paths(), &stats, None);
         assert_eq!(s.filesystems.len(), 1);
         assert_eq!(s.volumes.len(), 2);
         assert!(s.governor.is_none());
@@ -2021,7 +2038,7 @@ tmpfs /run tmpfs rw 0 0
         let stats = FakeStatsClient {
             outcome: Some(VolumeStatsOutcome::Unavailable),
         };
-        let out = storage(&probe, &paths(), &stats);
+        let out = storage(&probe, &paths(), &stats, None);
         let governor = out.governor.expect("governor");
         assert_eq!(governor["mode"], "armed");
         assert_eq!(governor["free_bytes"], 53_687_091_200_u64);
@@ -2033,7 +2050,7 @@ tmpfs /run tmpfs rw 0 0
         let stats = FakeStatsClient {
             outcome: Some(VolumeStatsOutcome::Unavailable),
         };
-        let out = storage(&probe, &paths(), &stats);
+        let out = storage(&probe, &paths(), &stats, None);
         assert!(out.governor.is_none());
     }
 
@@ -2046,7 +2063,7 @@ tmpfs /run tmpfs rw 0 0
         let stats = FakeStatsClient {
             outcome: Some(VolumeStatsOutcome::Unavailable),
         };
-        let out = storage(&probe, &paths(), &stats);
+        let out = storage(&probe, &paths(), &stats, None);
         assert!(out.governor.is_none());
     }
 
@@ -2061,7 +2078,7 @@ tmpfs /run tmpfs rw 0 0
         let stats = FakeStatsClient {
             outcome: Some(VolumeStatsOutcome::Unavailable),
         };
-        let out = storage(&probe, &paths(), &stats);
+        let out = storage(&probe, &paths(), &stats, None);
         assert!(out.governor.is_none());
     }
 
@@ -2076,7 +2093,7 @@ tmpfs /run tmpfs rw 0 0
         let stats = FakeStatsClient {
             outcome: Some(VolumeStatsOutcome::Unavailable),
         };
-        let out = storage(&probe, &paths(), &stats);
+        let out = storage(&probe, &paths(), &stats, None);
         assert!(out.governor.is_none());
     }
 
@@ -2194,7 +2211,7 @@ tmpfs /run tmpfs rw 0 0
                 stable: true,
             })),
         };
-        let s = storage(&probe, &paths(), &stats);
+        let s = storage(&probe, &paths(), &stats, None);
         assert_eq!(s.volumes.len(), 2);
         assert_eq!(s.volumes[0].label, "TESLACAM");
         assert_eq!(s.volumes[0].source, "bitmap");
@@ -2212,11 +2229,31 @@ tmpfs /run tmpfs rw 0 0
         let stats = FakeStatsClient {
             outcome: Some(VolumeStatsOutcome::Unavailable),
         };
-        let s = storage(&probe, &paths(), &stats);
+        let s = storage(&probe, &paths(), &stats, None);
         assert_eq!(s.volumes.len(), 2);
         assert!(s.volumes.iter().all(|v| v.total_bytes.is_none()));
         assert!(!s.volumes[0].stable);
         assert!(!s.volumes[1].stable);
+    }
+
+    #[test]
+    fn storage_passes_through_quarantined_summary() {
+        let probe = FakeProbe::default();
+        let stats = FakeStatsClient {
+            outcome: Some(VolumeStatsOutcome::Unavailable),
+        };
+        let s = storage(
+            &probe,
+            &paths(),
+            &stats,
+            Some(QuarantinedDto {
+                count: 3,
+                bytes: 4096,
+            }),
+        );
+        let q = s.quarantined.expect("quarantined present");
+        assert_eq!(q.count, 3);
+        assert_eq!(q.bytes, 4096);
     }
 
     #[test]
