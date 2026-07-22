@@ -1608,7 +1608,23 @@ LUNs) is the single make-or-break that still needs the car.**
     podman: `cargo test -p retentiond` = 50 green (was 52; the 2 removed were the reader's own
     tests), `candidates.rs` clippy-clean (crate-wide `--all-targets -D warnings` still trips on
     pre-existing baseline debt in untouched `main.rs`/`archive.rs`/`archive_driver.rs`/`watchdog.rs`).
-  - [ ] **FU-3** — per-angle partial archive (archive good angles, quarantine only bad).
+  - [x] **FU-3** — per-angle partial archive (archive good angles, quarantine only bad). **DONE 2026-07-22.**
+    retentiond-only change (no schema, no contract, no deploy needed). `archive_driver.rs`
+    `archive_recent_capped` now probes the STAGED copy per-angle and partitions into
+    good/bad camera angles, then dispatches three finalization cases: **(1) all-bad + prior
+    good archive** → discard the bad recopy, keep the existing servable bytes, re-anchor the
+    marker (never clobber good bytes); **(2) all-bad, no prior good** → promote all + quarantine;
+    **(3) mixed (≥1 good)** → promote ONLY the good angles, discard bad staging, register
+    Live/PartiallyLive so the good angles stay visible+servable in the UI while only the
+    genuinely-corrupt angles are dropped. Tier-3 recording path: GPT-5.5 adversarial review
+    found 2 issues, both production-fixed and locked by regression tests
+    (`all_bad_recopy_over_complete_live_preserves_good_bytes` = prior-good bytes preserved;
+    `mixed_promote_failure_discards_bad_staged` = mixed promote-failure discards bad staging).
+    Shared promote loop extracted to `promote_staged_angles` (DRY + clippy cognitive-complexity).
+    Verified in podman: `cargo test -p retentiond` = **252 green** (202 lib + 50 integration);
+    `cargo clippy -p retentiond --all-targets -D warnings` clean on all changed lines
+    (only pre-existing baseline debt in untouched `main.rs`/`archive.rs`/`watchdog.rs` remains).
+    Final GPT-5.5 refactor review: CLEAN.
   - [x] **FU-4** — quarantined-byte accounting metric (never auto-delete). **DONE 2026-07-21.**
     Read-only observability: `GET /api/storage` now carries a `quarantined:
     {count, bytes} | null` block aggregating `archive_items WHERE

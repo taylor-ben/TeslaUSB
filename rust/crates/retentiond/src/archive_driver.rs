@@ -167,6 +167,8 @@ pub struct CycleReport {
     pub register_rejected: usize,
     /// Count of copied candidates quarantined as undecodable.
     pub quarantined_undecodable: usize,
+    /// Count of clips archived with only a subset of good angles (bad angles left unpromoted).
+    pub partially_archived: usize,
     /// Count of observed candidates skipped because their key is already pending.
     pub skipped_already_pending: usize,
     /// Count of candidates skipped because their key was deterministically rejected.
@@ -315,57 +317,173 @@ pub fn archive_recent_capped(
                     now_epoch_s,
                 );
             } else {
-                let mut promoted_angles = Vec::with_capacity(staged_angles.len());
-                let mut promote_failed_at = None;
-                for (idx, staged) in staged_angles.iter().enumerate() {
-                    let staging_rel = format!("{STAGING_DIR}/{}", staged.file_ref);
-                    if store.promote_dest(&staging_rel, &staged.file_ref).is_err() {
-                        report.copy_failed = report.copy_failed.saturating_add(1);
-                        promote_failed_at = Some(idx);
-                        break;
+                let staged_failures = collect_probe_failures_staged(store, &staged_angles);
+                let bad_cameras: std::collections::HashSet<String> = staged_failures
+                    .iter()
+                    .map(|failure| failure.camera.clone())
+                    .collect();
+                let probe_deterministic = !staged_failures.is_empty()
+                    && staged_failures
+                        .iter()
+                        .all(|failure| matches!(failure.reason, ProbeFailureReason::Unplayable(_)));
+
+                let mut good_staged_angles = Vec::with_capacity(staged_angles.len());
+                let mut bad_staged_angles = Vec::new();
+                let mut good_marker_angles = Vec::with_capacity(marker_angles.len());
+                for (staged, marker_angle) in staged_angles.iter().zip(marker_angles.iter()) {
+                    if bad_cameras.contains(&staged.camera) {
+                        bad_staged_angles.push(staged.clone());
+                    } else {
+                        good_staged_angles.push(staged.clone());
+                        good_marker_angles.push(marker_angle.clone());
                     }
-                    promoted_angles.push(staged.clone());
                 }
-                if let Some(failed_idx) = promote_failed_at {
-                    discard_staged_files(store, &staged_angles, failed_idx);
+
+                let prior_status = state
+                    .markers
+                    .get(&candidate.canonical_key)
+                    .map(|marker| marker.status);
+                let prior_good_archive = matches!(
+                    prior_status,
+                    Some(MarkerStatus::CompleteLive | MarkerStatus::Partial)
+                );
+                if good_staged_angles.is_empty() && prior_good_archive {
+                    // FU-3 safety: a prior cycle already archived good, servable angles
+                    // for this clip. Never overwrite those final bytes with this cycle's
+                    // all-bad recopy — discard the bad staging and keep the existing
+                    // archive. Re-anchor the marker to the new source fingerprint so we
+                    // stop re-copying this clip every cycle.
+                    let prior_status = prior_status.unwrap_or(MarkerStatus::CompleteLive);
+                    discard_staged_files(store, &staged_angles, 0);
+                    log_kept_existing_archive(&candidate.canonical_key);
+                    remove_empty_staging_dirs_best_effort(state, &archive_item_path);
                     write_marker(
                         state,
                         &candidate,
-                        MarkerStatus::Partial,
-                        false,
+                        prior_status,
+                        probe_deterministic,
                         marker_angles,
                         now_epoch_s,
                     );
-                } else {
-                    remove_empty_staging_dirs_best_effort(state, &archive_item_path);
-                    let reg = ArchiveRegistration {
-                        canonical_key: candidate.canonical_key.clone(),
-                        folder_class: "RecentClips".to_owned(),
-                        partition: candidate.partition.clone(),
-                        started_at: candidate.started_at,
-                        ended_at: candidate.ended_at,
-                        duration_s: candidate.duration_s,
-                        archive: ArchiveItemRef {
-                            path: archive_item_path,
-                            size_bytes: segment_size_bytes,
-                            file_count: usize_to_i64_saturating(promoted_angles.len()),
-                            archived_at: now_epoch_s,
-                        },
-                        angles: promoted_angles,
-                    };
-
-                    finalize_registration(
-                        store,
-                        register,
-                        reg,
-                        state,
-                        &mut report,
-                        RegistrationContext {
-                            candidate: &candidate,
+                } else if good_staged_angles.is_empty() {
+                    let (promoted_angles, promote_failed_at) =
+                        promote_staged_angles(store, &mut report, &staged_angles);
+                    if let Some(failed_idx) = promote_failed_at {
+                        discard_staged_files(store, &staged_angles, failed_idx);
+                        write_marker(
+                            state,
+                            &candidate,
+                            MarkerStatus::Partial,
+                            false,
                             marker_angles,
                             now_epoch_s,
-                        },
-                    );
+                        );
+                    } else {
+                        remove_empty_staging_dirs_best_effort(state, &archive_item_path);
+                        let reg = ArchiveRegistration {
+                            canonical_key: candidate.canonical_key.clone(),
+                            folder_class: "RecentClips".to_owned(),
+                            partition: candidate.partition.clone(),
+                            started_at: candidate.started_at,
+                            ended_at: candidate.ended_at,
+                            duration_s: candidate.duration_s,
+                            archive: ArchiveItemRef {
+                                path: archive_item_path,
+                                size_bytes: segment_size_bytes,
+                                file_count: usize_to_i64_saturating(promoted_angles.len()),
+                                archived_at: now_epoch_s,
+                            },
+                            angles: promoted_angles,
+                        };
+                        let failure_detail = staged_failures
+                            .iter()
+                            .map(ProbeFailure::to_log_fragment)
+                            .collect::<Vec<_>>()
+                            .join(",");
+
+                        finalize_registration(
+                            register,
+                            reg,
+                            state,
+                            &mut report,
+                            RegistrationContext {
+                                candidate: &candidate,
+                                marker_angles,
+                                quarantine_failure_detail: Some(failure_detail),
+                                now_epoch_s,
+                            },
+                            FinalizeDisposition::Quarantined,
+                            probe_deterministic,
+                        );
+                    }
+                } else {
+                    let (promoted_angles, promote_failed_at) =
+                        promote_staged_angles(store, &mut report, &good_staged_angles);
+                    if let Some(failed_idx) = promote_failed_at {
+                        discard_staged_files(store, &good_staged_angles, failed_idx);
+                        discard_staged_files(store, &bad_staged_angles, 0);
+                        write_marker(
+                            state,
+                            &candidate,
+                            MarkerStatus::Partial,
+                            false,
+                            marker_angles,
+                            now_epoch_s,
+                        );
+                    } else {
+                        discard_staged_files(store, &bad_staged_angles, 0);
+                        remove_empty_staging_dirs_best_effort(state, &archive_item_path);
+                        let good_segment_size_bytes = promoted_angles
+                            .iter()
+                            .fold(0_i64, |acc, angle| acc.saturating_add(angle.size_bytes));
+                        let disposition = if bad_cameras.is_empty() {
+                            FinalizeDisposition::Live
+                        } else {
+                            FinalizeDisposition::PartiallyLive
+                        };
+                        if !bad_cameras.is_empty() {
+                            let mut cams: Vec<_> = bad_cameras.iter().cloned().collect();
+                            cams.sort_unstable();
+                            log_partial_archive_warning(
+                                &candidate.canonical_key,
+                                &cams.join(","),
+                            );
+                        }
+                        let reg = ArchiveRegistration {
+                            canonical_key: candidate.canonical_key.clone(),
+                            folder_class: "RecentClips".to_owned(),
+                            partition: candidate.partition.clone(),
+                            started_at: candidate.started_at,
+                            ended_at: candidate.ended_at,
+                            duration_s: candidate.duration_s,
+                            archive: ArchiveItemRef {
+                                path: archive_item_path,
+                                size_bytes: good_segment_size_bytes,
+                                file_count: usize_to_i64_saturating(promoted_angles.len()),
+                                archived_at: now_epoch_s,
+                            },
+                            angles: promoted_angles,
+                        };
+
+                        finalize_registration(
+                            register,
+                            reg,
+                            state,
+                            &mut report,
+                            RegistrationContext {
+                                candidate: &candidate,
+                                marker_angles: good_marker_angles,
+                                quarantine_failure_detail: None,
+                                now_epoch_s,
+                            },
+                            disposition,
+                            if matches!(disposition, FinalizeDisposition::Live) {
+                                false
+                            } else {
+                                probe_deterministic
+                            },
+                        );
+                    }
                 }
             }
         } else {
@@ -383,6 +501,30 @@ pub fn archive_recent_capped(
     Ok(report)
 }
 
+/// Promote every staged angle in order, stopping at the first promote failure.
+///
+/// Returns the angles promoted before any failure plus the index of the failing
+/// angle (`None` when all promoted). Shared by the all-bad and mixed archive
+/// finalization paths so the promote loop lives in exactly one place.
+fn promote_staged_angles(
+    store: &dyn ArchiveStore,
+    report: &mut CycleReport,
+    angles: &[ArchiveAngleRef],
+) -> (Vec<ArchiveAngleRef>, Option<usize>) {
+    let mut promoted_angles = Vec::with_capacity(angles.len());
+    let mut promote_failed_at = None;
+    for (idx, staged) in angles.iter().enumerate() {
+        let staging_rel = format!("{STAGING_DIR}/{}", staged.file_ref);
+        if store.promote_dest(&staging_rel, &staged.file_ref).is_err() {
+            report.copy_failed = report.copy_failed.saturating_add(1);
+            promote_failed_at = Some(idx);
+            break;
+        }
+        promoted_angles.push(staged.clone());
+    }
+    (promoted_angles, promote_failed_at)
+}
+
 /// Probe a copied candidate and register it (or defer/quarantine/reject).
 ///
 /// Deterministic indexd rejections ([`RegisterError::Rejected`]) are logged and
@@ -391,86 +533,103 @@ pub fn archive_recent_capped(
 struct RegistrationContext<'a> {
     candidate: &'a Candidate,
     marker_angles: Vec<MarkerAngle>,
+    quarantine_failure_detail: Option<String>,
     now_epoch_s: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinalizeDisposition {
+    Live,
+    PartiallyLive,
+    Quarantined,
+}
+
 fn finalize_registration(
-    store: &dyn ArchiveStore,
     register: &dyn RegisterClient,
     reg: ArchiveRegistration,
     state: &mut DriverState,
     report: &mut CycleReport,
     registration: RegistrationContext<'_>,
+    disposition: FinalizeDisposition,
+    probe_deterministic: bool,
 ) {
-    let probe_failures = collect_probe_failures(store, &reg.angles);
-    if probe_failures.is_empty() {
-        if let Err(err) = stage_outbox_registration(state, &reg, RegistrationDisposition::Live) {
-            log_outbox_stage_failure(&reg.canonical_key, &err);
-            report.copy_failed = report.copy_failed.saturating_add(1);
-            return;
+    match disposition {
+        FinalizeDisposition::Live | FinalizeDisposition::PartiallyLive => {
+            let marker_status = if matches!(disposition, FinalizeDisposition::Live) {
+                MarkerStatus::CompleteLive
+            } else {
+                MarkerStatus::Partial
+            };
+            if let Err(err) = stage_outbox_registration(state, &reg, RegistrationDisposition::Live) {
+                log_outbox_stage_failure(&reg.canonical_key, &err);
+                report.copy_failed = report.copy_failed.saturating_add(1);
+                return;
+            }
+            write_marker(
+                state,
+                registration.candidate,
+                marker_status,
+                probe_deterministic,
+                registration.marker_angles,
+                registration.now_epoch_s,
+            );
+            match register.register(&reg) {
+                Ok(_) => {
+                    persist_outbox(state);
+                    if matches!(disposition, FinalizeDisposition::Live) {
+                        report.registered = report.registered.saturating_add(1);
+                    } else {
+                        report.partially_archived = report.partially_archived.saturating_add(1);
+                    }
+                }
+                Err(RegisterError::Rejected { message }) => {
+                    persist_outbox(state);
+                    log_register_rejected_warning(&reg.canonical_key, &message);
+                    report.register_rejected = report.register_rejected.saturating_add(1);
+                }
+                Err(_) => {
+                    report.register_deferred = report.register_deferred.saturating_add(1);
+                    enqueue_pending(reg, RegistrationDisposition::Live, state, report);
+                }
+            }
         }
-        write_marker(
-            state,
-            registration.candidate,
-            MarkerStatus::CompleteLive,
-            false,
-            registration.marker_angles,
-            registration.now_epoch_s,
-        );
-        match register.register(&reg) {
-            Ok(_) => {
-                persist_outbox(state);
-                report.registered = report.registered.saturating_add(1);
+        FinalizeDisposition::Quarantined => {
+            log_quarantine_warning(
+                &reg.canonical_key,
+                registration
+                    .quarantine_failure_detail
+                    .as_deref()
+                    .unwrap_or("staged_probe_failed"),
+            );
+            report.quarantined_undecodable = report.quarantined_undecodable.saturating_add(1);
+            if let Err(err) =
+                stage_outbox_registration(state, &reg, RegistrationDisposition::Quarantine)
+            {
+                log_outbox_stage_failure(&reg.canonical_key, &err);
+                report.copy_failed = report.copy_failed.saturating_add(1);
+                return;
             }
-            Err(RegisterError::Rejected { message }) => {
-                persist_outbox(state);
-                log_register_rejected_warning(&reg.canonical_key, &message);
-                report.register_rejected = report.register_rejected.saturating_add(1);
-            }
-            Err(_) => {
-                report.register_deferred = report.register_deferred.saturating_add(1);
-                enqueue_pending(reg, RegistrationDisposition::Live, state, report);
-            }
-        }
-    } else {
-        let failure_detail = probe_failures
-            .iter()
-            .map(ProbeFailure::to_log_fragment)
-            .collect::<Vec<_>>()
-            .join(",");
-        log_quarantine_warning(&reg.canonical_key, &failure_detail);
-        report.quarantined_undecodable = report.quarantined_undecodable.saturating_add(1);
-        let probe_deterministic = !probe_failures.is_empty()
-            && probe_failures
-                .iter()
-                .all(|failure| matches!(failure.reason, ProbeFailureReason::Unplayable(_)));
-        if let Err(err) =
-            stage_outbox_registration(state, &reg, RegistrationDisposition::Quarantine)
-        {
-            log_outbox_stage_failure(&reg.canonical_key, &err);
-            report.copy_failed = report.copy_failed.saturating_add(1);
-            return;
-        }
-        write_marker(
-            state,
-            registration.candidate,
-            MarkerStatus::Quarantined,
-            probe_deterministic,
-            registration.marker_angles,
-            registration.now_epoch_s,
-        );
-        match register.register_quarantined(&reg) {
-            Ok(_) => {
-                persist_outbox(state);
-            }
-            Err(RegisterError::Rejected { message }) => {
-                persist_outbox(state);
-                log_register_rejected_warning(&reg.canonical_key, &message);
-                report.register_rejected = report.register_rejected.saturating_add(1);
-            }
-            Err(_) => {
-                report.register_deferred = report.register_deferred.saturating_add(1);
-                enqueue_pending(reg, RegistrationDisposition::Quarantine, state, report);
+            write_marker(
+                state,
+                registration.candidate,
+                MarkerStatus::Quarantined,
+                probe_deterministic,
+                registration.marker_angles,
+                registration.now_epoch_s,
+            );
+            match register.register_quarantined(&reg) {
+                Ok(_) => {
+                    persist_outbox(state);
+                }
+                Err(RegisterError::Rejected { message }) => {
+                    persist_outbox(state);
+                    log_register_rejected_warning(&reg.canonical_key, &message);
+                    report.register_rejected = report.register_rejected.saturating_add(1);
+                }
+                Err(_) => {
+                    report.register_deferred = report.register_deferred.saturating_add(1);
+                    enqueue_pending(reg, RegistrationDisposition::Quarantine, state, report);
+                }
             }
         }
     }
@@ -824,9 +983,9 @@ fn stage_outbox_registration(
 /// this cycle.
 ///
 /// A matching-fingerprint `CompleteLive` marker suppresses unconditionally. A
-/// `Quarantined` marker suppresses only when the quarantine was deterministic
-/// (every probe failure was `Unplayable`, none `ProbeIo`) AND we are still within
-/// the re-copy backoff window. The backoff — rather than permanent suppression —
+/// `Quarantined` or deterministic `Partial` markers suppress only when all probe
+/// failures were `Unplayable` (none `ProbeIo`) AND we are still within the
+/// re-copy backoff window. The backoff — rather than permanent suppression —
 /// is deliberate: the source fingerprint captures the clip's FAT allocation
 /// chain, directory metadata, and timestamps, but NOT its content bytes, so an
 /// in-place rewrite that leaves size/VDL/mtime unchanged keeps the same
@@ -846,7 +1005,7 @@ fn marker_suppresses_recopy(
     }
     match marker.status {
         MarkerStatus::CompleteLive => true,
-        MarkerStatus::Quarantined => {
+        MarkerStatus::Quarantined | MarkerStatus::Partial => {
             // Elapsed in [0, BACKOFF) suppresses. A negative elapsed (now <
             // updated_at) means the RTC-less Pi's clock stepped backward — treat
             // that as EXPIRED (do not suppress) so a backward clock can never
@@ -854,7 +1013,6 @@ fn marker_suppresses_recopy(
             let elapsed = now_epoch_s.saturating_sub(marker.updated_at);
             marker.probe_deterministic && (0..QUARANTINE_RECOPY_BACKOFF_S).contains(&elapsed)
         }
-        MarkerStatus::Partial => false,
     }
 }
 
@@ -960,13 +1118,14 @@ enum ProbeFailureReason {
     ProbeIo,
 }
 
-fn collect_probe_failures(
+fn collect_probe_failures_staged(
     store: &dyn ArchiveStore,
     angles: &[ArchiveAngleRef],
 ) -> Vec<ProbeFailure> {
     let mut failures = Vec::new();
     for angle in angles {
-        match store.probe_dest_playability(&angle.file_ref) {
+        let staging_rel = format!("{STAGING_DIR}/{}", angle.file_ref);
+        match store.probe_dest_playability(&staging_rel) {
             Ok(ArchivePlayability::Playable) => {}
             Ok(ArchivePlayability::Unplayable(reason)) => failures.push(ProbeFailure {
                 camera: angle.camera.clone(),
@@ -986,6 +1145,22 @@ fn log_quarantine_warning(canonical_key: &str, failure_detail: &str) {
     let _ = writeln!(
         &mut stderr,
         "retentiond archive_recent_only: quarantining_undecodable canonical_key={canonical_key} failures={failure_detail}"
+    );
+}
+
+fn log_partial_archive_warning(canonical_key: &str, cameras: &str) {
+    let mut stderr = io::stderr();
+    let _ = writeln!(
+        &mut stderr,
+        "retentiond archive_recent_only: partially_archived canonical_key={canonical_key} unarchived_cameras={cameras}"
+    );
+}
+
+fn log_kept_existing_archive(canonical_key: &str) {
+    let mut stderr = io::stderr();
+    let _ = writeln!(
+        &mut stderr,
+        "retentiond archive_recent_only: kept_existing_archive_discarded_bad_recopy canonical_key={canonical_key}"
     );
 }
 
@@ -1051,8 +1226,8 @@ mod tests {
         ClipMarker, CycleReport, DriverState, MARKER_SCHEMA, MAX_REGISTER_ATTEMPTS, MarkerAngle,
         MarkerStatus, MarkerSummary, OUTBOX_FILE, PRUNE_EVERY_CYCLES, PRUNE_GRACE_SECS,
         PRUNE_MIN_MISSED_SCANS, PersistedOutbox, QUARANTINE_RECOPY_BACKOFF_S,
-        RegistrationDisposition, archive_recent_capped, archive_recent_once, basename, marker_path,
-        read_marker,
+        RegistrationDisposition, STAGING_DIR, archive_recent_capped, archive_recent_once, basename,
+        marker_path, read_marker,
     };
 
     const KEY: &str = "0:TeslaCam/RecentClips/2026-06-19_10-00-00";
@@ -1165,6 +1340,18 @@ mod tests {
         "RecentClips/2026-06-19/2026-06-19_10-00-00/2026-06-19_10-00-00-back.mp4".to_owned()
     }
 
+    fn staging_path(final_rel: &str) -> String {
+        format!("{STAGING_DIR}/{final_rel}")
+    }
+
+    fn staged_front_path() -> String {
+        staging_path(&final_front_path())
+    }
+
+    fn staged_back_path() -> String {
+        staging_path(&final_back_path())
+    }
+
     #[derive(Default)]
     struct FakeCandidates {
         clips: RefCell<Vec<Candidate>>,
@@ -1187,8 +1374,11 @@ mod tests {
         copies: RefCell<Vec<(String, String)>>,
         promotions: RefCell<Vec<(String, String)>>,
         fail_once_src: RefCell<Option<String>>,
+        fail_promote_src: RefCell<Option<String>>,
         removed: RefCell<Vec<String>>,
         landed: RefCell<HashSet<String>>,
+        landed_hashes: RefCell<HashMap<String, ContentHash>>,
+        source_hashes: RefCell<HashMap<String, ContentHash>>,
         probe_unplayable: RefCell<HashMap<String, UnplayableReason>>,
         probe_error: RefCell<HashSet<String>>,
     }
@@ -1196,6 +1386,10 @@ mod tests {
     impl FakeStore {
         fn fail_once_for(&self, src_rel: &str) {
             *self.fail_once_src.borrow_mut() = Some(src_rel.to_owned());
+        }
+
+        fn set_fail_promote_once(&self, staging_rel: &str) {
+            *self.fail_promote_src.borrow_mut() = Some(staging_rel.to_owned());
         }
 
         fn set_unplayable(&self, dest_rel: &str, reason: UnplayableReason) {
@@ -1207,6 +1401,16 @@ mod tests {
         fn set_probe_error(&self, dest_rel: &str) {
             self.probe_error.borrow_mut().insert(dest_rel.to_owned());
         }
+
+        fn set_copy_hash(&self, src_rel: &str, hash: ContentHash) {
+            self.source_hashes
+                .borrow_mut()
+                .insert(src_rel.to_owned(), hash);
+        }
+
+        fn landed_hash(&self, dest_rel: &str) -> Option<ContentHash> {
+            self.landed_hashes.borrow().get(dest_rel).copied()
+        }
     }
 
     impl ArchiveStore for FakeStore {
@@ -1215,11 +1419,20 @@ mod tests {
                 *self.fail_once_src.borrow_mut() = None;
                 return Err(io::Error::other("copy failed"));
             }
+            let hash = self
+                .source_hashes
+                .borrow()
+                .get(src_rel)
+                .copied()
+                .unwrap_or_else(|| ContentHash::new([0_u8; 32]));
             self.copies
                 .borrow_mut()
                 .push((src_rel.to_owned(), dest_rel.to_owned()));
             self.landed.borrow_mut().insert(dest_rel.to_owned());
-            Ok(ContentHash::new([0_u8; 32]))
+            self.landed_hashes
+                .borrow_mut()
+                .insert(dest_rel.to_owned(), hash);
+            Ok(hash)
         }
 
         fn source_identity(&self, _src_rel: &str) -> io::Result<FileIdentity> {
@@ -1233,10 +1446,15 @@ mod tests {
         fn remove_dest(&self, dest_rel: &str) -> io::Result<()> {
             self.removed.borrow_mut().push(dest_rel.to_owned());
             self.landed.borrow_mut().remove(dest_rel);
+            self.landed_hashes.borrow_mut().remove(dest_rel);
             Ok(())
         }
 
         fn promote_dest(&self, staging_rel: &str, final_rel: &str) -> io::Result<()> {
+            if self.fail_promote_src.borrow().as_deref() == Some(staging_rel) {
+                *self.fail_promote_src.borrow_mut() = None;
+                return Err(io::Error::other("promote failed"));
+            }
             let mut landed = self.landed.borrow_mut();
             if !landed.remove(staging_rel) {
                 return Err(io::Error::new(
@@ -1245,6 +1463,15 @@ mod tests {
                 ));
             }
             landed.insert(final_rel.to_owned());
+            drop(landed);
+            let mut landed_hashes = self.landed_hashes.borrow_mut();
+            let Some(hash) = landed_hashes.remove(staging_rel) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("staging file hash not found: {staging_rel}"),
+                ));
+            };
+            landed_hashes.insert(final_rel.to_owned(), hash);
             self.promotions
                 .borrow_mut()
                 .push((staging_rel.to_owned(), final_rel.to_owned()));
@@ -1657,42 +1884,124 @@ mod tests {
     }
 
     #[test]
-    fn unplayable_angle_registers_quarantine_without_remove_dest() {
+    fn all_bad_clip_quarantines_and_accounts() {
         let candidates = FakeCandidates::default();
-        candidates.set(vec![sample_candidate()]);
+        let candidate = sample_candidate();
+        candidates.set(vec![candidate.clone()]);
         let store = FakeStore::default();
-        store.set_unplayable(
-            "RecentClips/2026-06-19/2026-06-19_10-00-00/2026-06-19_10-00-00-back.mp4",
-            UnplayableReason::NoMoov,
-        );
+        store.set_unplayable(&staged_front_path(), UnplayableReason::NoMoov);
+        store.set_unplayable(&staged_back_path(), UnplayableReason::NoMoov);
         let register = FakeRegister::default();
-        let mut state = DriverState::new();
+        let archive_root = new_archive_root();
+        let mut state = DriverState::with_archive_root(&archive_root);
 
         let report = archive_recent_once(&candidates, &store, &register, &mut state, 1).unwrap();
         assert_eq!(report.quarantined_undecodable, 1);
+        assert_eq!(report.partially_archived, 0);
         assert_eq!(report.copy_failed, 0);
         assert_eq!(register.live_calls.borrow().len(), 0);
         assert_eq!(register.quarantine_calls.borrow().len(), 1);
-        assert!(store.removed.borrow().is_empty());
+        assert_eq!(register.quarantine_calls.borrow()[0].angles.len(), 2);
+        let marker = read_marker(&state, &candidate).expect("quarantined marker");
+        assert_eq!(marker.status, MarkerStatus::Quarantined);
+        assert!(marker.probe_deterministic);
+        assert!(store.landed.borrow().contains(&final_front_path()));
+        assert!(store.landed.borrow().contains(&final_back_path()));
+
+        let _ = fs::remove_dir_all(archive_root);
+    }
+
+    #[test]
+    fn mixed_clip_promotes_good_angle_live_and_leaves_bad_unpromoted() {
+        let candidates = FakeCandidates::default();
+        let candidate = sample_candidate();
+        candidates.set(vec![candidate.clone()]);
+        let store = FakeStore::default();
+        store.set_unplayable(&staged_back_path(), UnplayableReason::NoMoov);
+        let register = FakeRegister::default();
+        let archive_root = new_archive_root();
+        let mut state = DriverState::with_archive_root(&archive_root);
+
+        let report = archive_recent_once(&candidates, &store, &register, &mut state, 1).unwrap();
+        assert_eq!(report.partially_archived, 1);
+        assert_eq!(report.registered, 0);
+        assert_eq!(report.quarantined_undecodable, 0);
+        assert_eq!(register.live_calls.borrow().len(), 1);
+        assert_eq!(register.quarantine_calls.borrow().len(), 0);
+        let reg = register.live_calls.borrow();
+        assert_eq!(reg[0].angles.len(), 1);
+        assert_eq!(reg[0].angles[0].camera, "front");
+        drop(reg);
+        assert!(store.landed.borrow().contains(&final_front_path()));
+        assert!(
+            !store.landed.borrow().contains(&final_back_path()),
+            "bad angle must never be promoted to final path"
+        );
+        assert!(
+            store
+                .removed
+                .borrow()
+                .iter()
+                .any(|path| path == &staged_back_path()),
+            "bad staged file must be discarded, not leaked in staging"
+        );
+        assert!(
+            !store.landed.borrow().contains(&staged_back_path()),
+            "bad staged file must not remain in staging"
+        );
+        let marker = read_marker(&state, &candidate).expect("partial marker");
+        assert_eq!(marker.status, MarkerStatus::Partial);
+        assert_eq!(marker.angles.len(), 1);
+        assert_eq!(marker.angles[0].camera, "front");
+
+        let _ = fs::remove_dir_all(archive_root);
+    }
+
+    #[test]
+    fn single_bad_angle_clip_degenerates_to_all_bad() {
+        let mut candidate = sample_candidate();
+        candidate.angles.truncate(1);
+        let candidates = FakeCandidates::default();
+        candidates.set(vec![candidate.clone()]);
+        let store = FakeStore::default();
+        let bad_final = format!(
+            "RecentClips/2026-06-19/2026-06-19_10-00-00/2026-06-19_10-00-00-{}.mp4",
+            candidate.angles[0].camera
+        );
+        store.set_unplayable(&staging_path(&bad_final), UnplayableReason::NoMoov);
+        let register = FakeRegister::default();
+        let archive_root = new_archive_root();
+        let mut state = DriverState::with_archive_root(&archive_root);
+
+        let report = archive_recent_once(&candidates, &store, &register, &mut state, 1).unwrap();
+        assert_eq!(report.quarantined_undecodable, 1);
+        assert_eq!(report.partially_archived, 0);
+        assert_eq!(register.live_calls.borrow().len(), 0);
+        assert_eq!(register.quarantine_calls.borrow().len(), 1);
+        assert_eq!(register.quarantine_calls.borrow()[0].angles.len(), 1);
+        let marker = read_marker(&state, &candidate).expect("quarantined marker");
+        assert_eq!(marker.status, MarkerStatus::Quarantined);
+
+        let _ = fs::remove_dir_all(archive_root);
     }
 
     #[test]
     fn probe_error_routes_to_quarantine_without_copy_failure_or_remove() {
         let candidates = FakeCandidates::default();
-        candidates.set(vec![sample_candidate()]);
+        let candidate = sample_candidate();
+        candidates.set(vec![candidate.clone()]);
         let store = FakeStore::default();
-        store.set_probe_error(
-            "RecentClips/2026-06-19/2026-06-19_10-00-00/2026-06-19_10-00-00-front.mp4",
-        );
+        store.set_probe_error(&staged_front_path());
+        store.set_probe_error(&staged_back_path());
         let register = FakeRegister::default();
         let mut state = DriverState::new();
 
         let report = archive_recent_once(&candidates, &store, &register, &mut state, 1).unwrap();
         assert_eq!(report.copy_failed, 0);
         assert_eq!(report.quarantined_undecodable, 1);
-        assert!(store.removed.borrow().is_empty());
         assert_eq!(register.live_calls.borrow().len(), 0);
         assert_eq!(register.quarantine_calls.borrow().len(), 1);
+        assert!(store.removed.borrow().is_empty());
     }
 
     #[test]
@@ -1700,10 +2009,8 @@ mod tests {
         let candidates = FakeCandidates::default();
         candidates.set(vec![sample_candidate()]);
         let store = FakeStore::default();
-        store.set_unplayable(
-            "RecentClips/2026-06-19/2026-06-19_10-00-00/2026-06-19_10-00-00-front.mp4",
-            UnplayableReason::NoMoov,
-        );
+        store.set_unplayable(&staged_front_path(), UnplayableReason::NoMoov);
+        store.set_unplayable(&staged_back_path(), UnplayableReason::NoMoov);
         let register = FakeRegister::with_quarantine_failures(vec![true, true, false]);
         let mut state = DriverState::new();
 
@@ -1788,10 +2095,8 @@ mod tests {
         let candidates = FakeCandidates::default();
         candidates.set(vec![sample_candidate()]);
         let store = FakeStore::default();
-        store.set_unplayable(
-            "RecentClips/2026-06-19/2026-06-19_10-00-00/2026-06-19_10-00-00-front.mp4",
-            UnplayableReason::NoMoov,
-        );
+        store.set_unplayable(&staged_front_path(), UnplayableReason::NoMoov);
+        store.set_unplayable(&staged_back_path(), UnplayableReason::NoMoov);
         let register = FakeRegister::default();
         register.set_always_fail_quarantine(true);
         let mut state = DriverState::new();
@@ -1838,13 +2143,12 @@ mod tests {
 
     #[test]
     fn deterministic_quarantine_same_fingerprint_suppresses_within_backoff() {
-        const BACK_DEST: &str =
-            "RecentClips/2026-06-19/2026-06-19_10-00-00/2026-06-19_10-00-00-back.mp4";
         let candidates = FakeCandidates::default();
         let candidate = sample_candidate();
         candidates.set(vec![candidate.clone()]);
         let store = FakeStore::default();
-        store.set_unplayable(BACK_DEST, UnplayableReason::NoMoov);
+        store.set_unplayable(&staged_front_path(), UnplayableReason::NoMoov);
+        store.set_unplayable(&staged_back_path(), UnplayableReason::NoMoov);
         let register = FakeRegister::default();
         let archive_root = new_archive_root();
         let mut state = DriverState::with_archive_root(&archive_root);
@@ -1866,13 +2170,12 @@ mod tests {
 
     #[test]
     fn deterministic_quarantine_recopies_after_backoff() {
-        const BACK_DEST: &str =
-            "RecentClips/2026-06-19/2026-06-19_10-00-00/2026-06-19_10-00-00-back.mp4";
         let candidates = FakeCandidates::default();
         let candidate = sample_candidate();
         candidates.set(vec![candidate.clone()]);
         let store = FakeStore::default();
-        store.set_unplayable(BACK_DEST, UnplayableReason::NoMoov);
+        store.set_unplayable(&staged_front_path(), UnplayableReason::NoMoov);
+        store.set_unplayable(&staged_back_path(), UnplayableReason::NoMoov);
         let register = FakeRegister::default();
         let archive_root = new_archive_root();
         let mut state = DriverState::with_archive_root(&archive_root);
@@ -1899,13 +2202,12 @@ mod tests {
 
     #[test]
     fn deterministic_quarantine_expired_when_clock_steps_back_recopies() {
-        const BACK_DEST: &str =
-            "RecentClips/2026-06-19/2026-06-19_10-00-00/2026-06-19_10-00-00-back.mp4";
         let candidates = FakeCandidates::default();
         let candidate = sample_candidate();
         candidates.set(vec![candidate.clone()]);
         let store = FakeStore::default();
-        store.set_unplayable(BACK_DEST, UnplayableReason::NoMoov);
+        store.set_unplayable(&staged_front_path(), UnplayableReason::NoMoov);
+        store.set_unplayable(&staged_back_path(), UnplayableReason::NoMoov);
         let register = FakeRegister::default();
         let archive_root = new_archive_root();
         let mut state = DriverState::with_archive_root(&archive_root);
@@ -1925,13 +2227,12 @@ mod tests {
 
     #[test]
     fn deterministic_quarantine_changed_fingerprint_recopies_within_backoff() {
-        const BACK_DEST: &str =
-            "RecentClips/2026-06-19/2026-06-19_10-00-00/2026-06-19_10-00-00-back.mp4";
         let candidates = FakeCandidates::default();
         let candidate = sample_candidate();
         candidates.set(vec![candidate.clone()]);
         let store = FakeStore::default();
-        store.set_unplayable(BACK_DEST, UnplayableReason::NoMoov);
+        store.set_unplayable(&staged_front_path(), UnplayableReason::NoMoov);
+        store.set_unplayable(&staged_back_path(), UnplayableReason::NoMoov);
         let register = FakeRegister::default();
         let archive_root = new_archive_root();
         let mut state = DriverState::with_archive_root(&archive_root);
@@ -1953,13 +2254,12 @@ mod tests {
 
     #[test]
     fn transient_probe_io_quarantine_retries_every_cycle() {
-        const BACK_DEST: &str =
-            "RecentClips/2026-06-19/2026-06-19_10-00-00/2026-06-19_10-00-00-back.mp4";
         let candidates = FakeCandidates::default();
         let candidate = sample_candidate();
         candidates.set(vec![candidate.clone()]);
         let store = FakeStore::default();
-        store.set_probe_error(BACK_DEST);
+        store.set_probe_error(&staged_front_path());
+        store.set_probe_error(&staged_back_path());
         let register = FakeRegister::default();
         let archive_root = new_archive_root();
         let mut state = DriverState::with_archive_root(&archive_root);
@@ -1974,6 +2274,245 @@ mod tests {
             archive_recent_once(&candidates, &store, &register, &mut state, 1000 + 60).unwrap();
         assert!(store.copies.borrow().len() > copies_after_first);
         assert_eq!(second.quarantined_undecodable, 1);
+
+        let _ = fs::remove_dir_all(archive_root);
+    }
+
+    #[test]
+    fn mixed_clip_deterministic_bad_angle_backs_off_recopy() {
+        let candidates = FakeCandidates::default();
+        let candidate = sample_candidate();
+        candidates.set(vec![candidate.clone()]);
+        let store = FakeStore::default();
+        store.set_unplayable(&staged_back_path(), UnplayableReason::NoMoov);
+        let register = FakeRegister::default();
+        let archive_root = new_archive_root();
+        let mut state = DriverState::with_archive_root(&archive_root);
+
+        let first = archive_recent_once(&candidates, &store, &register, &mut state, 1000).unwrap();
+        assert_eq!(first.partially_archived, 1);
+        let marker = read_marker(&state, &candidate).expect("partial marker");
+        assert_eq!(marker.status, MarkerStatus::Partial);
+        assert!(marker.probe_deterministic);
+        let copies_after_first = store.copies.borrow().len();
+
+        let second =
+            archive_recent_once(&candidates, &store, &register, &mut state, 1000 + 60).unwrap();
+        assert_eq!(store.copies.borrow().len(), copies_after_first);
+        assert_eq!(second.partially_archived, 0);
+        assert_eq!(second.registered, 0);
+        assert_eq!(second.quarantined_undecodable, 0);
+
+        let _ = fs::remove_dir_all(archive_root);
+    }
+
+    #[test]
+    fn mixed_clip_transient_bad_angle_retries_every_cycle() {
+        let candidates = FakeCandidates::default();
+        let candidate = sample_candidate();
+        candidates.set(vec![candidate.clone()]);
+        let store = FakeStore::default();
+        store.set_probe_error(&staged_back_path());
+        let register = FakeRegister::default();
+        let archive_root = new_archive_root();
+        let mut state = DriverState::with_archive_root(&archive_root);
+
+        let first = archive_recent_once(&candidates, &store, &register, &mut state, 1000).unwrap();
+        assert_eq!(first.partially_archived, 1);
+        let marker = read_marker(&state, &candidate).expect("partial marker");
+        assert_eq!(marker.status, MarkerStatus::Partial);
+        assert!(!marker.probe_deterministic);
+        let copies_after_first = store.copies.borrow().len();
+
+        let second =
+            archive_recent_once(&candidates, &store, &register, &mut state, 1000 + 60).unwrap();
+        assert!(store.copies.borrow().len() > copies_after_first);
+        assert_eq!(second.partially_archived, 1);
+
+        let _ = fs::remove_dir_all(archive_root);
+    }
+
+    #[test]
+    fn regressed_good_angle_is_not_overwritten_by_bad_recopy() {
+        let candidates = FakeCandidates::default();
+        let initial = sample_candidate();
+        candidates.set(vec![initial.clone()]);
+        let store = FakeStore::default();
+        store.set_copy_hash(
+            "TeslaCam/RecentClips/2026-06-19_10-00-00-front.mp4",
+            ContentHash::new([1_u8; 32]),
+        );
+        store.set_copy_hash(
+            "TeslaCam/RecentClips/2026-06-19_10-00-00-back.mp4",
+            ContentHash::new([2_u8; 32]),
+        );
+        let register = FakeRegister::default();
+        let archive_root = new_archive_root();
+        let mut state = DriverState::with_archive_root(&archive_root);
+
+        let first = archive_recent_once(&candidates, &store, &register, &mut state, 1).unwrap();
+        assert_eq!(first.registered, 1);
+        let front_hash_cycle1 = store
+            .landed_hash(&final_front_path())
+            .expect("front final hash after cycle 1");
+
+        let replacement = replacement_candidate_with_fingerprint(&initial, "fingerprint-b");
+        candidates.set(vec![replacement.clone()]);
+        store.set_copy_hash(
+            "TeslaCam/RecentClips/2026-06-19_10-00-00-front.mp4",
+            ContentHash::new([9_u8; 32]),
+        );
+        store.set_unplayable(&staged_front_path(), UnplayableReason::NoMoov);
+
+        let second = archive_recent_once(&candidates, &store, &register, &mut state, 2).unwrap();
+        assert_eq!(second.partially_archived, 1);
+        assert_eq!(second.quarantined_undecodable, 0);
+        let front_hash_cycle2 = store
+            .landed_hash(&final_front_path())
+            .expect("front final hash after cycle 2");
+        assert_eq!(
+            front_hash_cycle2, front_hash_cycle1,
+            "previously-good final front bytes must remain unchanged"
+        );
+        let calls = register.live_calls.borrow();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].angles.len(), 1);
+        assert_eq!(calls[1].angles[0].camera, "back");
+        drop(calls);
+        assert_eq!(register.quarantine_calls.borrow().len(), 0);
+
+        let _ = fs::remove_dir_all(archive_root);
+    }
+
+    #[test]
+    fn all_good_clip_registers_live_unchanged() {
+        let candidates = FakeCandidates::default();
+        let candidate = sample_candidate();
+        candidates.set(vec![candidate.clone()]);
+        let store = FakeStore::default();
+        let register = FakeRegister::default();
+        let archive_root = new_archive_root();
+        let mut state = DriverState::with_archive_root(&archive_root);
+
+        let report = archive_recent_once(&candidates, &store, &register, &mut state, 1).unwrap();
+        assert_eq!(report.registered, 1);
+        assert_eq!(report.partially_archived, 0);
+        assert_eq!(report.quarantined_undecodable, 0);
+        assert_eq!(register.live_calls.borrow().len(), 1);
+        assert_eq!(register.live_calls.borrow()[0].angles.len(), 2);
+        let marker = read_marker(&state, &candidate).expect("complete marker");
+        assert_eq!(marker.status, MarkerStatus::CompleteLive);
+
+        let _ = fs::remove_dir_all(archive_root);
+    }
+
+    #[test]
+    fn all_bad_recopy_over_complete_live_preserves_good_bytes() {
+        let candidates = FakeCandidates::default();
+        let initial = sample_candidate();
+        candidates.set(vec![initial.clone()]);
+        let store = FakeStore::default();
+        store.set_copy_hash(
+            "TeslaCam/RecentClips/2026-06-19_10-00-00-front.mp4",
+            ContentHash::new([1_u8; 32]),
+        );
+        store.set_copy_hash(
+            "TeslaCam/RecentClips/2026-06-19_10-00-00-back.mp4",
+            ContentHash::new([2_u8; 32]),
+        );
+        let register = FakeRegister::default();
+        let archive_root = new_archive_root();
+        let mut state = DriverState::with_archive_root(&archive_root);
+
+        let first = archive_recent_once(&candidates, &store, &register, &mut state, 1).unwrap();
+        assert_eq!(first.registered, 1);
+        let front_hash_cycle1 = store
+            .landed_hash(&final_front_path())
+            .expect("front final hash after cycle 1");
+        let back_hash_cycle1 = store
+            .landed_hash(&final_back_path())
+            .expect("back final hash after cycle 1");
+        let promotions_after_cycle1 = store.promotions.borrow().len();
+
+        // Cycle 2: same clip, new source fingerprint, BOTH staged angles now bad.
+        let replacement = replacement_candidate_with_fingerprint(&initial, "fingerprint-b");
+        candidates.set(vec![replacement.clone()]);
+        store.set_copy_hash(
+            "TeslaCam/RecentClips/2026-06-19_10-00-00-front.mp4",
+            ContentHash::new([8_u8; 32]),
+        );
+        store.set_copy_hash(
+            "TeslaCam/RecentClips/2026-06-19_10-00-00-back.mp4",
+            ContentHash::new([9_u8; 32]),
+        );
+        store.set_unplayable(&staged_front_path(), UnplayableReason::NoMoov);
+        store.set_unplayable(&staged_back_path(), UnplayableReason::NoMoov);
+
+        let second = archive_recent_once(&candidates, &store, &register, &mut state, 2).unwrap();
+        assert_eq!(second.registered, 0);
+        assert_eq!(second.partially_archived, 0);
+        assert_eq!(second.quarantined_undecodable, 0);
+        // The previously-good final bytes must be untouched (never promoted over).
+        assert_eq!(
+            store.landed_hash(&final_front_path()),
+            Some(front_hash_cycle1),
+            "front final bytes must survive an all-bad recopy"
+        );
+        assert_eq!(
+            store.landed_hash(&final_back_path()),
+            Some(back_hash_cycle1),
+            "back final bytes must survive an all-bad recopy"
+        );
+        assert_eq!(
+            store.promotions.borrow().len(),
+            promotions_after_cycle1,
+            "the all-bad prior-good guard must not promote any staged bytes"
+        );
+        assert_eq!(register.live_calls.borrow().len(), 1);
+        assert_eq!(register.quarantine_calls.borrow().len(), 0);
+        // Marker re-anchored to the new fingerprint, prior good status preserved.
+        let marker = read_marker(&state, &replacement).expect("marker after cycle 2");
+        assert_eq!(marker.status, MarkerStatus::CompleteLive);
+        assert_eq!(marker.source_fingerprint.as_str(), "fingerprint-b");
+
+        let _ = fs::remove_dir_all(archive_root);
+    }
+
+    #[test]
+    fn mixed_promote_failure_discards_bad_staged() {
+        let candidates = FakeCandidates::default();
+        let candidate = sample_candidate();
+        candidates.set(vec![candidate.clone()]);
+        let store = FakeStore::default();
+        // Front good, back bad in staging; the good angle's promote then fails,
+        // forcing the mixed promote-failure arm.
+        store.set_unplayable(&staged_back_path(), UnplayableReason::NoMoov);
+        store.set_fail_promote_once(&staged_front_path());
+        let register = FakeRegister::default();
+        let archive_root = new_archive_root();
+        let mut state = DriverState::with_archive_root(&archive_root);
+
+        let report = archive_recent_once(&candidates, &store, &register, &mut state, 1).unwrap();
+        assert_eq!(report.copy_failed, 1);
+        assert_eq!(report.registered, 0);
+        assert_eq!(report.partially_archived, 0);
+        assert_eq!(report.quarantined_undecodable, 0);
+        assert_eq!(register.live_calls.borrow().len(), 0);
+        assert_eq!(register.quarantine_calls.borrow().len(), 0);
+
+        let removed = store.removed.borrow();
+        assert!(
+            removed.contains(&staged_front_path()),
+            "good staged file must be discarded on promote failure"
+        );
+        assert!(
+            removed.contains(&staged_back_path()),
+            "bad staged file must be discarded on promote failure (no staging leak)"
+        );
+        drop(removed);
+
+        let marker = read_marker(&state, &candidate).expect("partial marker");
+        assert_eq!(marker.status, MarkerStatus::Partial);
 
         let _ = fs::remove_dir_all(archive_root);
     }
