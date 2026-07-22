@@ -1384,7 +1384,7 @@ LUNs) is the single make-or-break that still needs the car.**
   UAT `spa/test/uat/shell.spec.ts` (active/inactive) 12 pass at 375+1280. LIVE-verified
   on hardware 2026-06-26: banner correctly **hidden** when no handoff active, both
   viewports, console + network clean. See `files/hw-results.md` "bb-folder+op-banner live".)**
-- [ ] Primary nav (sidebar desktop / bottom tabs mobile), availability-gated items. **(partial: nav present; per-feature availability gating to finish — A9)**
+- [x] Primary nav (sidebar desktop / bottom tabs mobile), availability-gated items. **(nav COMPLETE; per-feature availability gating DESCOPED per operator decision 2026-07-22 — A9 closed. All shipped features are always available in the single-image B-1 architecture (media folders provisioned at setup; Map/Analytics/Media/Cloud/Settings are all real parity screens; media sub-nav pills all route to real screens), so runtime availability gating would be permanently dead code. `Shell.tsx` `NAV` and `MediaPills.tsx` `PILLS` render statically by design. Revisit only if a feature ever ships in a genuinely optional/stubbed state.)**
 - [ ] Feedback model: JSON for AJAX + flash banners; live-poll views. **(partial: proven on media routes; not yet audited across all routes — see §5 error-code audit)**
 
 ---
