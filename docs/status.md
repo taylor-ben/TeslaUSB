@@ -1540,9 +1540,27 @@ LUNs) is the single make-or-break that still needs the car.**
   Reviews: GPT-5.5 `moov-design-review` (design) + `moov-review`/`moov-review2` (diff).
   Will quarantine the live synthetic clip-5 stubs when deployed (expected; not a
   regression). Follow-ups filed below. **(follow-up from `p1-playwright`)**
-  - [ ] **FU-1** — remediate clips force-promoted to `archive` *before* this gate
-    (live clip-5 stubs stay playable-but-broken until a narrow Guard-A exception +
-    re-validation driver downgrades them; low urgency, superseded at C3).
+  - [ ] **FU-1** — remediate clips force-promoted to `archive` *before* the decodability
+    gate. *(Deferred 2026-07-22; remediation target does not exist on a fresh install —
+    two-model DEFER, Opus + independent GPT-5.5.)* The target is `archive_items` rows
+    promoted to `LIVE` before the 2026-06-22 probe gate (e.g. the old synthetic ~48 KiB
+    clip-5 stubs with no `moov`, playable-but-broken). On a fresh provision indexd creates
+    `/var/lib/teslausb/index.sqlite3` empty from the v1 schema (`db/migrations.rs` §archive_items,
+    `db/mod.rs` `apply_migrations`), so every row is written by a *post-gate* register verb
+    (`register_archived_clip`/`register_quarantined_clip`, `db/ingest.rs`) — zero pre-gate
+    rows exist. The current device is a genuinely fresh SD card, so the condition is absent.
+    Building the "Guard-A exception + re-validation driver" would also have to punch a hole
+    in indexd's *intentionally guarded* `LIVE→QUARANTINED` downgrade (`db/ingest.rs` keeps
+    `LIVE` when a re-register arrives as `QUARANTINED`), adding archive-serving/delete-state
+    risk on the recording path to defend a condition that isn't present — speculative per the
+    simplicity-first charter. **Correct trigger (sharpened by GPT-5.5):** revisit only when an
+    in-place migration/import (`setup.sh update` preserves disk/archive/index; migration.md
+    D2 "no reflash") carries a **pre-gate or unknown-provenance** `index.sqlite3` + archive/
+    marker state onto a running device; implement then as a **one-shot migration
+    revalidation** before serving archive, NOT as standing daemon behaviour. **Documented
+    risk of deferring:** on such a preserved device a pre-gate broken `LIVE` clip stays
+    playable-but-broken indefinitely (a durable `complete_live` marker suppresses recopy, so
+    the level-triggered self-heal never re-probes it). Acceptable today: no such device exists.
   - [x] **FU-2** — **`QUARANTINED→LIVE` self-heal is already satisfied in production
     (ADR-0005); no candidate-selection change was required.** The "permanently
     quarantined" worry was true only of the pre-ADR-0004 SQLite candidate seam
