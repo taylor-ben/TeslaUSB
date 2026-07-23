@@ -1,0 +1,116 @@
+# Contract: webd `/api/cloud` HTTP surface
+
+Status: **NOT FROZEN — reconciled design draft with OPEN ITEMS.** Target surface
+for **P4** (webd) + **P6** (SPA). A Tier-3 review (cycle 2,
+`files/cloud-p0-review-reconciliation.md`) confirmed the security prerequisite but
+found the wire contract underspecified. Pinned in P4, not here.
+
+> **OPEN ITEMS (pin in P4):**
+> - **The full session + CSRF wire contract** — login/bootstrap flow, cookie
+>   attributes, expiry, CSRF token issuance/rotation, origin policy, exact 401/403
+>   envelopes — so webd and the SPA implement one interoperable scheme (webd has
+>   **no auth today**; §0).
+> - **The uploadd control socket** (path, frame cap, timeout, response envelope)
+>   incl. a typed `get_status` verb — the only authoritative source for
+>   `configured` / `provider_type` / uploader status / `sync-now` status (§4).
+> - Manual retry maps to the indexd **`cloud_queue_retry`** verb (parent/child +
+>   collision resolution), not a plain upsert.
+> - Redaction is enforced **before persistence** in the rclone engine, not only at
+>   this edge (see the creds contract).
+
+webd today exposes only `/api/jobs` + `/api/jobs/failed`; there is **no
+`/api/cloud`**. P4 adds it.
+
+---
+
+## 0. Security prerequisite — auth + CSRF (D8, blocks P4)
+webd currently has **no auth middleware**; every route is unauthenticated. The
+cloud surface **mutates credentials and triggers uploads**, so before any mutating
+`/api/cloud/*` route ships:
+- an **authenticated operator session** (the parity target is v1's privileged-
+  action gate) must guard all non-GET cloud routes, and
+- **CSRF protection** (same-site + token) on those mutations.
+
+This is a **P4 prerequisite**, tracked as its own gate in `plan.md`. GET status
+may be readable, but **no credential write or `sync-now` lands unauthenticated**.
+
+## 1. Transport & error mapping
+JSON over the existing webd HTTP server. webd calls **indexd** for
+state/config/history and an **uploadd control socket** for actions (D6, §4).
+
+- indexd unavailable (non-unix stub / socket error) → **503** (mirrors the
+  existing `set_pref` path).
+- **Fix (m1):** `webd::indexd_client` currently maps read-timeout / connection-
+  reset to `Protocol` → **500**; these are availability failures and must map to
+  **`Unavailable` → 503** so the SPA shows "temporarily unavailable," not a bug.
+- **Redacted errors (D8):** responses **never** echo raw rclone/backend output or
+  submitted secret values. Errors are a **stable code + sanitized, length-capped
+  message** (mirroring wifid ipc's "reason never echoes the submitted value").
+  Test-connection returns a **classified** result (`ok | auth_failed |
+  unreachable | config_invalid | timeout`), not verbatim stderr.
+
+## 2. Endpoints
+
+### Reads
+- `GET /api/cloud` → dashboard: `{ configured, provider_type, status, counters:
+  {synced_count, synced_bytes, since_at}, queue: {counts_by_state, in_progress?},
+  last_error_class? }`. Counters come from `cloud_stats_get` (derived — M1).
+- `GET /api/cloud/config` → non-secret config (`cloud_config_get`): folders,
+  priority, `reserve_gb`, retry, toggles. **Never** returns secrets.
+- `GET /api/cloud/queue?cursor=&limit=` → paginated queue snapshot
+  (`cloud_queue_load`); `limit` **server-capped** (m2).
+- `GET /api/cloud/history?cursor=&limit=` → paginated history
+  (`cloud_history_load`); `limit` server-capped (m2).
+
+### Mutations (all auth + CSRF gated — §0)
+- `PUT /api/cloud/config` → validate (like `set_pref`) → `cloud_config_put`.
+  Rejects unknown keys / out-of-range values with 400 + field error.
+- `POST /api/cloud/provider` → set credentials for one flow (OAuth token paste /
+  S3 form / NAS form or `rclone.conf` paste). webd **validates + type/‌key
+  allow-lists** (`cloud-provider-creds.md` §4) **before** handing to the creds
+  store; a rejected paste (multi-section, banned key, bad type) → **400 with a
+  sanitized reason**. On success the blob is (re)written and uploadd is signaled
+  to reload (D9, §4).
+- `POST /api/cloud/provider/test` → `rclone lsd teslausb:` (or `rclone about`)
+  via the uploadd control socket; returns the **classified** result (§1), never
+  raw stderr.
+- `POST /api/cloud/sync-now` → asks **uploadd** (control socket, §4) to run a
+  candidate/enqueue/drain pass now. 202 + current status; **never** blocks on the
+  transfer.
+- `POST /api/cloud/reset-counters` → `cloud_stats_reset` (sets the stats baseline
+  — M1). Returns the new baseline.
+- `POST /api/cloud/queue/{archive_item_id}/retry` → requeue the **parked/failed**
+  children of that event. Path segment is the **numeric `archive_item_id`** (M5)
+  — **not** a slash-bearing remote key (which would break routing/emit ambiguous
+  URLs). Body may carry an optional `child_key` to retry a single child.
+
+## 3. FailedJobs / JobHub wiring (M5)
+Upload failures already have a home: `JobHub` + `FailedJobs.tsx` + the
+`upload_queue` SSE seam (present, unfed). P4 feeds them from the **persistent**
+`cloud_upload_queue` / `cloud_sync_history` (not an in-memory ring that dies on
+restart):
+- failed/parked children surface as `JobStatus` entries with a **sanitized**
+  `error_class` (no raw stderr — D8),
+- the SSE `upload_queue` topic emits state transitions,
+- the manual-retry action maps to `POST /api/cloud/queue/{archive_item_id}/retry`.
+
+## 4. uploadd control socket (D6)
+`sync-now`, `provider/test`, and the provider-reload signal need a **live uploadd
+process**, not indexd. P4 pins a small uploadd control socket (framed-JSON
+`{"cmd":…}`, same framing family) with verbs `sync_now`, `test_remote`,
+`reload_credentials`. Until uploadd is enabled (Phase 8 gate), these return a
+well-formed **503 "uploader offline"** rather than a hang or a 500.
+
+## 5. Deferred (post-P0)
+- A remote **browse** endpoint (list objects on the remote) — **post-P0** (m2);
+  not needed for parity MVP and adds bandwidth/enumeration cost.
+
+## 6. Tests (P4 acceptance)
+Accept/reject/persist per endpoint; **auth + CSRF**: every mutating route rejects
+unauthenticated / bad-token with 401/403 and **does not** touch creds/indexd;
+provider paste rejection (multi-section, banned key, `type=wasabi` normalized to
+`s3`) → 400 sanitized; **no endpoint ever returns raw rclone stderr or a secret**
+(assert on redaction); indexd-down → 503 (incl. the m1 timeout/reset remap);
+uploadd-offline → 503 "uploader offline"; retry route accepts the numeric
+`archive_item_id` and rejects a non-numeric segment; stats reflect a
+`reset-counters` baseline.
