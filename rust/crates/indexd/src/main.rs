@@ -52,7 +52,7 @@ mod unix_app {
     use indexd::db::ingest::{FrontParseAttemptRow, load_front_parse_attempts};
     use indexd::db::mutations::BootContext;
     use indexd::db::{DbError, open};
-    use indexd::derive::DeriveConfig;
+    use indexd::derive::{self, DeriveConfig};
     use indexd::server;
     use scannerd::produce::MAX_FRONT_SHAPES_PER_BATCH;
     use scannerd::proto::{Request, read_batch, write_request};
@@ -412,7 +412,8 @@ mod unix_app {
                     eprintln!("indexd: database mutex poisoned");
                     return;
                 };
-                let result = apply(&mut locked, &batch, derive_cfg);
+                let effective_cfg = derive::load_derive_config(&locked, derive_cfg);
+                let result = apply(&mut locked, &batch, effective_cfg);
                 let next = if result.is_ok() {
                     match load_front_parse_attempts(&locked) {
                         Ok(attempts) => {

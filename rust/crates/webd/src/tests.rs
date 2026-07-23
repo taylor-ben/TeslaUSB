@@ -615,12 +615,143 @@ async fn put_settings_clock_utc_forwards_set_pref() {
 }
 
 #[tokio::test]
+async fn put_settings_trip_gap_minutes_forwards_set_pref() {
+    let fx = settings_fixture(json!({ "status": "pref_set", "key": "trip_gap_minutes" }), false);
+    let (status, body) = put_json(
+        &fx.app,
+        "/api/settings",
+        json!({ "key": "trip_gap_minutes", "value": "15" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!({ "key": "trip_gap_minutes", "value": "15" }));
+    let req = fx.indexd_last.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        req,
+        json!({ "cmd": "set_pref", "key": "trip_gap_minutes", "value": "15" })
+    );
+}
+
+#[tokio::test]
+async fn put_settings_speed_limit_mph_forwards_set_pref() {
+    let fx = settings_fixture(json!({ "status": "pref_set", "key": "speed_limit_mph" }), false);
+    let (status, body) = put_json(
+        &fx.app,
+        "/api/settings",
+        json!({ "key": "speed_limit_mph", "value": "75" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!({ "key": "speed_limit_mph", "value": "75" }));
+    let req = fx.indexd_last.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        req,
+        json!({ "cmd": "set_pref", "key": "speed_limit_mph", "value": "75" })
+    );
+}
+
+#[tokio::test]
+async fn put_settings_display_timezone_forwards_set_pref() {
+    let fx = settings_fixture(json!({ "status": "pref_set", "key": "display_timezone" }), false);
+    let (status, body) = put_json(
+        &fx.app,
+        "/api/settings",
+        json!({ "key": "display_timezone", "value": "America/Los_Angeles" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body,
+        json!({ "key": "display_timezone", "value": "America/Los_Angeles" })
+    );
+    let req = fx.indexd_last.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        req,
+        json!({ "cmd": "set_pref", "key": "display_timezone", "value": "America/Los_Angeles" })
+    );
+}
+
+#[tokio::test]
+async fn put_settings_display_timezone_empty_forwards_set_pref() {
+    let fx = settings_fixture(json!({ "status": "pref_set", "key": "display_timezone" }), false);
+    let (status, body) = put_json(
+        &fx.app,
+        "/api/settings",
+        json!({ "key": "display_timezone", "value": "" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!({ "key": "display_timezone", "value": "" }));
+    let req = fx.indexd_last.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        req,
+        json!({ "cmd": "set_pref", "key": "display_timezone", "value": "" })
+    );
+}
+
+#[tokio::test]
 async fn put_settings_rejects_invalid_speed_unit_without_forwarding() {
     let fx = settings_fixture(json!({ "status": "pref_set", "key": "speed_unit" }), false);
     let (status, body) = put_json(
         &fx.app,
         "/api/settings",
         json!({ "key": "speed_unit", "value": "furlongs" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "invalid_setting");
+    assert!(fx.indexd_last.lock().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn put_settings_rejects_trip_gap_minutes_zero_without_forwarding() {
+    let fx = settings_fixture(json!({ "status": "pref_set", "key": "trip_gap_minutes" }), false);
+    let (status, body) = put_json(
+        &fx.app,
+        "/api/settings",
+        json!({ "key": "trip_gap_minutes", "value": "0" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "invalid_setting");
+    assert!(fx.indexd_last.lock().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn put_settings_rejects_trip_gap_minutes_sixty_one_without_forwarding() {
+    let fx = settings_fixture(json!({ "status": "pref_set", "key": "trip_gap_minutes" }), false);
+    let (status, body) = put_json(
+        &fx.app,
+        "/api/settings",
+        json!({ "key": "trip_gap_minutes", "value": "61" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "invalid_setting");
+    assert!(fx.indexd_last.lock().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn put_settings_rejects_speed_limit_mph_201_without_forwarding() {
+    let fx = settings_fixture(json!({ "status": "pref_set", "key": "speed_limit_mph" }), false);
+    let (status, body) = put_json(
+        &fx.app,
+        "/api/settings",
+        json!({ "key": "speed_limit_mph", "value": "201" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "invalid_setting");
+    assert!(fx.indexd_last.lock().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn put_settings_rejects_invalid_display_timezone_without_forwarding() {
+    let fx = settings_fixture(json!({ "status": "pref_set", "key": "display_timezone" }), false);
+    let (status, body) = put_json(
+        &fx.app,
+        "/api/settings",
+        json!({ "key": "display_timezone", "value": "Not/AZone" }),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);

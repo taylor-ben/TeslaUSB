@@ -449,23 +449,20 @@ test.describe("trip map UAT", () => {
     //     its FAB first, then exercise the unit buttons.
     await page.locator("#btnSpeedLegend").click();
     await expect(page.locator("#speedLegend")).toBeVisible();
-    await expect(page.locator(".speed-legend-title")).toContainText("Speed (mph)");
-    await expect(page.locator(".speed-legend-row").first()).toContainText("0\u201315");
-    await page.locator("#speedUnitKph").click();
-    await page.waitForFunction(() => {
-      const h = (window as unknown as { __TESLAUSB_MAP_HOOKS__?: { unit: string } })
-        .__TESLAUSB_MAP_HOOKS__;
-      return !!h && h.unit === "kph";
-    });
+    // The map seeds its display unit from the speed_unit pref (seed = kph), so the
+    // legend opens in kph. Toggle to mph to exercise the switch — asserting both
+    // unit labels and bucket ranges — and leave mph as the stable baseline for the
+    // distance readouts asserted further below.
     await expect(page.locator(".speed-legend-title")).toContainText("Speed (kph)");
     await expect(page.locator(".speed-legend-row").first()).toContainText("0\u201325");
-    // flip back to mph for a stable baseline.
     await page.locator("#speedUnitMph").click();
     await page.waitForFunction(() => {
       const h = (window as unknown as { __TESLAUSB_MAP_HOOKS__?: { unit: string } })
         .__TESLAUSB_MAP_HOOKS__;
       return !!h && h.unit === "mph";
     });
+    await expect(page.locator(".speed-legend-title")).toContainText("Speed (mph)");
+    await expect(page.locator(".speed-legend-row").first()).toContainText("0\u201315");
 
     // (e) Route disambiguation. We invoke the disambiguation through the
     //     `triggerDisambig` hook, which runs the EXACT app logic the on-map
@@ -1141,11 +1138,37 @@ test.describe("trip map UAT", () => {
   test.describe("display preferences (server-persisted)", () => {
     test.use({ timezoneId: "America/Los_Angeles" });
 
-    test("clock and speed settings persist across reload", async ({
+    test("display timezone and speed settings persist across reload", async ({
       page,
       probe,
     }, testInfo) => {
       const settingPuts: { key?: string; value?: string }[] = [];
+      const settings = new Map<string, string>([
+        ["display_timezone", "UTC"],
+        ["speed_unit", "mph"],
+      ]);
+      await page.route("**/api/settings", async (route) => {
+        const req = route.request();
+        if (req.method() === "PUT") {
+          const body = JSON.parse(req.postData() || "{}") as { key?: string; value?: string };
+          if (body.key && body.value != null) settings.set(body.key, body.value);
+          await route.fulfill({
+            status: 200,
+            contentType: "application/json",
+            body: JSON.stringify({ key: body.key, value: body.value }),
+          });
+          return;
+        }
+        if (req.method() === "GET") {
+          await route.fulfill({
+            status: 200,
+            contentType: "application/json",
+            body: JSON.stringify([...settings].map(([key, value]) => ({ key, value }))),
+          });
+          return;
+        }
+        await route.continue();
+      });
       page.on("request", (req) => {
         if (!req.url().includes("/api/settings") || req.method() !== "PUT") return;
         try {
@@ -1156,9 +1179,9 @@ test.describe("trip map UAT", () => {
       });
 
       await gotoMap(page);
-      await page.locator("#btnDisplayPrefs").click();
-      await expect(page.locator("#displayPanel")).toBeVisible();
-      await expect(page.locator("#clockLocal")).toHaveAttribute("aria-pressed", "true");
+      await expect(page.locator("#btnDisplayPrefs")).toHaveCount(0);
+      await expect(page.locator("#clockLocal")).toHaveCount(0);
+      await expect(page.locator("#clockUtc")).toHaveCount(0);
 
       await page.locator("#btnVideos").click();
       await expect(page.locator("[data-testid=vp-events]")).toBeVisible();
@@ -1189,29 +1212,17 @@ test.describe("trip map UAT", () => {
       expect(expected.local).not.toBe(expected.utc);
 
       const eventOneTime = page.locator("[data-testid=vp-event-link-1] .st-date");
-      await expect(eventOneTime).toHaveText(expected.local);
-
-      await page.locator("#videoPanel .close-btn").click();
-      await expect(page.locator("#videoPanel")).not.toHaveClass(/open/);
-      await page.locator("#clockUtc").click();
-      await expect(page.locator("#clockUtc")).toHaveAttribute("aria-pressed", "true");
-      await page.locator("#btnVideos").click();
-      await expect(page.locator("#videoPanel")).toHaveClass(/open/);
       await expect(eventOneTime).toHaveText(expected.utc);
-      await expect
-        .poll(() => settingPuts.some((p) => p.key === "clock" && p.value === "utc"))
-        .toBe(true);
 
       await page.locator("#videoPanel .close-btn").click();
       await expect(page.locator("#videoPanel")).not.toHaveClass(/open/);
-      await page.locator("#btnDisplayPrefs").click();
-      await expect(page.locator("#displayPanel")).not.toHaveClass(/visible/);
       await page.locator("#btnSpeedLegend").click();
       await expect(page.locator("#speedLegend")).toBeVisible();
       await page.locator("#speedUnitKph").click();
       await expect
         .poll(() => settingPuts.some((p) => p.key === "speed_unit" && p.value === "kph"))
         .toBe(true);
+      settings.set("speed_unit", "kph");
 
       await page.reload({ waitUntil: "load" });
       await expect(page.locator(".map-container[data-screen=trip-map]")).toBeVisible();
@@ -1221,13 +1232,7 @@ test.describe("trip map UAT", () => {
         return !!h && h.tripCount > 0;
       });
 
-      await page.locator("#btnDisplayPrefs").click();
-      await expect(page.locator("#displayPanel")).toBeVisible();
-      await expect(page.locator("#clockUtc")).toHaveAttribute("aria-pressed", "true");
-
-      // Speed unit must survive the reload too (persisted independently of clock).
-      await page.locator("#btnDisplayPrefs").click();
-      await expect(page.locator("#displayPanel")).not.toHaveClass(/visible/);
+      await expect(page.locator("#btnDisplayPrefs")).toHaveCount(0);
       await page.locator("#btnSpeedLegend").click();
       await expect(page.locator("#speedLegend")).toBeVisible();
       await expect(page.locator("#speedUnitKph")).toHaveAttribute("aria-pressed", "true");
@@ -1258,7 +1263,7 @@ test.describe("trip map UAT", () => {
     test.beforeEach(async ({ page }) => {
       dayTzRequests = [];
       const settings = new Map<string, string>([
-        ["clock", "local"],
+        ["display_timezone", "UTC"],
         ["speed_unit", "mph"],
       ]);
 
@@ -1381,32 +1386,17 @@ test.describe("trip map UAT", () => {
       });
     });
 
-    test("sends browser tz for local clock and refetches day buckets on toggle", async ({
+    test("uses display_timezone for day-bucket requests and removes clock toggle", async ({
       page,
     }) => {
       await gotoMap(page);
       await expect
         .poll(() => dayTzRequests.length)
         .toBeGreaterThanOrEqual(1);
-      expect(dayTzRequests[0]).toBe("America/New_York");
-
-      // The clock toggle lives in the display-preferences panel; open it first.
-      await page.locator("#btnDisplayPrefs").click();
-      await expect(page.locator("#displayPanel")).toBeVisible();
-
-      await page.locator("#clockUtc").click();
-      await expect(page.locator("#clockUtc")).toHaveAttribute("aria-pressed", "true");
-      await expect
-        .poll(() => dayTzRequests.length)
-        .toBeGreaterThanOrEqual(2);
-      expect(dayTzRequests[dayTzRequests.length - 1]).toBe("UTC");
-
-      await page.locator("#clockLocal").click();
-      await expect(page.locator("#clockLocal")).toHaveAttribute("aria-pressed", "true");
-      await expect
-        .poll(() => dayTzRequests.length)
-        .toBeGreaterThanOrEqual(3);
-      expect(dayTzRequests[dayTzRequests.length - 1]).toBe("America/New_York");
+      expect(dayTzRequests[0]).toBe("UTC");
+      await expect(page.locator("#btnDisplayPrefs")).toHaveCount(0);
+      await expect(page.locator("#clockLocal")).toHaveCount(0);
+      await expect(page.locator("#clockUtc")).toHaveCount(0);
     });
   });
 

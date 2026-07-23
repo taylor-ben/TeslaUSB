@@ -38,6 +38,8 @@ pub const DEFAULT_TRIP_MIN_DISTANCE_KM: f64 = 0.05;
 /// Speed threshold (m/s) for `speed_limit_exceeded`; strict `>`
 /// (`mapping_event_derivation.py::_SPEED_LIMIT_MPS`).
 pub const SPEED_LIMIT_MPS: f64 = 35.76;
+/// Unit conversion: miles/hour → metres/second.
+pub const MPS_PER_MPH: f64 = 0.44704;
 
 /// `accel_x` threshold for `hard_acceleration` (`> 3.5`).
 pub const HARD_ACCEL_X: f64 = 3.5;
@@ -88,6 +90,30 @@ impl Default for DeriveConfig {
             speed_limit_mps: SPEED_LIMIT_MPS,
         }
     }
+}
+
+/// Load derive-config overrides from prefs. Invalid or missing prefs keep `base`.
+#[must_use]
+pub fn load_derive_config(conn: &rusqlite::Connection, base: DeriveConfig) -> DeriveConfig {
+    let mut cfg = base;
+
+    if let Ok(Some(raw_minutes)) = crate::db::mutations::get_pref(conn, "trip_gap_minutes") {
+        if let Ok(minutes) = raw_minutes.parse::<u32>() {
+            if (1..=60).contains(&minutes) {
+                cfg.gap_seconds = i64::from(minutes) * 60;
+            }
+        }
+    }
+
+    if let Ok(Some(raw_mph)) = crate::db::mutations::get_pref(conn, "speed_limit_mph") {
+        if let Ok(mph) = raw_mph.parse::<u32>() {
+            if (0..=200).contains(&mph) {
+                cfg.speed_limit_mps = f64::from(mph) * MPS_PER_MPH;
+            }
+        }
+    }
+
+    cfg
 }
 
 /// The autopilot states that count as "actively driving" for event
@@ -715,7 +741,12 @@ mod tests {
         clippy::indexing_slicing
     )]
 
-    use super::{DeriveConfig, derive, encode_polyline, is_autopilot_engaged, utc_civil_date};
+    use super::{
+        DeriveConfig, MPS_PER_MPH, derive, encode_polyline, is_autopilot_engaged,
+        load_derive_config, utc_civil_date,
+    };
+    use crate::db::mutations::set_pref;
+    use crate::db::open_in_memory;
     use crate::model::{ClipEventInput, DeriveClip, DeriveWaypoint, EventType, FolderClass};
     use scannerd::clip_event::rounded_tz_offset;
     use teslausb_core::sei::tesla::{AutopilotState, Gear};
@@ -838,6 +869,61 @@ mod tests {
             super::epoch_from_tesla_timestamp("xxxx-06-01_00-00-00"),
             None
         );
+    }
+
+    #[test]
+    fn load_derive_config_uses_pref_minutes_and_mph() {
+        let conn = open_in_memory().unwrap();
+        set_pref(&conn, "trip_gap_minutes", "15").unwrap();
+        set_pref(&conn, "speed_limit_mph", "75").unwrap();
+        let cfg = load_derive_config(&conn, DeriveConfig::default());
+        assert_eq!(cfg.gap_seconds, 900);
+        assert_eq!(cfg.speed_limit_mps, 75.0 * MPS_PER_MPH);
+    }
+
+    #[test]
+    fn load_derive_config_uses_zero_mph_to_disable_speed_event() {
+        let conn = open_in_memory().unwrap();
+        set_pref(&conn, "speed_limit_mph", "0").unwrap();
+        let cfg = load_derive_config(&conn, DeriveConfig::default());
+        assert_eq!(cfg.speed_limit_mps, 0.0);
+    }
+
+    #[test]
+    fn load_derive_config_ignores_out_of_range_values() {
+        let conn = open_in_memory().unwrap();
+        set_pref(&conn, "trip_gap_minutes", "0").unwrap();
+        set_pref(&conn, "speed_limit_mph", "201").unwrap();
+        let base = DeriveConfig {
+            gap_seconds: 777,
+            min_distance_km: 1.23,
+            speed_limit_mps: 9.87,
+        };
+        let cfg = load_derive_config(&conn, base);
+        assert_eq!(cfg.gap_seconds, base.gap_seconds);
+        assert_eq!(cfg.speed_limit_mps, base.speed_limit_mps);
+        assert_eq!(cfg.min_distance_km, base.min_distance_km);
+    }
+
+    #[test]
+    fn load_derive_config_uses_base_when_prefs_absent_or_invalid() {
+        let conn = open_in_memory().unwrap();
+        let base = DeriveConfig {
+            gap_seconds: 321,
+            min_distance_km: 0.5,
+            speed_limit_mps: 12.34,
+        };
+        let absent = load_derive_config(&conn, base);
+        assert_eq!(absent.gap_seconds, base.gap_seconds);
+        assert_eq!(absent.speed_limit_mps, base.speed_limit_mps);
+        assert_eq!(absent.min_distance_km, base.min_distance_km);
+
+        set_pref(&conn, "trip_gap_minutes", "abc").unwrap();
+        set_pref(&conn, "speed_limit_mph", "xyz").unwrap();
+        let invalid = load_derive_config(&conn, base);
+        assert_eq!(invalid.gap_seconds, base.gap_seconds);
+        assert_eq!(invalid.speed_limit_mps, base.speed_limit_mps);
+        assert_eq!(invalid.min_distance_km, base.min_distance_km);
     }
 
     #[test]

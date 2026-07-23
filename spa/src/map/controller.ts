@@ -25,7 +25,6 @@ import { makeEventIcon } from "./eventIcons";
 
 const DEFAULT_TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png";
 const DISAMBIG_PIXEL_RADIUS = 22;
-export type ClockPref = "local" | "utc";
 
 /** A single route waypoint in canonical units (speed in m/s). */
 export interface MapWaypoint {
@@ -76,7 +75,7 @@ interface RenderInput {
   trips: MapTrip[];
   events: MapEvent[];
   unit: SpeedUnit;
-  clock: ClockPref;
+  tz: string;
   filters: MapFilters;
 }
 
@@ -99,8 +98,8 @@ interface MapHooks {
   tripCount: number;
   /** Active display unit. */
   unit: SpeedUnit;
-  /** Active clock mode for rendered times. */
-  clock: ClockPref;
+  /** Active timezone for rendered times. */
+  tz: string;
   /** Whether a tile layer was added (false under offline UAT). */
   hasTileLayer: boolean;
   /** Current count of rendered `.marker-cluster` bubbles (for clustering UAT). */
@@ -126,7 +125,7 @@ interface MapHooks {
   disambigHighlightCount: () => number;
 }
 
-function fmtLocalTime(epochSec: number, clock: ClockPref): string {
+function fmtLocalTime(epochSec: number, tz: string): string {
   try {
     const d = new Date(epochSec * 1000);
     const options: Intl.DateTimeFormatOptions = {
@@ -136,8 +135,8 @@ function fmtLocalTime(epochSec: number, clock: ClockPref): string {
       hour: "numeric",
       minute: "2-digit",
       hour12: true,
+      timeZone: tz,
     };
-    if (clock === "utc") options.timeZone = "UTC";
     return d.toLocaleString(undefined, options);
   } catch {
     return "Invalid Date";
@@ -241,7 +240,7 @@ export class TripMapController {
       eventMarkerCount: 0,
       tripCount: 0,
       unit: "mph",
-      clock: "local",
+      tz: "UTC",
       hasTileLayer: this.hasTileLayer,
       clusterCount: () =>
         container.querySelectorAll(".marker-cluster").length,
@@ -344,9 +343,9 @@ export class TripMapController {
     if (this.last) this.render({ ...this.last, unit });
   }
 
-  /** Re-render with a new clock mode (local vs UTC) for every map timestamp. */
-  setClock(clock: ClockPref) {
-    if (this.last) this.render({ ...this.last, clock });
+  /** Re-render with a new timezone for every map timestamp. */
+  setTz(tz: string) {
+    if (this.last) this.render({ ...this.last, tz });
   }
 
   /** Draw a full day: trips, events, start/end markers; fit bounds. */
@@ -354,7 +353,7 @@ export class TripMapController {
     const normalized = this.normalizeRenderInput(input);
     this.last = normalized;
     this.hooks.unit = normalized.unit;
-    this.hooks.clock = normalized.clock;
+    this.hooks.tz = normalized.tz;
     this.renderCurrent(true);
   }
 
@@ -431,9 +430,9 @@ export class TripMapController {
         ev.clipId != null
           ? `<br><a class="map-watch-link" data-map-event-id="${ev.id}" href="/events?event=${ev.id}">▶ Watch video</a>`
           : "";
-      const clock = this.last?.clock ?? "local";
+      const tz = this.last?.tz ?? "UTC";
       marker.bindPopup(
-        `<strong>${safeType}</strong><br>${fmtLocalTime(ev.t, clock)}<br>${safeDesc}${watchLink}`,
+        `<strong>${safeType}</strong><br>${fmtLocalTime(ev.t, tz)}<br>${safeDesc}${watchLink}`,
       );
       if (ev.clipId != null) {
         this.watchableEventsById.set(ev.id, ev);
@@ -456,7 +455,7 @@ export class TripMapController {
       trips: input.trips,
       events: input.events,
       unit: input.unit,
-      clock: input.clock === "utc" ? "utc" : "local",
+      tz: input.tz || "UTC",
       filters: {
         enabledTypes: new Set(input.filters.enabledTypes),
         minSeverity: input.filters.minSeverity,
@@ -635,7 +634,7 @@ export class TripMapController {
       fillOpacity: 0.9,
     })
       .bindPopup(
-        `<strong>Trip #${trip.id}</strong><br>${fmtLocalTime(trip.startTime, this.last?.clock ?? "local")}<br>` +
+        `<strong>Trip #${trip.id}</strong><br>${fmtLocalTime(trip.startTime, this.last?.tz ?? "UTC")}<br>` +
           `${trip.distanceMi.toFixed(1)} mi \u00B7 ${trip.durationMin} min`,
       )
       .addTo(this.tripLayer);
@@ -782,7 +781,7 @@ export class TripMapController {
       main.className = "disambig-row-main";
       const primary = document.createElement("div");
       primary.className = "disambig-row-primary";
-      primary.textContent = fmtLocalTime(c.trip.startTime, this.last?.clock ?? "local");
+      primary.textContent = fmtLocalTime(c.trip.startTime, this.last?.tz ?? "UTC");
       main.appendChild(primary);
 
       const secondary = document.createElement("div");

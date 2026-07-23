@@ -34,14 +34,49 @@ import type {
  * counters; the old USB I/O tile was removed because there is no honest
  * per-device USB counter separate from mmcblk0 writes.
  *
- * The config form (Mapping & Indexing) is reproduced for structural parity but
- * is inert: buttons are `type="button"` and the form `preventDefault`s, so the
- * screen can never issue a mutation.
+ * The Mapping & Indexing form is live and persists changed settings through
+ * `PUT /api/settings` using canonical pref keys (`speed_unit`,
+ * `trip_gap_minutes`, `speed_limit_mph`, `display_timezone`).
  */
 
 function pref(prefs: Pref[] | null, key: string, dflt = ""): string {
   const p = prefs?.find((x) => x.key === key);
   return p ? p.value : dflt;
+}
+
+type MappingPrefs = {
+  trip_gap_minutes: string;
+  speed_limit_mph: string;
+  speed_unit: string;
+  display_timezone: string;
+};
+
+const DEFAULT_MAPPING_PREFS: MappingPrefs = {
+  trip_gap_minutes: "5",
+  speed_limit_mph: "80",
+  speed_unit: "mph",
+  display_timezone: "",
+};
+
+function mappingPrefsFromRows(prefs: Pref[] | null): MappingPrefs {
+  return {
+    trip_gap_minutes: pref(
+      prefs,
+      "trip_gap_minutes",
+      DEFAULT_MAPPING_PREFS.trip_gap_minutes,
+    ),
+    speed_limit_mph: pref(
+      prefs,
+      "speed_limit_mph",
+      DEFAULT_MAPPING_PREFS.speed_limit_mph,
+    ),
+    speed_unit: pref(prefs, "speed_unit", DEFAULT_MAPPING_PREFS.speed_unit),
+    display_timezone: pref(
+      prefs,
+      "display_timezone",
+      DEFAULT_MAPPING_PREFS.display_timezone,
+    ),
+  };
 }
 
 const METRIC_TILES = [
@@ -213,7 +248,16 @@ function metricFor(
 }
 
 export function MediaHub() {
-  const [prefs, setPrefs] = useState<Pref[] | null>(null);
+  const [mappingDraft, setMappingDraft] = useState<MappingPrefs>(
+    DEFAULT_MAPPING_PREFS,
+  );
+  const [mappingBaseline, setMappingBaseline] = useState<MappingPrefs>(
+    DEFAULT_MAPPING_PREFS,
+  );
+  const [mappingSaving, setMappingSaving] = useState(false);
+  const [mappingMsg, setMappingMsg] = useState<
+    { kind: "info" | "success" | "error"; text: string } | null
+  >(null);
   const [indexer, setIndexer] = useState<HealthBlock | null>(null);
   const [health, setHealth] = useState<SystemHealth | null>(null);
   const [metrics, setMetrics] = useState<SystemMetrics | null>(null);
@@ -267,7 +311,12 @@ export function MediaHub() {
     const ctrl = new AbortController();
     api
       .settings(ctrl.signal)
-      .then(setPrefs)
+      .then((loadedPrefs) => {
+        if (ctrl.signal.aborted) return;
+        const next = mappingPrefsFromRows(loadedPrefs);
+        setMappingDraft(next);
+        setMappingBaseline(next);
+      })
       .catch(() => {
         // Read-only degrade: fall back to template defaults without logging,
         // so an absent/empty prefs store never trips the zero-console gate.
@@ -311,6 +360,39 @@ export function MediaHub() {
       });
     return () => ctrl.abort();
   }, []);
+
+  const onSubmitMapping = async (event: Event) => {
+    event.preventDefault();
+    if (mappingSaving) return;
+    const changed = (Object.keys(mappingDraft) as (keyof MappingPrefs)[])
+      .filter((key) => mappingDraft[key] !== mappingBaseline[key])
+      .map((key) => [key, mappingDraft[key]] as const);
+    if (!changed.length) {
+      setMappingMsg({ kind: "info", text: "No changes to save." });
+      return;
+    }
+    setMappingSaving(true);
+    setMappingMsg({ kind: "info", text: "Saving mapping settings…" });
+    try {
+      const ac = new AbortController();
+      for (const [key, value] of changed) {
+        await api.putSetting(key, value, ac.signal);
+      }
+      const nextBaseline = { ...mappingDraft };
+      setMappingBaseline(nextBaseline);
+      setMappingMsg({ kind: "success", text: "Mapping settings saved." });
+    } catch (err) {
+      setMappingMsg({
+        kind: "error",
+        text:
+          err instanceof ApiError
+            ? err.message
+            : "Could not save mapping settings.",
+      });
+    } finally {
+      setMappingSaving(false);
+    }
+  };
 
   useEffect(() => {
     let active = true;
@@ -1418,16 +1500,32 @@ export function MediaHub() {
           </div>
         </details>
 
-        {/* Mapping & Indexing — config form, inert; bound to /api/settings. */}
+        {/* Mapping & Indexing — live config form bound to /api/settings. */}
         <details class="settings-section">
           <summary>Mapping &amp; Indexing</summary>
           <div class="section-content">
-            <form onSubmit={(e) => e.preventDefault()}>
+            <form onSubmit={onSubmitMapping}>
               <p style="font-size:0.85rem; color:var(--text-secondary); margin:0 0 16px">
                 Tesla embeds GPS coordinates and telemetry data (speed, braking,
                 steering) inside each dashcam video. The indexer extracts this
                 data and builds a database of trips, routes, and driving events.
               </p>
+              {mappingMsg ? (
+                <div
+                  id="mapping-action-status"
+                  role="status"
+                  aria-live="polite"
+                  style={`font-size:0.85em;margin:0 0 10px;color:${
+                    mappingMsg.kind === "error"
+                      ? "var(--accent-error, #e53935)"
+                      : mappingMsg.kind === "success"
+                        ? "var(--accent-success, #4caf50)"
+                        : "var(--text-secondary)"
+                  }`}
+                >
+                  {mappingMsg.text}
+                </div>
+              ) : null}
               <div class="settings-form-grid">
                 <div class="form-group">
                   <label style="font-size:0.85rem">
@@ -1436,10 +1534,17 @@ export function MediaHub() {
                   <input
                     type="number"
                     name="trip_gap_minutes"
-                    value={pref(prefs, "trip_gap_minutes", "10")}
+                    value={mappingDraft.trip_gap_minutes}
                     min="1"
                     max="60"
                     class="settings-form-input"
+                    onInput={(e) => {
+                      setMappingMsg(null);
+                      setMappingDraft((prev) => ({
+                        ...prev,
+                        trip_gap_minutes: (e.currentTarget as HTMLInputElement).value,
+                      }));
+                    }}
                   />
                 </div>
                 <div class="form-group">
@@ -1450,11 +1555,18 @@ export function MediaHub() {
                     id="mapping-speed-limit"
                     type="number"
                     name="speed_limit_mph"
-                    value={pref(prefs, "speed_limit_mph", "85")}
+                    value={mappingDraft.speed_limit_mph}
                     min="0"
                     max="200"
                     step="5"
                     class="settings-form-input"
+                    onInput={(e) => {
+                      setMappingMsg(null);
+                      setMappingDraft((prev) => ({
+                        ...prev,
+                        speed_limit_mph: (e.currentTarget as HTMLInputElement).value,
+                      }));
+                    }}
                   />
                 </div>
                 <div class="form-group">
@@ -1463,9 +1575,16 @@ export function MediaHub() {
                   </label>
                   <select
                     id="mapping-speed-units"
-                    name="speed_units"
+                    name="speed_unit"
                     class="settings-form-input"
-                    value={pref(prefs, "speed_units", "mph")}
+                    value={mappingDraft.speed_unit}
+                    onChange={(e) => {
+                      setMappingMsg(null);
+                      setMappingDraft((prev) => ({
+                        ...prev,
+                        speed_unit: (e.currentTarget as HTMLSelectElement).value,
+                      }));
+                    }}
                   >
                     <option value="mph">mph</option>
                     <option value="kph">kph</option>
@@ -1482,7 +1601,14 @@ export function MediaHub() {
                     id="mapping-display-timezone"
                     name="display_timezone"
                     class="settings-form-input"
-                    value={pref(prefs, "display_timezone")}
+                    value={mappingDraft.display_timezone}
+                    onChange={(e) => {
+                      setMappingMsg(null);
+                      setMappingDraft((prev) => ({
+                        ...prev,
+                        display_timezone: (e.currentTarget as HTMLSelectElement).value,
+                      }));
+                    }}
                   >
                     <option value="">Auto (use this device's timezone)</option>
                     {TIMEZONES.map((tz) => (
@@ -1494,12 +1620,12 @@ export function MediaHub() {
                 </div>
               </div>
               <button
-                type="button"
+                type="submit"
                 class="btn btn-primary"
                 style="width:100%"
-                disabled
+                disabled={mappingSaving}
               >
-                Save Mapping Settings
+                {mappingSaving ? "Saving Mapping Settings…" : "Save Mapping Settings"}
               </button>
             </form>
           </div>

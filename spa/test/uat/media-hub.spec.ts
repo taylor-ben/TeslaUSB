@@ -353,6 +353,21 @@ test.describe("settings dashboard UAT", () => {
         }),
       );
     });
+    await page.route("**/api/settings", async (route) => {
+      if (route.request().method() !== "PUT") {
+        await route.continue();
+        return;
+      }
+      const body = JSON.parse(route.request().postData() || "{}") as {
+        key?: string;
+        value?: string;
+      };
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ key: body.key, value: body.value }),
+      });
+    });
     await gotoDashboard(page);
 
     // App shell (base.html parity): brand + toast region.
@@ -510,7 +525,7 @@ test.describe("settings dashboard UAT", () => {
     // /api/settings binding proof — these fields are populated from the live
     // settings response and the seed sets them to NON-DEFAULT values, so each
     // assertion holds ONLY if the screen actually bound the response (a screen
-    // that ignored /api/settings would show the template defaults mph/85/10/""/
+    // that ignored /api/settings would show the template defaults mph/80/5/""/
     // unchecked). Elements live in collapsed <details>; value/checked are still
     // readable without expanding.
     await expect(page.locator("input[name=trip_gap_minutes]")).toHaveValue("15");
@@ -519,6 +534,10 @@ test.describe("settings dashboard UAT", () => {
     await expect(page.locator("#mapping-display-timezone")).toHaveValue(
       "America/Los_Angeles",
     );
+    // The Save button lives inside the collapsed Mapping <details>, so it is hidden
+    // from the accessibility tree; assert enabled via a locator (works on attached,
+    // non-visible elements) rather than getByRole (which excludes hidden nodes).
+    await expect(page.locator("button:has-text('Save Mapping Settings')")).toBeEnabled();
 
     // Section order + count — exact parity with the captured dashboard.
     const summaries = page.locator("details.settings-section > summary");
@@ -895,11 +914,27 @@ test.describe("settings dashboard UAT", () => {
     expect(legacyCss.headers()["content-type"] ?? "").toMatch(/css/);
   });
 
-  // ── Gate 3 (read-only): no mutations; config forms are inert ────────────
-  test("read-only — no mutating requests, config forms cannot submit", async ({
+  // ── Gate 3: mapping settings form persists via /api/settings PUT ─────────
+  test("mapping settings form saves changed values", async ({
     page,
     probe,
   }) => {
+    const savedPuts: { key?: string; value?: string }[] = [];
+    await page.route("**/api/settings", async (route) => {
+      const req = route.request();
+      if (req.method() !== "PUT") {
+        await route.continue();
+        return;
+      }
+      const body = JSON.parse(req.postData() || "{}") as { key?: string; value?: string };
+      savedPuts.push(body);
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ key: body.key, value: body.value }),
+      });
+    });
+
     const origin = new URL(loadState().baseURL).origin;
     await gotoDashboard(page);
     await page.waitForLoadState("networkidle");
@@ -915,7 +950,9 @@ test.describe("settings dashboard UAT", () => {
         const u = new URL(req.url);
         expect(u.origin, `off-origin request to ${req.url}`).toBe(origin);
         if (!u.pathname.startsWith("/api/")) continue;
-        expect(req.method.toUpperCase(), `${req.method} ${u.pathname}`).toBe("GET");
+        const method = req.method.toUpperCase();
+        if (u.pathname === "/api/settings" && method === "PUT") continue;
+        expect(method, `${req.method} ${u.pathname}`).toBe("GET");
         expect(allowedApi.has(u.pathname), `unexpected API path ${u.pathname}`).toBe(true);
         seen.set(u.pathname, u.search);
       }
@@ -946,40 +983,35 @@ test.describe("settings dashboard UAT", () => {
     expect(apiSeen.has("/api/wifi/saved"), "/api/wifi/saved was never requested").toBe(true);
     expect(apiSeen.has("/api/wifi/ap"), "/api/wifi/ap was never requested").toBe(true);
 
-    // ACTIVELY exercise the mutation surface: expand every section, then prove
-    // each config <form> swallows its submit (onSubmit preventDefault) and that
-    // pressing Enter in a field issues no request and does not navigate.
+    // Exercise Mapping & Indexing save path and assert exactly the changed keys
+    // are sent to /api/settings.
     await page.locator("details.settings-section").evaluateAll((els) =>
       els.forEach((d) => d.setAttribute("open", "")),
     );
-    const allPrevented = await page.locator("form").evaluateAll((forms) =>
-      forms.map((f) => {
-        const ev = new Event("submit", { cancelable: true, bubbles: true });
-        f.dispatchEvent(ev);
-        return ev.defaultPrevented;
-      }),
-    );
-    expect(allPrevented.length, "dashboard should have config forms").toBeGreaterThan(0);
-    expect(allPrevented.every(Boolean), "every form must preventDefault on submit").toBe(true);
 
     const urlBefore = page.url();
-    await page.locator("#mapping-speed-limit").press("Enter");
-    // Settle: let any (errant) delayed/debounced submit fetch reach the wire
-    // before we assert the read-only invariant.
+    await page.fill("input[name=trip_gap_minutes]", "12");
+    await page.selectOption("#mapping-speed-units", "mph");
+    await page.click("button:has-text('Save Mapping Settings')");
     await page.waitForLoadState("networkidle");
-    await page.waitForTimeout(500);
+    await expect.poll(() => savedPuts.length).toBe(2);
     expect(page.url(), "pressing Enter in a field must not navigate").toBe(urlBefore);
+    expect(savedPuts).toEqual(
+      expect.arrayContaining([
+        { key: "trip_gap_minutes", value: "12" },
+        { key: "speed_unit", value: "mph" },
+      ]),
+    );
 
-    // Re-assert the FULL whitelist after the exercise — catches a stray GET to a
-    // non-whitelisted path as well as any mutating method.
+    // Re-assert whitelist after the mutation exercise — catches any stray path.
     assertOnlyWhitelistedApi();
     const mutating = probe.requests.filter((r) =>
       ["POST", "PUT", "PATCH", "DELETE"].includes(r.method.toUpperCase()),
     );
-    expect(mutating, `mutating request(s): ${JSON.stringify(mutating)}`).toEqual([]);
-
-    // The Save button is disabled (cannot be the source of a mutation).
-    await expect(page.locator("form button[disabled]")).toHaveCount(1);
+    expect(
+      mutating.filter((r) => new URL(r.url).pathname !== "/api/settings"),
+      `unexpected mutating request(s): ${JSON.stringify(mutating)}`,
+    ).toEqual([]);
   });
 
   // ── Gate 3 (console + network): zero warnings/errors/pageerror, no failures ─

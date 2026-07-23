@@ -544,6 +544,13 @@ async fn put_setting(
 fn validate_setting(key: &str, value: &str) -> bool {
     match key {
         "speed_unit" => matches!(value, "mph" | "kph"),
+        "trip_gap_minutes" => value
+            .parse::<u32>()
+            .is_ok_and(|minutes| (1..=60).contains(&minutes)),
+        "speed_limit_mph" => value
+            .parse::<u32>()
+            .is_ok_and(|mph| (0..=200).contains(&mph)),
+        "display_timezone" => value.is_empty() || crate::daybucket::parse_tz(value).is_ok(),
         "clock" => matches!(value, "local" | "utc"),
         _ => false,
     }

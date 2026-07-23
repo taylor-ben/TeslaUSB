@@ -141,7 +141,7 @@ test.describe("webd catalog client", () => {
     const prefs = await api.settings();
     expect(Array.isArray(prefs)).toBe(true);
     const map = new Map(prefs.map((p) => [p.key, p.value]));
-    expect(map.get("speed_units")).toBe("kph");
+    expect(map.get("speed_unit")).toBe("kph");
     expect(map.get("speed_limit_mph")).toBe("75");
     expect(map.get("trip_gap_minutes")).toBe("15");
     expect(map.get("display_timezone")).toBe("America/Los_Angeles");

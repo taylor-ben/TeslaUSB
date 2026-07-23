@@ -5,7 +5,6 @@ import type { Clip, DaySummary, EventItem, Trip, TripDetail } from "../api/types
 import { classifyDeleteFailure } from "../player/deleteClip";
 import { MapVideoOverlay } from "./map/MapVideoOverlay";
 import {
-  type ClockPref,
   TripMapController,
   type MapEvent,
   type MapFilters,
@@ -106,7 +105,7 @@ function severityLabel(severity: number | null): string | null {
   }
 }
 
-function fmtClock(epochSec: number, clock: ClockPref): string {
+function fmtClock(epochSec: number, tz: string): string {
   try {
     const options: Intl.DateTimeFormatOptions = {
       month: "short",
@@ -114,18 +113,17 @@ function fmtClock(epochSec: number, clock: ClockPref): string {
       hour: "numeric",
       minute: "2-digit",
       hour12: true,
+      timeZone: tz,
     };
-    if (clock === "utc") options.timeZone = "UTC";
     return new Date(epochSec * 1000).toLocaleString(undefined, options);
   } catch {
     return "—";
   }
 }
 
-/** The tz to send to day-bucketing endpoints for a given clock preference. */
-function tzForClock(clock: ClockPref): string {
-  if (clock === "utc") return "UTC";
-  return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+/** Resolve settings pref value to an IANA timezone string. */
+function resolveTz(displayTz: string): string {
+  return displayTz || Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
 }
 
 function humanizeType(type: string): string {
@@ -172,9 +170,9 @@ function toMapTrip(trip: Trip, detail: TripDetail | null): MapTrip {
  *  - bubbles  → bounded per-trip `/api/events?trip=<id>` (on-route events).
  *  - panel    → `/api/events`, `/api/trips/page`, `/api/clips` (global cursor pages).
  *
- * The display-preference toggles (mph/kmh + local/UTC clock) are small SPA
- * functional additions (the legacy app was server-driven with no UI control) to
- * satisfy the parity gate.
+ * The display-preference toggle (mph/kmh) is a small SPA functional addition
+ * (the legacy app was server-driven with no UI control) to satisfy the parity
+ * gate. Timezone selection is now centralized in Settings.
  */
 export function TripMap() {
   const mapRef = useRef<HTMLDivElement>(null);
@@ -184,12 +182,12 @@ export function TripMap() {
   const watchAbortRef = useRef<AbortController | null>(null);
   const routeEventsByTripIdRef = useRef<Map<number, number[]>>(new Map());
   const tripClipsByTripIdRef = useRef<Map<number, Clip[]>>(new Map());
-  const fetchedClockRef = useRef<ClockPref | null>(null);
+  const fetchedDisplayTzRef = useRef<string | null>(null);
 
   const [days, setDays] = useState<DaySummary[] | null>(null);
   const [dayIndex, setDayIndex] = useState(0);
   const [unit, setUnit] = useState<SpeedUnit>("mph");
-  const [clock, setClock] = useState<ClockPref>("local");
+  const [displayTz, setDisplayTz] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [prefError, setPrefError] = useState<string | null>(null);
@@ -200,7 +198,6 @@ export function TripMap() {
 
   const [legendVisible, setLegendVisible] = useState(false);
   const [filtersVisible, setFiltersVisible] = useState(false);
-  const [displayVisible, setDisplayVisible] = useState(false);
   const [panelOpen, setPanelOpen] = useState(false);
   const [panelTab, setPanelTab] = useState<PanelTab>("events");
   const [clipsFolder, setClipsFolder] = useState<ClipsFolder>("RecentClips");
@@ -371,6 +368,7 @@ export function TripMap() {
       unit === "kph" ? maxDistanceMi * KM_PER_MILE : maxDistanceMi;
     return Math.max(0, Math.ceil(displayMax));
   }, [maxDistanceMi, unit]);
+  const resolvedTz = useMemo(() => resolveTz(displayTz), [displayTz]);
   const minDistanceDisplay = useMemo(
     () =>
       unit === "kph"
@@ -398,14 +396,14 @@ export function TripMap() {
         const settings = await api.settings(boot.signal);
         const pref = settings.find((p) => p.key === "speed_unit")?.value ?? "";
         const initialUnit: SpeedUnit = /kph|km/i.test(pref) ? "kph" : "mph";
-        const clockPref = settings.find((p) => p.key === "clock")?.value;
-        const initialClock: ClockPref = clockPref === "utc" ? "utc" : "local";
+        const initialDisplayTz =
+          settings.find((p) => p.key === "display_timezone")?.value ?? "";
         setUnit(initialUnit);
-        setClock(initialClock);
-        const dayList = await api.days(tzForClock(initialClock), boot.signal);
+        setDisplayTz(initialDisplayTz);
+        const dayList = await api.days(resolveTz(initialDisplayTz), boot.signal);
         setDays(dayList);
         setDayIndex(0);
-        fetchedClockRef.current = initialClock;
+        fetchedDisplayTzRef.current = initialDisplayTz;
       } catch (err) {
         if (boot.signal.aborted) return;
         setError(errMessage(err));
@@ -421,17 +419,16 @@ export function TripMap() {
     };
   }, [onWatchEvent, onRoutePick]);
 
-  // Re-bucket the day list when the clock preference flips (Local uses the
-  // browser tz, UTC uses UTC). Skips the initial mount fetch (done above) and
-  // resets to the newest day.
+  // Re-bucket the day list when the settings timezone changes. Skips the initial
+  // mount fetch (done above) and resets to the newest day.
   useEffect(() => {
-    if (fetchedClockRef.current === null) return;
-    if (fetchedClockRef.current === clock) return;
-    fetchedClockRef.current = clock;
+    if (fetchedDisplayTzRef.current === null) return;
+    if (fetchedDisplayTzRef.current === displayTz) return;
+    fetchedDisplayTzRef.current = displayTz;
     const ac = new AbortController();
     (async () => {
       try {
-        const dayList = await api.days(tzForClock(clock), ac.signal);
+        const dayList = await api.days(resolvedTz, ac.signal);
         setDays(dayList);
         setDayIndex(0);
       } catch (err) {
@@ -440,14 +437,14 @@ export function TripMap() {
       }
     })();
     return () => ac.abort();
-  }, [clock]);
+  }, [displayTz, resolvedTz]);
 
   // ── Load the selected day whenever it changes. ──
   useEffect(() => {
     if (!currentDay) return;
     const seq = ++seqRef.current;
     const ac = new AbortController();
-    const tz = tzForClock(clock);
+    const tz = resolvedTz;
     watchAbortRef.current?.abort();
     watchAbortRef.current = null;
     routeEventsByTripIdRef.current = new Map();
@@ -466,7 +463,7 @@ export function TripMap() {
         const eventPages = await Promise.all(
           trips.map((t) =>
             api
-              .events({ trip: t.id, limit: 500 }, ac.signal)
+              .events({ trip: t.id, tz, limit: 500 }, ac.signal)
               .then((p) => p.items)
               .catch(() => [] as EventItem[]),
           ),
@@ -541,13 +538,13 @@ export function TripMap() {
     })();
 
     return () => ac.abort();
-  }, [currentDay?.day, clock]);
+  }, [currentDay?.day, resolvedTz]);
 
   useEffect(() => {
     const ctrl = ctrlRef.current;
     if (!ctrl) return;
-    ctrl.render({ trips: mapTrips, events: mapEvents, unit, clock, filters });
-  }, [mapTrips, mapEvents, unit, clock, filters]);
+    ctrl.render({ trips: mapTrips, events: mapEvents, unit, tz: resolvedTz, filters });
+  }, [mapTrips, mapEvents, unit, resolvedTz, filters]);
 
   useEffect(() => {
     panelStateRef.current = panelState;
@@ -593,7 +590,7 @@ export function TripMap() {
       try {
         if (tab === "events") {
           const page = await api.events(
-            { cursor, limit: PANEL_PAGE_SIZE },
+            { cursor, tz: resolvedTz, limit: PANEL_PAGE_SIZE },
             controller.signal,
           );
           if (controller.signal.aborted || panelRequestSeqRef.current[tab] !== seq) {
@@ -688,7 +685,7 @@ export function TripMap() {
         }
       }
     },
-    [clipsFolder],
+    [clipsFolder, resolvedTz],
   );
 
   const retryPanelTab = useCallback((tab: PanelTab) => {
@@ -980,19 +977,6 @@ export function TripMap() {
     );
   };
 
-  const onToggleClock = (next: ClockPref) => {
-    if (next === clock) return;
-    const prev = clock;
-    setClock(next);
-    persistPref(
-      "clock",
-      next,
-      prev,
-      (v) => setClock(v as ClockPref),
-      "Couldn't save clock preference. Keeping previous value.",
-    );
-  };
-
   const onToggleType = (type: string) => {
     setFilters((prev) => {
       const enabledTypes = new Set(prev.enabledTypes);
@@ -1232,37 +1216,6 @@ export function TripMap() {
         </div>
       </div>
 
-      <div
-        class={`display-panel${displayVisible ? " visible" : ""}`}
-        id="displayPanel"
-        aria-hidden={displayVisible ? "false" : "true"}
-      >
-        <div class="filter-panel-title">Display</div>
-        <div class="filter-section">
-          <div class="filter-label">Clock</div>
-          <span class="speed-unit-toggle" role="group" aria-label="Clock">
-            <button
-              type="button"
-              class={`speed-unit-btn${clock === "local" ? " active" : ""}`}
-              id="clockLocal"
-              aria-pressed={clock === "local"}
-              onClick={() => onToggleClock("local")}
-            >
-              Local
-            </button>
-            <button
-              type="button"
-              class={`speed-unit-btn${clock === "utc" ? " active" : ""}`}
-              id="clockUtc"
-              aria-pressed={clock === "utc"}
-              onClick={() => onToggleClock("utc")}
-            >
-              UTC
-            </button>
-          </span>
-        </div>
-      </div>
-
       <div class="map-fab-group" id="mapFabs">
         <button
           class={`map-fab${panelOpen ? " active" : ""}`}
@@ -1281,15 +1234,6 @@ export function TripMap() {
           title="Filters"
         >
           <Icon name="filter" />
-        </button>
-        <button
-          class={`map-fab${displayVisible ? " active" : ""}`}
-          id="btnDisplayPrefs"
-          onClick={() => setDisplayVisible((v) => !v)}
-          aria-label="Display preferences"
-          title="Display"
-        >
-          <Icon name="settings" />
         </button>
         <button
           class={`map-fab${legendVisible ? " active" : ""}`}
@@ -1349,7 +1293,7 @@ export function TripMap() {
           {panelTab === "events" && (
             <EventsTab
               events={panelState.events.items}
-              clock={clock}
+              tz={resolvedTz}
               loading={panelState.events.loading}
               endReached={panelState.events.endReached}
               error={panelState.events.error}
@@ -1360,7 +1304,7 @@ export function TripMap() {
           {panelTab === "trips" && (
             <TripsTab
               trips={panelState.trips.items}
-              clock={clock}
+              tz={resolvedTz}
               loading={panelState.trips.loading}
               endReached={panelState.trips.endReached}
               error={panelState.trips.error}
@@ -1386,7 +1330,7 @@ export function TripMap() {
               </div>
               <ClipsTab
                 clips={panelState.clips.items}
-                clock={clock}
+                tz={resolvedTz}
                 loading={panelState.clips.loading}
                 endReached={panelState.clips.endReached}
                 error={panelState.clips.error}
@@ -1409,7 +1353,7 @@ export function TripMap() {
           clips={overlayState.clips}
           camera={overlayState.camera}
           cloudConnected={cloudConnected}
-          clock={clock}
+          clock={resolvedTz}
           onClose={onOverlayClose}
           onNavigate={onOverlayNavigate}
           onCameraChange={onOverlayCameraChange}
@@ -1423,7 +1367,7 @@ export function TripMap() {
 
 function EventsTab({
   events,
-  clock,
+  tz,
   loading,
   endReached,
   error,
@@ -1431,7 +1375,7 @@ function EventsTab({
   onRetry,
 }: {
   events: EventItem[] | null;
-  clock: ClockPref;
+  tz: string;
   loading: boolean;
   endReached: boolean;
   error: boolean;
@@ -1470,7 +1414,7 @@ function EventsTab({
         const inner = (
           <>
             <div class="st-type">{ev.type.replace(/_/g, " ")}</div>
-            <div class="st-date">{fmtClock(ev.t, clock)}</div>
+            <div class="st-date">{fmtClock(ev.t, tz)}</div>
             <div class="st-meta">
               {ev.description ||
                 (ev.trip_id != null ? `Trip #${ev.trip_id}` : "Standalone")}
@@ -1529,7 +1473,7 @@ function EventsTab({
 
 function TripsTab({
   trips,
-  clock,
+  tz,
   loading,
   endReached,
   error,
@@ -1537,7 +1481,7 @@ function TripsTab({
   onRetry,
 }: {
   trips: Trip[] | null;
-  clock: ClockPref;
+  tz: string;
   loading: boolean;
   endReached: boolean;
   error: boolean;
@@ -1572,7 +1516,7 @@ function TripsTab({
           <div class="vp-clip-info">
             <div class="vp-clip-date">Trip #{t.id}</div>
             <div class="vp-clip-meta">
-              {fmtClock(t.started_at, clock)} · {t.point_count} pts
+              {fmtClock(t.started_at, tz)} · {t.point_count} pts
             </div>
             <div class="vp-clip-reason">
               {((t.distance_m ?? 0) / METERS_PER_MILE).toFixed(1)} mi
@@ -1608,7 +1552,7 @@ function TripsTab({
 
 function ClipsTab({
   clips,
-  clock,
+  tz,
   loading,
   endReached,
   error,
@@ -1622,7 +1566,7 @@ function ClipsTab({
   onDelete,
 }: {
   clips: Clip[] | null;
-  clock: ClockPref;
+  tz: string;
   loading: boolean;
   endReached: boolean;
   error: boolean;
@@ -1670,11 +1614,11 @@ function ClipsTab({
               type="button"
               class="vp-clip-info vp-clip-link"
               data-testid={`vp-clip-link-${c.id}`}
-              aria-label={`Play clip ${fmtClock(c.started_at, clock)}`}
+              aria-label={`Play clip ${fmtClock(c.started_at, tz)}`}
               disabled={rowBusy}
               onClick={() => onPlay(c)}
             >
-              <div class="vp-clip-date">{fmtClock(c.started_at, clock)}</div>
+              <div class="vp-clip-date">{fmtClock(c.started_at, tz)}</div>
               <div class="vp-clip-meta">
                 {c.angles.length} cam · {mb} MB
               </div>
