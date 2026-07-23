@@ -1275,14 +1275,25 @@ test.describe("event-player UAT", () => {
     await expect(page.locator(".event-location")).toHaveText("Hard acceleration");
     await expect(page.locator("#mainVideo")).toHaveAttribute("src", /\/api\/clips\/3\/stream/);
 
+    // The <video> src is set synchronously, but the browser issues the byte-range
+    // media fetch asynchronously. Wait for the real 206 to land (rather than
+    // racing the capture) before asserting on its range headers.
+    await expect
+      .poll(
+        () =>
+          streams.responses.filter(
+            (r) =>
+              r.resourceType === "media" &&
+              /\/api\/clips\/3\/stream/.test(r.url) &&
+              r.status === 206,
+          ).length,
+        { timeout: 10_000, message: "by-id event target must issue a 206 media request" },
+      )
+      .toBeGreaterThan(0);
+
     const mediaResp = streams.responses.filter(
       (r) => r.resourceType === "media" && /\/api\/clips\/3\/stream/.test(r.url),
     );
-    expect(mediaResp.length, "by-id event target must issue a media request").toBeGreaterThan(0);
-    expect(
-      mediaResp.some((r) => r.status === 206),
-      "by-id event target media request must be 206",
-    ).toBe(true);
     const partial = mediaResp.find((r) => r.status === 206)!;
     expect(partial.acceptRanges).toBe("bytes");
     expect(partial.contentRange, `content-range=${partial.contentRange}`).toMatch(

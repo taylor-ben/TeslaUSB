@@ -1336,7 +1336,15 @@ test.describe("media (lock chimes) UAT", () => {
       const v0 = { name: "LockChime.wav", rel_path: "LockChime.wav", size_bytes: 512, modified: "2026-06-15T23:57:58" };
       const v1 = { name: "LockChime.wav", rel_path: "LockChime.wav", size_bytes: 1024, modified: "2026-06-15T23:58:30" };
       let chimeConverged = false;
-      let gadgetReads = 0;
+      // gadgetd reports `chime_reenum_pending` as a real duration: it stays true
+      // for the whole re-enumeration window — seen identically by EVERY poller
+      // (the Shell status-dot poll and Media's reenum poll both just read the
+      // current gadget state) — and only flips false once the car has re-read the
+      // drive. Model it as a plain flag the test toggles, NOT a per-read counter:
+      // a counter races whichever poller reads first, so the Shell mount poll
+      // would consume a "first read only" pending window before Media's reenum
+      // poll ever sees it.
+      let reenumPending = true;
 
       await page.route("**/api/chime-scheduler", (route) => {
         if (route.request().method() !== "GET") return route.continue();
@@ -1354,12 +1362,9 @@ test.describe("media (lock chimes) UAT", () => {
         if (route.request().method() !== "GET") return route.continue();
         return jsonRoute(route, 200, { installed: chimeConverged ? v1 : v0 });
       });
-      // Reenum reports pending on the first read only, so it clears on the first
-      // fast-forward — before convergence is allowed to happen.
       await page.route("**/api/gadget/status", (route) => {
         if (route.request().method() !== "GET") return route.continue();
-        gadgetReads += 1;
-        return jsonRoute(route, 200, { ...GADGET_BASE, chime_reenum_pending: gadgetReads <= 1 });
+        return jsonRoute(route, 200, { ...GADGET_BASE, chime_reenum_pending: reenumPending });
       });
 
       await gotoActivationMedia(page);
@@ -1367,8 +1372,10 @@ test.describe("media (lock chimes) UAT", () => {
       // The overlay appears while reenum is pending.
       await expect(page.locator("[data-testid=reenum-overlay]")).toBeVisible();
 
-      // First fast-forward: reenum clears (notice queued but hidden behind
-      // pendingActivation); convergence is still gated off, so pending stays.
+      // Re-enumeration completes on the car (gadgetd stops reporting pending)
+      // BEFORE the chime rewrite converges. The next-lock notice is queued but
+      // stays hidden behind the still-pending activation.
+      reenumPending = false;
       await page.clock.fastForward(2000);
       await expect(page.locator("[data-testid=reenum-overlay]")).toHaveCount(0, { timeout: 10000 });
       await expect(page.locator("[data-testid=activation-status]")).toBeVisible();
