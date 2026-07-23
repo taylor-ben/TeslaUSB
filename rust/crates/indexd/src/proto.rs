@@ -74,6 +74,99 @@ pub enum Request {
     },
     /// List rows that need delete-state crash recovery.
     ListRecoveryRows {},
+    /// Paginated cloud upload candidates.
+    CloudCandidates {
+        /// Folder classes to include.
+        folders: Vec<String>,
+        /// Optional opaque keyset cursor.
+        after_cursor: Option<String>,
+        /// Page size (server capped).
+        limit: u32,
+    },
+    /// Paginated durable upload queue load.
+    CloudQueueLoad {
+        /// Optional opaque keyset cursor.
+        after_cursor: Option<String>,
+        /// Page size (server capped).
+        limit: u32,
+    },
+    /// Idempotent queue row upsert.
+    CloudQueueUpsert {
+        /// Upsert payload.
+        item: CloudQueueUpsertWire,
+    },
+    /// Manual retry / parked-collision resolution.
+    CloudQueueRetry {
+        /// Parent archive item id.
+        archive_item_id: i64,
+        /// Optional child discriminator.
+        child_key: Option<String>,
+        /// Resolution mode.
+        resolution: CloudQueueRetryResolutionWire,
+    },
+    /// Acquire upload lease token.
+    UploadLeaseAcquire {
+        /// Parent archive item id.
+        archive_item_id: i64,
+        /// Monotonic lease ttl in milliseconds.
+        ttl_ms: u32,
+    },
+    /// Renew upload lease token.
+    UploadLeaseRenew {
+        /// Lease token from `upload_lease_acquire`.
+        token: String,
+        /// New ttl in milliseconds.
+        ttl_ms: u32,
+    },
+    /// Release upload lease token.
+    UploadLeaseRelease {
+        /// Lease token.
+        token: String,
+    },
+    /// Commit one successful upload.
+    CloudUploadCommit {
+        /// Queue primary key.
+        queue_pk: CloudQueuePkWire,
+        /// Idempotency key for this transfer attempt.
+        attempt_id: String,
+        /// Backend verification hash.
+        hash: String,
+        /// Hash algorithm.
+        hash_alg: String,
+        /// Uploaded bytes.
+        size: i64,
+    },
+    /// Record one failed upload attempt.
+    CloudUploadFail {
+        /// Queue primary key.
+        queue_pk: CloudQueuePkWire,
+        /// Idempotency key for this transfer attempt.
+        attempt_id: String,
+        /// Sanitized error class.
+        error_class: String,
+        /// Retry gate (unix seconds), null = immediate retry.
+        not_before: Option<i64>,
+        /// Terminal failure marker.
+        terminal: bool,
+    },
+    /// Derived cloud counters.
+    CloudStatsGet {},
+    /// Reset cloud counters baseline.
+    CloudStatsReset {},
+    /// Non-secret cloud config get.
+    CloudConfigGet {},
+    /// Non-secret cloud config put.
+    CloudConfigPut {
+        /// Typed config.
+        config: CloudConfigWire,
+    },
+    /// Paginated history load.
+    CloudHistoryLoad {
+        /// Optional opaque keyset cursor.
+        after_cursor: Option<String>,
+        /// Page size (server capped).
+        limit: u32,
+    },
 }
 
 /// Archive registration payload.
@@ -155,6 +248,162 @@ pub struct RecoveryRowWire {
     pub delete_gen: Option<String>,
 }
 
+/// Queue primary key over the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudQueuePkWire {
+    /// Destination id.
+    pub destination_id: String,
+    /// Canonical remote key.
+    pub remote_key: String,
+}
+
+/// Queue upsert payload over the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudQueueUpsertWire {
+    /// Parent archive item id.
+    pub archive_item_id: i64,
+    /// Child key.
+    pub child_key: String,
+    /// Destination id.
+    pub destination_id: String,
+    /// Destination key.
+    pub remote_key: String,
+    /// Upload category.
+    pub category: String,
+    /// FIFO sequence.
+    pub seq: i64,
+    /// Total bytes.
+    pub total_bytes: i64,
+    /// Local content hash.
+    pub content_sha256: String,
+    /// Optional backend verification hash.
+    pub expected_hash: Option<String>,
+    /// Verification algorithm.
+    pub verify_alg: String,
+}
+
+/// Manual retry collision resolution mode over the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum CloudQueueRetryResolutionWire {
+    /// Keep remote existing object.
+    KeepExisting,
+    /// Retry with a new remote key.
+    Rekey {
+        /// New key.
+        remote_key: String,
+    },
+    /// Retry with overwrite intent.
+    Replace,
+}
+
+/// Candidate row over the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudCandidateWire {
+    /// Parent archive item id.
+    pub archive_item_id: i64,
+    /// Child key.
+    pub child_key: String,
+    /// Source path.
+    pub source_rel: String,
+    /// Destination id.
+    pub destination_id: String,
+    /// Destination key.
+    pub remote_key: String,
+    /// Size bytes.
+    pub size_bytes: i64,
+    /// Local content hash.
+    pub content_sha256: String,
+    /// Queue state.
+    pub state: String,
+    /// Upload category.
+    pub category: String,
+    /// FIFO sequence.
+    pub seq: i64,
+}
+
+/// Queue row over the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudQueueRowWire {
+    /// Parent archive item id.
+    pub archive_item_id: i64,
+    /// Child key.
+    pub child_key: String,
+    /// Destination id.
+    pub destination_id: String,
+    /// Destination key.
+    pub remote_key: String,
+    /// Category.
+    pub category: String,
+    /// FIFO sequence.
+    pub seq: i64,
+    /// Total bytes.
+    pub total_bytes: i64,
+    /// Uploaded bytes.
+    pub bytes_uploaded: i64,
+    /// Local content hash.
+    pub content_sha256: String,
+    /// Queue state.
+    pub state: String,
+    /// Attempts.
+    pub attempts: i64,
+    /// Retry gate.
+    pub not_before: Option<i64>,
+    /// Last error.
+    pub last_error: Option<String>,
+}
+
+/// History row over the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudHistoryRowWire {
+    /// Row id.
+    pub id: i64,
+    /// Completion sequence.
+    pub completion_seq: i64,
+    /// Parent archive item id.
+    pub archive_item_id: i64,
+    /// Child key.
+    pub child_key: String,
+    /// Destination id.
+    pub destination_id: String,
+    /// Outcome.
+    pub outcome: String,
+    /// Size bytes.
+    pub size_bytes: i64,
+    /// Timestamp.
+    pub at: i64,
+    /// Sanitized error class.
+    pub error_class: Option<String>,
+}
+
+/// Typed non-secret cloud config over the wire.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudConfigWire {
+    /// Sentry folder enabled.
+    pub sentry_enabled: bool,
+    /// Saved folder enabled.
+    pub saved_enabled: bool,
+    /// Recent folder enabled.
+    pub recent_enabled: bool,
+    /// Sentry priority.
+    pub sentry_priority: i64,
+    /// Saved priority.
+    pub saved_priority: i64,
+    /// Recent priority.
+    pub recent_priority: i64,
+    /// Remote reserve in GiB.
+    pub reserve_gb: i64,
+    /// Max attempts.
+    pub max_attempts: i64,
+    /// Base backoff seconds.
+    pub base_backoff_secs: i64,
+    /// Keep local files until backed up.
+    pub keep_until_backed_up: bool,
+    /// Auto sync toggle.
+    pub auto_sync: bool,
+}
+
 /// Outbound RPC response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -204,6 +453,90 @@ pub enum Response {
         /// Rows needing recovery.
         rows: Vec<RecoveryRowWire>,
     },
+    /// Cloud candidates page.
+    CloudCandidates {
+        /// Candidate rows.
+        items: Vec<CloudCandidateWire>,
+        /// Opaque next cursor.
+        next_cursor: Option<String>,
+    },
+    /// Cloud queue page.
+    CloudQueuePage {
+        /// Queue rows.
+        items: Vec<CloudQueueRowWire>,
+        /// Opaque next cursor.
+        next_cursor: Option<String>,
+    },
+    /// Queue state response.
+    CloudQueueState {
+        /// Resulting state.
+        state: String,
+    },
+    /// Upload lease acquire response.
+    UploadLeaseAcquired {
+        /// Lease granted.
+        granted: bool,
+        /// Lease token.
+        token: Option<String>,
+        /// Lease boot id.
+        boot_id: Option<String>,
+        /// Monotonic expiry.
+        expires_mono_ms: Option<i64>,
+    },
+    /// Upload lease renew response.
+    UploadLeaseRenewed {
+        /// Renew success.
+        ok: bool,
+        /// New expiry.
+        expires_mono_ms: Option<i64>,
+    },
+    /// Upload lease release response.
+    UploadLeaseReleased {
+        /// Release success.
+        ok: bool,
+    },
+    /// Upload commit response.
+    CloudUploadCommitted {
+        /// Commit success.
+        ok: bool,
+        /// Parent became durable.
+        durable_parent: bool,
+    },
+    /// Upload fail response.
+    CloudUploadFailed {
+        /// Fail record success.
+        ok: bool,
+        /// Resulting queue state.
+        state: String,
+    },
+    /// Derived stats response.
+    CloudStats {
+        /// Uploaded item count since baseline.
+        synced_count: i64,
+        /// Uploaded bytes since baseline.
+        synced_bytes: i64,
+        /// Baseline timestamp.
+        since_at: i64,
+    },
+    /// Stats reset response.
+    CloudStatsReset {
+        /// Reset success.
+        ok: bool,
+        /// New baseline sequence.
+        baseline_seq: i64,
+    },
+    /// Config response.
+    CloudConfig {
+        /// Typed config.
+        config: CloudConfigWire,
+    },
+    /// History page response.
+    CloudHistoryPage {
+        /// History rows.
+        items: Vec<CloudHistoryRowWire>,
+        /// Opaque next cursor.
+        next_cursor: Option<String>,
+    },
 }
 
 /// Read one framed payload (4-byte LE length then bytes).
@@ -229,6 +562,13 @@ pub fn read_frame(stream: &mut impl Read, cap: u32) -> io::Result<Vec<u8>> {
 ///
 /// Returns an error if the payload cannot be framed or write fails.
 pub fn write_frame(stream: &mut impl Write, payload: &[u8]) -> io::Result<()> {
+    if payload.len() > MAX_REQUEST_FRAME as usize {
+        return Err(io::Error::other(format!(
+            "frame too large: {} > {}",
+            payload.len(),
+            MAX_REQUEST_FRAME
+        )));
+    }
     let len =
         u32::try_from(payload.len()).map_err(|_| io::Error::other("frame exceeds u32 length"))?;
     stream.write_all(&len.to_le_bytes())?;
@@ -265,9 +605,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ArchiveAngle, ArchiveUnit, EvictionCandidateWire, MAX_REQUEST_FRAME, RecoveryRowWire,
-        RegisterArchivedClip, Request, Response, read_frame, read_request, write_frame,
-        write_response,
+        ArchiveAngle, ArchiveUnit, CloudCandidateWire, CloudConfigWire, CloudHistoryRowWire,
+        CloudQueuePkWire, CloudQueueRetryResolutionWire, CloudQueueRowWire, CloudQueueUpsertWire,
+        EvictionCandidateWire, MAX_REQUEST_FRAME, RecoveryRowWire, RegisterArchivedClip, Request,
+        Response, read_frame, read_request, write_frame, write_response,
     };
 
     #[test]
@@ -340,6 +681,15 @@ mod tests {
         buf.extend_from_slice(&(MAX_REQUEST_FRAME + 1).to_le_bytes());
         let mut cur = Cursor::new(buf);
         assert!(read_frame(&mut cur, MAX_REQUEST_FRAME).is_err());
+    }
+
+    #[test]
+    fn write_response_rejects_oversize() {
+        let response = Response::Rejected {
+            message: "x".repeat(MAX_REQUEST_FRAME as usize),
+        };
+        let mut buf = Vec::new();
+        assert!(write_response(&mut buf, &response).is_err());
     }
 
     #[test]
@@ -455,6 +805,140 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn cloud_control_requests_serialize_with_expected_cmd_tags() {
+        let cases = vec![
+            (
+                "cloud_candidates",
+                Request::CloudCandidates {
+                    folders: vec!["RecentClips".to_owned()],
+                    after_cursor: None,
+                    limit: 10,
+                },
+            ),
+            (
+                "cloud_queue_load",
+                Request::CloudQueueLoad {
+                    after_cursor: Some("opaque".to_owned()),
+                    limit: 10,
+                },
+            ),
+            (
+                "cloud_queue_upsert",
+                Request::CloudQueueUpsert {
+                    item: CloudQueueUpsertWire {
+                        archive_item_id: 1,
+                        child_key: "child".to_owned(),
+                        destination_id: "dest".to_owned(),
+                        remote_key: "rk".to_owned(),
+                        category: "bulk".to_owned(),
+                        seq: 1,
+                        total_bytes: 2,
+                        content_sha256:
+                            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                                .to_owned(),
+                        expected_hash: None,
+                        verify_alg: "none".to_owned(),
+                    },
+                },
+            ),
+            (
+                "cloud_queue_retry",
+                Request::CloudQueueRetry {
+                    archive_item_id: 1,
+                    child_key: Some("child".to_owned()),
+                    resolution: CloudQueueRetryResolutionWire::Replace,
+                },
+            ),
+            (
+                "upload_lease_acquire",
+                Request::UploadLeaseAcquire {
+                    archive_item_id: 1,
+                    ttl_ms: 1_000,
+                },
+            ),
+            (
+                "upload_lease_renew",
+                Request::UploadLeaseRenew {
+                    token: "1:abc".to_owned(),
+                    ttl_ms: 1_000,
+                },
+            ),
+            (
+                "upload_lease_release",
+                Request::UploadLeaseRelease {
+                    token: "1:abc".to_owned(),
+                },
+            ),
+            (
+                "cloud_upload_commit",
+                Request::CloudUploadCommit {
+                    queue_pk: CloudQueuePkWire {
+                        destination_id: "dest".to_owned(),
+                        remote_key: "rk".to_owned(),
+                    },
+                    attempt_id: "a1".to_owned(),
+                    hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .to_owned(),
+                    hash_alg: "sha256".to_owned(),
+                    size: 12,
+                },
+            ),
+            (
+                "cloud_upload_fail",
+                Request::CloudUploadFail {
+                    queue_pk: CloudQueuePkWire {
+                        destination_id: "dest".to_owned(),
+                        remote_key: "rk".to_owned(),
+                    },
+                    attempt_id: "a2".to_owned(),
+                    error_class: "timeout".to_owned(),
+                    not_before: Some(123),
+                    terminal: false,
+                },
+            ),
+            ("cloud_stats_get", Request::CloudStatsGet {}),
+            ("cloud_stats_reset", Request::CloudStatsReset {}),
+            ("cloud_config_get", Request::CloudConfigGet {}),
+            (
+                "cloud_config_put",
+                Request::CloudConfigPut {
+                    config: CloudConfigWire {
+                        sentry_enabled: true,
+                        saved_enabled: true,
+                        recent_enabled: false,
+                        sentry_priority: 0,
+                        saved_priority: 1,
+                        recent_priority: 2,
+                        reserve_gb: 4,
+                        max_attempts: 5,
+                        base_backoff_secs: 60,
+                        keep_until_backed_up: true,
+                        auto_sync: true,
+                    },
+                },
+            ),
+            (
+                "cloud_history_load",
+                Request::CloudHistoryLoad {
+                    after_cursor: None,
+                    limit: 25,
+                },
+            ),
+        ];
+
+        for (expected_cmd, request) in cases {
+            let encoded = serde_json::to_value(&request).unwrap();
+            assert_eq!(
+                encoded.get("cmd").and_then(serde_json::Value::as_str),
+                Some(expected_cmd)
+            );
+            let decoded: Request = serde_json::from_value(encoded).unwrap();
+            assert_eq!(decoded, request);
+        }
+    }
+
+    #[test]
     fn delete_control_responses_serialize_with_expected_status_tags() {
         let cases = vec![
             ("claimed", Response::Claimed {}),
@@ -488,6 +972,156 @@ mod tests {
                         size_bytes: 2_048,
                         delete_gen: Some("abc".to_owned()),
                     }],
+                },
+            ),
+        ];
+
+        for (expected_status, response) in cases {
+            let encoded = serde_json::to_value(&response).unwrap();
+            assert_eq!(
+                encoded.get("status").and_then(serde_json::Value::as_str),
+                Some(expected_status)
+            );
+            let decoded: Response = serde_json::from_value(encoded).unwrap();
+            assert_eq!(decoded, response);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn cloud_control_responses_serialize_with_expected_status_tags() {
+        let cases = vec![
+            (
+                "cloud_candidates",
+                Response::CloudCandidates {
+                    items: vec![CloudCandidateWire {
+                        archive_item_id: 1,
+                        child_key: "child".to_owned(),
+                        source_rel: "archive/a/child".to_owned(),
+                        destination_id: "dest".to_owned(),
+                        remote_key: "rk".to_owned(),
+                        size_bytes: 10,
+                        content_sha256:
+                            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                                .to_owned(),
+                        state: "queued".to_owned(),
+                        category: "bulk".to_owned(),
+                        seq: 1,
+                    }],
+                    next_cursor: Some("opaque".to_owned()),
+                },
+            ),
+            (
+                "cloud_queue_page",
+                Response::CloudQueuePage {
+                    items: vec![CloudQueueRowWire {
+                        archive_item_id: 1,
+                        child_key: "child".to_owned(),
+                        destination_id: "dest".to_owned(),
+                        remote_key: "rk".to_owned(),
+                        category: "bulk".to_owned(),
+                        seq: 1,
+                        total_bytes: 10,
+                        bytes_uploaded: 0,
+                        content_sha256:
+                            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                                .to_owned(),
+                        state: "queued".to_owned(),
+                        attempts: 0,
+                        not_before: None,
+                        last_error: None,
+                    }],
+                    next_cursor: None,
+                },
+            ),
+            (
+                "cloud_queue_state",
+                Response::CloudQueueState {
+                    state: "queued".to_owned(),
+                },
+            ),
+            (
+                "upload_lease_acquired",
+                Response::UploadLeaseAcquired {
+                    granted: true,
+                    token: Some("1:abc".to_owned()),
+                    boot_id: Some("boot".to_owned()),
+                    expires_mono_ms: Some(1200),
+                },
+            ),
+            (
+                "upload_lease_renewed",
+                Response::UploadLeaseRenewed {
+                    ok: true,
+                    expires_mono_ms: Some(2200),
+                },
+            ),
+            (
+                "upload_lease_released",
+                Response::UploadLeaseReleased { ok: true },
+            ),
+            (
+                "cloud_upload_committed",
+                Response::CloudUploadCommitted {
+                    ok: true,
+                    durable_parent: false,
+                },
+            ),
+            (
+                "cloud_upload_failed",
+                Response::CloudUploadFailed {
+                    ok: true,
+                    state: "failed".to_owned(),
+                },
+            ),
+            (
+                "cloud_stats",
+                Response::CloudStats {
+                    synced_count: 1,
+                    synced_bytes: 100,
+                    since_at: 0,
+                },
+            ),
+            (
+                "cloud_stats_reset",
+                Response::CloudStatsReset {
+                    ok: true,
+                    baseline_seq: 9,
+                },
+            ),
+            (
+                "cloud_config",
+                Response::CloudConfig {
+                    config: CloudConfigWire {
+                        sentry_enabled: true,
+                        saved_enabled: true,
+                        recent_enabled: false,
+                        sentry_priority: 0,
+                        saved_priority: 1,
+                        recent_priority: 2,
+                        reserve_gb: 4,
+                        max_attempts: 5,
+                        base_backoff_secs: 60,
+                        keep_until_backed_up: true,
+                        auto_sync: true,
+                    },
+                },
+            ),
+            (
+                "cloud_history_page",
+                Response::CloudHistoryPage {
+                    items: vec![CloudHistoryRowWire {
+                        id: 1,
+                        completion_seq: 7,
+                        archive_item_id: 1,
+                        child_key: "child".to_owned(),
+                        destination_id: "dest".to_owned(),
+                        outcome: "uploaded".to_owned(),
+                        size_bytes: 10,
+                        at: 100,
+                        error_class: None,
+                    }],
+                    next_cursor: None,
                 },
             ),
         ];

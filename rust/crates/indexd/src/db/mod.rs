@@ -6,6 +6,7 @@
 //! mutations funnel through here. Readers (webd / retentiond / uploadd)
 //! never write directly.
 
+pub mod cloud;
 pub mod ingest;
 pub mod migrations;
 pub mod mutations;
@@ -225,6 +226,12 @@ mod tests {
             "prefs",
             "media_entries",
             "front_parse_attempts",
+            "cloud_upload_queue",
+            "cloud_synced_files",
+            "cloud_sync_history",
+            "cloud_meta",
+            "cloud_provider_config",
+            "cloud_upload_attempts",
         ] {
             let found: i64 = conn
                 .query_row(

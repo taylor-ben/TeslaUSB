@@ -11,20 +11,27 @@ use std::time::Duration;
 
 use rusqlite::{Connection, params};
 
+use crate::db::cloud::{
+    CloudConfig, CloudQueuePk, CloudQueueRetryResolution, CloudQueueUpsertItem, cloud_candidates,
+    cloud_config_get, cloud_config_put, cloud_history_load, cloud_queue_load, cloud_queue_retry,
+    cloud_queue_upsert, cloud_stats_get, cloud_stats_reset, cloud_upload_commit, cloud_upload_fail,
+    upload_lease_acquire, upload_lease_release, upload_lease_renew,
+};
 use crate::db::ingest::{
     ArchiveAngleRegistration, ArchiveRegistration, ArchiveUnitRegistration, register_archived_clip,
     register_quarantined_clip,
 };
 use crate::db::mutations::{
-    BootContext, has_unexpired_lease, mark_deleted, mark_deleting, quarantine, release_delete_claim,
-    set_pref,
+    BootContext, has_unexpired_lease, mark_deleted, mark_deleting, quarantine,
+    release_delete_claim, set_pref,
 };
-use crate::db::now_epoch_s;
 use crate::db::reads::{list_eviction_candidates, list_recovery_rows};
+use crate::db::{DbError, now_epoch_s};
 use crate::model::FolderClass;
 use crate::proto::{
-    EvictionCandidateWire, RecoveryRowWire, RegisterArchivedClip, Request, Response, read_request,
-    write_response,
+    CloudCandidateWire, CloudConfigWire, CloudHistoryRowWire, CloudQueueRetryResolutionWire,
+    CloudQueueRowWire, CloudQueueUpsertWire, EvictionCandidateWire, RecoveryRowWire,
+    RegisterArchivedClip, Request, Response, read_request, write_response,
 };
 
 /// Start the indexd registration server thread.
@@ -77,6 +84,7 @@ fn serve(
     }
 }
 
+#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 fn handle_connection(
     mut stream: UnixStream,
     conn: &Arc<Mutex<Connection>>,
@@ -164,6 +172,145 @@ fn handle_connection(
             Request::ListRecoveryRows {} => match handle_list_recovery_rows(conn) {
                 Ok(rows) => Response::RecoveryRows { rows },
                 Err(message) => Response::Error { message },
+            },
+            Request::CloudCandidates {
+                folders,
+                after_cursor,
+                limit,
+            } => match handle_cloud_candidates(conn, &folders, after_cursor.as_deref(), limit) {
+                Ok((items, next_cursor)) => Response::CloudCandidates { items, next_cursor },
+                Err(HandlerError::Rejected(message)) => Response::Rejected { message },
+                Err(HandlerError::Internal(message)) => Response::Error { message },
+            },
+            Request::CloudQueueLoad {
+                after_cursor,
+                limit,
+            } => match handle_cloud_queue_load(conn, after_cursor.as_deref(), limit) {
+                Ok((items, next_cursor)) => Response::CloudQueuePage { items, next_cursor },
+                Err(HandlerError::Rejected(message)) => Response::Rejected { message },
+                Err(HandlerError::Internal(message)) => Response::Error { message },
+            },
+            Request::CloudQueueUpsert { item } => match handle_cloud_queue_upsert(conn, &item) {
+                Ok(state) => Response::CloudQueueState { state },
+                Err(HandlerError::Rejected(message)) => Response::Rejected { message },
+                Err(HandlerError::Internal(message)) => Response::Error { message },
+            },
+            Request::CloudQueueRetry {
+                archive_item_id,
+                child_key,
+                resolution,
+            } => match handle_cloud_queue_retry(
+                conn,
+                archive_item_id,
+                child_key.as_deref(),
+                &resolution,
+            ) {
+                Ok(state) => Response::CloudQueueState { state },
+                Err(HandlerError::Rejected(message)) => Response::Rejected { message },
+                Err(HandlerError::Internal(message)) => Response::Error { message },
+            },
+            Request::UploadLeaseAcquire {
+                archive_item_id,
+                ttl_ms,
+            } => match handle_upload_lease_acquire(conn, boot, archive_item_id, ttl_ms) {
+                Ok((granted, token, boot_id, expires_mono_ms)) => Response::UploadLeaseAcquired {
+                    granted,
+                    token,
+                    boot_id,
+                    expires_mono_ms,
+                },
+                Err(HandlerError::Rejected(message)) => Response::Rejected { message },
+                Err(HandlerError::Internal(message)) => Response::Error { message },
+            },
+            Request::UploadLeaseRenew { token, ttl_ms } => {
+                match handle_upload_lease_renew(conn, boot, &token, ttl_ms) {
+                    Ok((ok, expires_mono_ms)) => Response::UploadLeaseRenewed {
+                        ok,
+                        expires_mono_ms,
+                    },
+                    Err(HandlerError::Rejected(message)) => Response::Rejected { message },
+                    Err(HandlerError::Internal(message)) => Response::Error { message },
+                }
+            }
+            Request::UploadLeaseRelease { token } => {
+                match handle_upload_lease_release(conn, boot, &token) {
+                    Ok(ok) => Response::UploadLeaseReleased { ok },
+                    Err(HandlerError::Rejected(message)) => Response::Rejected { message },
+                    Err(HandlerError::Internal(message)) => Response::Error { message },
+                }
+            }
+            Request::CloudUploadCommit {
+                queue_pk,
+                attempt_id,
+                hash,
+                hash_alg,
+                size,
+            } => match handle_cloud_upload_commit(
+                conn,
+                &queue_pk.destination_id,
+                &queue_pk.remote_key,
+                &attempt_id,
+                &hash,
+                &hash_alg,
+                size,
+            ) {
+                Ok((ok, durable_parent)) => Response::CloudUploadCommitted { ok, durable_parent },
+                Err(HandlerError::Rejected(message)) => Response::Rejected { message },
+                Err(HandlerError::Internal(message)) => Response::Error { message },
+            },
+            Request::CloudUploadFail {
+                queue_pk,
+                attempt_id,
+                error_class,
+                not_before,
+                terminal,
+            } => match handle_cloud_upload_fail(
+                conn,
+                &queue_pk.destination_id,
+                &queue_pk.remote_key,
+                &attempt_id,
+                &error_class,
+                not_before,
+                terminal,
+            ) {
+                Ok((ok, state)) => Response::CloudUploadFailed { ok, state },
+                Err(HandlerError::Rejected(message)) => Response::Rejected { message },
+                Err(HandlerError::Internal(message)) => Response::Error { message },
+            },
+            Request::CloudStatsGet {} => match handle_cloud_stats_get(conn) {
+                Ok((synced_count, synced_bytes, since_at)) => Response::CloudStats {
+                    synced_count,
+                    synced_bytes,
+                    since_at,
+                },
+                Err(HandlerError::Rejected(message)) => Response::Rejected { message },
+                Err(HandlerError::Internal(message)) => Response::Error { message },
+            },
+            Request::CloudStatsReset {} => match handle_cloud_stats_reset(conn) {
+                Ok(baseline_seq) => Response::CloudStatsReset {
+                    ok: true,
+                    baseline_seq,
+                },
+                Err(HandlerError::Rejected(message)) => Response::Rejected { message },
+                Err(HandlerError::Internal(message)) => Response::Error { message },
+            },
+            Request::CloudConfigGet {} => match handle_cloud_config_get(conn) {
+                Ok(config) => Response::CloudConfig { config },
+                Err(HandlerError::Rejected(message)) => Response::Rejected { message },
+                Err(HandlerError::Internal(message)) => Response::Error { message },
+            },
+            Request::CloudConfigPut { config } => match handle_cloud_config_put(conn, &config) {
+                Ok(config) => Response::CloudConfig { config },
+                Err(HandlerError::Rejected(message)) => Response::Rejected { message },
+                Err(HandlerError::Internal(message)) => Response::Error { message },
+            },
+            Request::CloudHistoryLoad {
+                after_cursor,
+                limit,
+            } => match handle_cloud_history_load(conn, after_cursor.as_deref(), limit) {
+                Ok((items, next_cursor)) => Response::CloudHistoryPage { items, next_cursor },
+                Err(HandlerError::Rejected(message)) => Response::Rejected { message },
+                Err(HandlerError::Internal(message)) => Response::Error { message },
             },
         },
         Err(e) => Response::Error {
@@ -278,7 +425,10 @@ fn handle_mark_archive_deleted(
     Ok(Response::Acked {})
 }
 
-fn handle_release_archive_delete_claim(conn: &Arc<Mutex<Connection>>, id: i64) -> Result<(), String> {
+fn handle_release_archive_delete_claim(
+    conn: &Arc<Mutex<Connection>>,
+    id: i64,
+) -> Result<(), String> {
     let locked = conn
         .lock()
         .map_err(|_| "index database mutex is poisoned".to_owned())?;
@@ -326,7 +476,9 @@ fn handle_list_eviction_candidates(
         .collect())
 }
 
-fn handle_list_recovery_rows(conn: &Arc<Mutex<Connection>>) -> Result<Vec<RecoveryRowWire>, String> {
+fn handle_list_recovery_rows(
+    conn: &Arc<Mutex<Connection>>,
+) -> Result<Vec<RecoveryRowWire>, String> {
     let locked = conn
         .lock()
         .map_err(|_| "index database mutex is poisoned".to_owned())?;
@@ -341,6 +493,327 @@ fn handle_list_recovery_rows(conn: &Arc<Mutex<Connection>>) -> Result<Vec<Recove
             delete_gen: row.delete_gen,
         })
         .collect())
+}
+
+fn map_db_error(error: DbError) -> HandlerError {
+    match error {
+        DbError::Sqlite(rusqlite::Error::InvalidParameterName(message)) => {
+            HandlerError::Rejected(message)
+        }
+        other => HandlerError::Internal(other.to_string()),
+    }
+}
+
+fn to_config_wire(config: &CloudConfig) -> CloudConfigWire {
+    CloudConfigWire {
+        sentry_enabled: config.sentry_enabled,
+        saved_enabled: config.saved_enabled,
+        recent_enabled: config.recent_enabled,
+        sentry_priority: config.sentry_priority,
+        saved_priority: config.saved_priority,
+        recent_priority: config.recent_priority,
+        reserve_gb: config.reserve_gb,
+        max_attempts: config.max_attempts,
+        base_backoff_secs: config.base_backoff_secs,
+        keep_until_backed_up: config.keep_until_backed_up,
+        auto_sync: config.auto_sync,
+    }
+}
+
+fn from_config_wire(config: &CloudConfigWire) -> CloudConfig {
+    CloudConfig {
+        sentry_enabled: config.sentry_enabled,
+        saved_enabled: config.saved_enabled,
+        recent_enabled: config.recent_enabled,
+        sentry_priority: config.sentry_priority,
+        saved_priority: config.saved_priority,
+        recent_priority: config.recent_priority,
+        reserve_gb: config.reserve_gb,
+        max_attempts: config.max_attempts,
+        base_backoff_secs: config.base_backoff_secs,
+        keep_until_backed_up: config.keep_until_backed_up,
+        auto_sync: config.auto_sync,
+    }
+}
+
+fn from_retry_resolution_wire(
+    resolution: &CloudQueueRetryResolutionWire,
+) -> CloudQueueRetryResolution {
+    match resolution {
+        CloudQueueRetryResolutionWire::KeepExisting => CloudQueueRetryResolution::KeepExisting,
+        CloudQueueRetryResolutionWire::Rekey { remote_key } => CloudQueueRetryResolution::Rekey {
+            remote_key: remote_key.clone(),
+        },
+        CloudQueueRetryResolutionWire::Replace => CloudQueueRetryResolution::Replace,
+    }
+}
+
+fn handle_cloud_candidates(
+    conn: &Arc<Mutex<Connection>>,
+    folders: &[String],
+    after_cursor: Option<&str>,
+    limit: u32,
+) -> Result<(Vec<CloudCandidateWire>, Option<String>), HandlerError> {
+    let locked = conn
+        .lock()
+        .map_err(|_| HandlerError::Internal("index database mutex is poisoned".to_owned()))?;
+    let page = cloud_candidates(&locked, folders, after_cursor, limit).map_err(map_db_error)?;
+    Ok((
+        page.items
+            .into_iter()
+            .map(|row| CloudCandidateWire {
+                archive_item_id: row.archive_item_id,
+                child_key: row.child_key,
+                source_rel: row.source_rel,
+                destination_id: row.destination_id,
+                remote_key: row.remote_key,
+                size_bytes: row.size_bytes,
+                content_sha256: row.content_sha256,
+                state: row.state,
+                category: row.category,
+                seq: row.seq,
+            })
+            .collect(),
+        page.next_cursor,
+    ))
+}
+
+fn handle_cloud_queue_load(
+    conn: &Arc<Mutex<Connection>>,
+    after_cursor: Option<&str>,
+    limit: u32,
+) -> Result<(Vec<CloudQueueRowWire>, Option<String>), HandlerError> {
+    let locked = conn
+        .lock()
+        .map_err(|_| HandlerError::Internal("index database mutex is poisoned".to_owned()))?;
+    let page = cloud_queue_load(&locked, after_cursor, limit).map_err(map_db_error)?;
+    Ok((
+        page.items
+            .into_iter()
+            .map(|row| CloudQueueRowWire {
+                archive_item_id: row.archive_item_id,
+                child_key: row.child_key,
+                destination_id: row.destination_id,
+                remote_key: row.remote_key,
+                category: row.category,
+                seq: row.seq,
+                total_bytes: row.total_bytes,
+                bytes_uploaded: row.bytes_uploaded,
+                content_sha256: row.content_sha256,
+                state: row.state,
+                attempts: row.attempts,
+                not_before: row.not_before,
+                last_error: row.last_error,
+            })
+            .collect(),
+        page.next_cursor,
+    ))
+}
+
+fn handle_cloud_queue_upsert(
+    conn: &Arc<Mutex<Connection>>,
+    item: &CloudQueueUpsertWire,
+) -> Result<String, HandlerError> {
+    let locked = conn
+        .lock()
+        .map_err(|_| HandlerError::Internal("index database mutex is poisoned".to_owned()))?;
+    cloud_queue_upsert(
+        &locked,
+        &CloudQueueUpsertItem {
+            archive_item_id: item.archive_item_id,
+            child_key: item.child_key.clone(),
+            destination_id: item.destination_id.clone(),
+            remote_key: item.remote_key.clone(),
+            category: item.category.clone(),
+            seq: item.seq,
+            total_bytes: item.total_bytes,
+            content_sha256: item.content_sha256.clone(),
+            expected_hash: item.expected_hash.clone(),
+            verify_alg: item.verify_alg.clone(),
+        },
+    )
+    .map_err(map_db_error)
+}
+
+fn handle_cloud_queue_retry(
+    conn: &Arc<Mutex<Connection>>,
+    archive_item_id: i64,
+    child_key: Option<&str>,
+    resolution: &CloudQueueRetryResolutionWire,
+) -> Result<String, HandlerError> {
+    let locked = conn
+        .lock()
+        .map_err(|_| HandlerError::Internal("index database mutex is poisoned".to_owned()))?;
+    cloud_queue_retry(
+        &locked,
+        archive_item_id,
+        child_key,
+        &from_retry_resolution_wire(resolution),
+    )
+    .map_err(map_db_error)
+}
+
+fn handle_upload_lease_acquire(
+    conn: &Arc<Mutex<Connection>>,
+    boot: &Arc<BootContext>,
+    archive_item_id: i64,
+    ttl_ms: u32,
+) -> Result<UploadLeaseAcquireWire, HandlerError> {
+    let locked = conn
+        .lock()
+        .map_err(|_| HandlerError::Internal("index database mutex is poisoned".to_owned()))?;
+    let result =
+        upload_lease_acquire(&locked, boot, archive_item_id, ttl_ms).map_err(map_db_error)?;
+    Ok((
+        result.granted,
+        result.token,
+        result.boot_id,
+        result.expires_mono_ms,
+    ))
+}
+
+type UploadLeaseAcquireWire = (bool, Option<String>, Option<String>, Option<i64>);
+
+fn handle_upload_lease_renew(
+    conn: &Arc<Mutex<Connection>>,
+    boot: &Arc<BootContext>,
+    token: &str,
+    ttl_ms: u32,
+) -> Result<(bool, Option<i64>), HandlerError> {
+    let locked = conn
+        .lock()
+        .map_err(|_| HandlerError::Internal("index database mutex is poisoned".to_owned()))?;
+    let result = upload_lease_renew(&locked, boot, token, ttl_ms).map_err(map_db_error)?;
+    Ok((result.ok, result.expires_mono_ms))
+}
+
+fn handle_upload_lease_release(
+    conn: &Arc<Mutex<Connection>>,
+    boot: &Arc<BootContext>,
+    token: &str,
+) -> Result<bool, HandlerError> {
+    let locked = conn
+        .lock()
+        .map_err(|_| HandlerError::Internal("index database mutex is poisoned".to_owned()))?;
+    upload_lease_release(&locked, boot, token).map_err(map_db_error)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_cloud_upload_commit(
+    conn: &Arc<Mutex<Connection>>,
+    destination_id: &str,
+    remote_key: &str,
+    attempt_id: &str,
+    hash: &str,
+    hash_alg: &str,
+    size: i64,
+) -> Result<(bool, bool), HandlerError> {
+    let mut locked = conn
+        .lock()
+        .map_err(|_| HandlerError::Internal("index database mutex is poisoned".to_owned()))?;
+    let result = cloud_upload_commit(
+        &mut locked,
+        &CloudQueuePk {
+            destination_id: destination_id.to_owned(),
+            remote_key: remote_key.to_owned(),
+        },
+        attempt_id,
+        hash,
+        hash_alg,
+        size,
+    )
+    .map_err(map_db_error)?;
+    Ok((result.ok, result.durable_parent))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_cloud_upload_fail(
+    conn: &Arc<Mutex<Connection>>,
+    destination_id: &str,
+    remote_key: &str,
+    attempt_id: &str,
+    error_class: &str,
+    not_before: Option<i64>,
+    terminal: bool,
+) -> Result<(bool, String), HandlerError> {
+    let mut locked = conn
+        .lock()
+        .map_err(|_| HandlerError::Internal("index database mutex is poisoned".to_owned()))?;
+    let result = cloud_upload_fail(
+        &mut locked,
+        &CloudQueuePk {
+            destination_id: destination_id.to_owned(),
+            remote_key: remote_key.to_owned(),
+        },
+        attempt_id,
+        error_class,
+        not_before,
+        terminal,
+    )
+    .map_err(map_db_error)?;
+    Ok((result.ok, result.state))
+}
+
+fn handle_cloud_stats_get(conn: &Arc<Mutex<Connection>>) -> Result<(i64, i64, i64), HandlerError> {
+    let locked = conn
+        .lock()
+        .map_err(|_| HandlerError::Internal("index database mutex is poisoned".to_owned()))?;
+    let stats = cloud_stats_get(&locked).map_err(map_db_error)?;
+    Ok((stats.synced_count, stats.synced_bytes, stats.since_at))
+}
+
+fn handle_cloud_stats_reset(conn: &Arc<Mutex<Connection>>) -> Result<i64, HandlerError> {
+    let locked = conn
+        .lock()
+        .map_err(|_| HandlerError::Internal("index database mutex is poisoned".to_owned()))?;
+    cloud_stats_reset(&locked).map_err(map_db_error)
+}
+
+fn handle_cloud_config_get(conn: &Arc<Mutex<Connection>>) -> Result<CloudConfigWire, HandlerError> {
+    let locked = conn
+        .lock()
+        .map_err(|_| HandlerError::Internal("index database mutex is poisoned".to_owned()))?;
+    let config = cloud_config_get(&locked).map_err(map_db_error)?;
+    Ok(to_config_wire(&config))
+}
+
+fn handle_cloud_config_put(
+    conn: &Arc<Mutex<Connection>>,
+    config: &CloudConfigWire,
+) -> Result<CloudConfigWire, HandlerError> {
+    let locked = conn
+        .lock()
+        .map_err(|_| HandlerError::Internal("index database mutex is poisoned".to_owned()))?;
+    let persisted = cloud_config_put(&locked, &from_config_wire(config)).map_err(map_db_error)?;
+    Ok(to_config_wire(&persisted))
+}
+
+fn handle_cloud_history_load(
+    conn: &Arc<Mutex<Connection>>,
+    after_cursor: Option<&str>,
+    limit: u32,
+) -> Result<(Vec<CloudHistoryRowWire>, Option<String>), HandlerError> {
+    let locked = conn
+        .lock()
+        .map_err(|_| HandlerError::Internal("index database mutex is poisoned".to_owned()))?;
+    let page = cloud_history_load(&locked, after_cursor, limit).map_err(map_db_error)?;
+    Ok((
+        page.items
+            .into_iter()
+            .map(|row| CloudHistoryRowWire {
+                id: row.id,
+                completion_seq: row.completion_seq,
+                archive_item_id: row.archive_item_id,
+                child_key: row.child_key,
+                destination_id: row.destination_id,
+                outcome: row.outcome,
+                size_bytes: row.size_bytes,
+                at: row.at,
+                error_class: row.error_class,
+            })
+            .collect(),
+        page.next_cursor,
+    ))
 }
 
 fn build_registration(payload: &RegisterArchivedClip) -> Result<ArchiveRegistration, String> {
@@ -487,8 +960,9 @@ mod tests {
     use crate::db::mutations::BootContext;
     use crate::db::open_in_memory;
     use crate::proto::{
-        ArchiveAngle, ArchiveUnit, MAX_REQUEST_FRAME, RegisterArchivedClip, Request, Response,
-        read_frame, write_frame,
+        ArchiveAngle, ArchiveUnit, CloudConfigWire, CloudQueuePkWire,
+        CloudQueueRetryResolutionWire, CloudQueueUpsertWire, MAX_REQUEST_FRAME,
+        RegisterArchivedClip, Request, Response, read_frame, write_frame,
     };
 
     fn payload() -> RegisterArchivedClip {
@@ -657,22 +1131,10 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn socket_delete_lifecycle_and_lease_denial_roundtrip() {
         let conn = open_in_memory().expect("open db");
-        let candidate_id = insert_archive_item(
-            &conn,
-            "archive/recent/old-1",
-            "RecentClips",
-            100,
-            1,
-            0,
-        );
-        let leased_id = insert_archive_item(
-            &conn,
-            "archive/recent/leased",
-            "RecentClips",
-            90,
-            1,
-            0,
-        );
+        let candidate_id =
+            insert_archive_item(&conn, "archive/recent/old-1", "RecentClips", 100, 1, 0);
+        let leased_id =
+            insert_archive_item(&conn, "archive/recent/leased", "RecentClips", 90, 1, 0);
         let conn = Arc::new(Mutex::new(conn));
         let boot = Arc::new(BootContext::new());
         {
@@ -689,8 +1151,8 @@ mod tests {
 
         let dir = new_temp_dir();
         let socket_path = dir.join("indexd.sock");
-        let _server = spawn(&conn, &boot, &socket_path, Duration::from_secs(2))
-            .expect("spawn indexd server");
+        let _server =
+            spawn(&conn, &boot, &socket_path, Duration::from_secs(2)).expect("spawn indexd server");
         let candidates = send(
             &socket_path,
             &Request::ListEvictionCandidates {
@@ -775,8 +1237,8 @@ mod tests {
         let boot = Arc::new(BootContext::new());
         let dir = new_temp_dir();
         let socket_path = dir.join("indexd.sock");
-        let _server = spawn(&conn, &boot, &socket_path, Duration::from_secs(2))
-            .expect("spawn indexd server");
+        let _server =
+            spawn(&conn, &boot, &socket_path, Duration::from_secs(2)).expect("spawn indexd server");
 
         let denied_list = send(
             &socket_path,
@@ -827,6 +1289,260 @@ mod tests {
                 }
             ),
             Response::Claimed {}
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines, clippy::panic, clippy::single_match_else)]
+    fn socket_cloud_rpc_roundtrip() {
+        let conn = open_in_memory().expect("open db");
+        conn.execute(
+            "INSERT INTO archive_items
+                (id, folder_class, path, size_bytes, file_count, archived_at, created_at, updated_at)
+             VALUES (101, 'RecentClips', 'archive/cloud/101', 30, 2, 100, 0, 0)",
+            [],
+        )
+        .expect("insert archive item");
+        let conn = Arc::new(Mutex::new(conn));
+        let boot = Arc::new(BootContext::new());
+        let dir = new_temp_dir();
+        let socket_path = dir.join("indexd.sock");
+        let _server =
+            spawn(&conn, &boot, &socket_path, Duration::from_secs(2)).expect("spawn indexd server");
+
+        let hash_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let hash_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        let queued = send(
+            &socket_path,
+            &Request::CloudQueueUpsert {
+                item: CloudQueueUpsertWire {
+                    archive_item_id: 101,
+                    child_key: "child-a".to_owned(),
+                    destination_id: "dest".to_owned(),
+                    remote_key: "rk/a".to_owned(),
+                    category: "bulk".to_owned(),
+                    seq: 1,
+                    total_bytes: 10,
+                    content_sha256: hash_a.to_owned(),
+                    expected_hash: None,
+                    verify_alg: "none".to_owned(),
+                },
+            },
+        );
+        assert_eq!(
+            queued,
+            Response::CloudQueueState {
+                state: "queued".to_owned()
+            }
+        );
+        let _ = send(
+            &socket_path,
+            &Request::CloudQueueUpsert {
+                item: CloudQueueUpsertWire {
+                    archive_item_id: 101,
+                    child_key: "child-b".to_owned(),
+                    destination_id: "dest".to_owned(),
+                    remote_key: "rk/b".to_owned(),
+                    category: "bulk".to_owned(),
+                    seq: 2,
+                    total_bytes: 20,
+                    content_sha256: hash_b.to_owned(),
+                    expected_hash: None,
+                    verify_alg: "none".to_owned(),
+                },
+            },
+        );
+
+        let lease = send(
+            &socket_path,
+            &Request::UploadLeaseAcquire {
+                archive_item_id: 101,
+                ttl_ms: 1_000,
+            },
+        );
+        let Response::UploadLeaseAcquired {
+            granted: true,
+            token: Some(token),
+            boot_id: Some(_),
+            expires_mono_ms: Some(_),
+        } = lease
+        else {
+            panic!("unexpected lease response: {lease:?}");
+        };
+        let renewed = send(
+            &socket_path,
+            &Request::UploadLeaseRenew {
+                token: token.clone(),
+                ttl_ms: 2_000,
+            },
+        );
+        assert!(matches!(
+            renewed,
+            Response::UploadLeaseRenewed {
+                ok: true,
+                expires_mono_ms: Some(_)
+            }
+        ));
+        assert_eq!(
+            send(
+                &socket_path,
+                &Request::UploadLeaseRelease {
+                    token: token.clone()
+                }
+            ),
+            Response::UploadLeaseReleased { ok: true }
+        );
+
+        let first_commit = send(
+            &socket_path,
+            &Request::CloudUploadCommit {
+                queue_pk: CloudQueuePkWire {
+                    destination_id: "dest".to_owned(),
+                    remote_key: "rk/a".to_owned(),
+                },
+                attempt_id: "attempt-a".to_owned(),
+                hash: hash_a.to_owned(),
+                hash_alg: "sha256".to_owned(),
+                size: 10,
+            },
+        );
+        assert_eq!(
+            first_commit,
+            Response::CloudUploadCommitted {
+                ok: true,
+                durable_parent: false
+            }
+        );
+        let second_commit = send(
+            &socket_path,
+            &Request::CloudUploadCommit {
+                queue_pk: CloudQueuePkWire {
+                    destination_id: "dest".to_owned(),
+                    remote_key: "rk/b".to_owned(),
+                },
+                attempt_id: "attempt-b".to_owned(),
+                hash: hash_b.to_owned(),
+                hash_alg: "sha256".to_owned(),
+                size: 20,
+            },
+        );
+        assert_eq!(
+            second_commit,
+            Response::CloudUploadCommitted {
+                ok: true,
+                durable_parent: true
+            }
+        );
+
+        let fail_state = send(
+            &socket_path,
+            &Request::CloudQueueUpsert {
+                item: CloudQueueUpsertWire {
+                    archive_item_id: 101,
+                    child_key: "child-c".to_owned(),
+                    destination_id: "dest".to_owned(),
+                    remote_key: "rk/c".to_owned(),
+                    category: "bulk".to_owned(),
+                    seq: 3,
+                    total_bytes: 5,
+                    content_sha256:
+                        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                            .to_owned(),
+                    expected_hash: None,
+                    verify_alg: "none".to_owned(),
+                },
+            },
+        );
+        assert_eq!(
+            fail_state,
+            Response::CloudQueueState {
+                state: "queued".to_owned()
+            }
+        );
+        let failed = send(
+            &socket_path,
+            &Request::CloudUploadFail {
+                queue_pk: CloudQueuePkWire {
+                    destination_id: "dest".to_owned(),
+                    remote_key: "rk/c".to_owned(),
+                },
+                attempt_id: "attempt-c".to_owned(),
+                error_class: "timeout".to_owned(),
+                not_before: Some(1234),
+                terminal: false,
+            },
+        );
+        assert_eq!(
+            failed,
+            Response::CloudUploadFailed {
+                ok: true,
+                state: "failed".to_owned()
+            }
+        );
+
+        let candidates = send(
+            &socket_path,
+            &Request::CloudCandidates {
+                folders: vec!["RecentClips".to_owned()],
+                after_cursor: None,
+                limit: 10,
+            },
+        );
+        assert!(matches!(candidates, Response::CloudCandidates { .. }));
+        let queue = send(
+            &socket_path,
+            &Request::CloudQueueLoad {
+                after_cursor: None,
+                limit: 10,
+            },
+        );
+        assert!(matches!(queue, Response::CloudQueuePage { .. }));
+        let history = send(
+            &socket_path,
+            &Request::CloudHistoryLoad {
+                after_cursor: None,
+                limit: 10,
+            },
+        );
+        assert!(matches!(history, Response::CloudHistoryPage { .. }));
+        let stats = send(&socket_path, &Request::CloudStatsGet {});
+        assert!(matches!(stats, Response::CloudStats { .. }));
+        let reset = send(&socket_path, &Request::CloudStatsReset {});
+        assert!(matches!(reset, Response::CloudStatsReset { ok: true, .. }));
+        let config = send(&socket_path, &Request::CloudConfigGet {});
+        let Response::CloudConfig { config } = config else {
+            panic!("expected cloud config response");
+        };
+        assert_eq!(config.max_attempts, 5);
+        let updated = send(
+            &socket_path,
+            &Request::CloudConfigPut {
+                config: CloudConfigWire {
+                    auto_sync: false,
+                    ..config
+                },
+            },
+        );
+        let Response::CloudConfig { config } = updated else {
+            panic!("expected cloud config response");
+        };
+        assert!(!config.auto_sync);
+        let retried = send(
+            &socket_path,
+            &Request::CloudQueueRetry {
+                archive_item_id: 101,
+                child_key: Some("child-c".to_owned()),
+                resolution: CloudQueueRetryResolutionWire::Replace,
+            },
+        );
+        assert_eq!(
+            retried,
+            Response::CloudQueueState {
+                state: "queued".to_owned()
+            }
         );
 
         let _ = std::fs::remove_dir_all(dir);

@@ -29,7 +29,7 @@ pub const SCHEMA_VERSION_NOTE: &str = "v1 (PROVISIONAL — pre-OP-3 freeze)";
 /// The highest schema version this binary knows how to produce. A DB
 /// reporting a higher version was written by a newer `indexd` and must
 /// not be opened read-write.
-pub const LATEST_VERSION: i64 = 5;
+pub const LATEST_VERSION: i64 = 6;
 
 /// The ordered migration ladder. Index order MUST match ascending
 /// `version`; [`MIGRATIONS`] is validated by a test.
@@ -58,6 +58,11 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 5,
         note: "v5 — front_parse_attempt retry/backoff columns",
         sql: V5_SQL,
+    },
+    Migration {
+        version: 6,
+        note: "v6 — cloud sync persistence tables + indexes",
+        sql: V6_SQL,
     },
 ];
 
@@ -140,6 +145,127 @@ ALTER TABLE front_parse_attempts
    ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE front_parse_attempts
    ADD COLUMN next_retry_at INTEGER;
+";
+
+/// v6 DDL: cloud-sync persistence (queue, dedup oracle, history, metadata,
+/// typed non-secret config).
+const V6_SQL: &str = "
+CREATE TABLE cloud_upload_queue (
+    archive_item_id  INTEGER NOT NULL REFERENCES archive_items(id) ON DELETE CASCADE,
+    child_key        TEXT    NOT NULL
+                          CHECK(length(child_key) BETWEEN 1 AND 512),
+    destination_id   TEXT    NOT NULL
+                          CHECK(length(destination_id) BETWEEN 1 AND 128),
+    remote_key       TEXT    NOT NULL
+                          CHECK(length(remote_key) BETWEEN 1 AND 1024),
+    category         TEXT    NOT NULL
+                          CHECK(category IN ('event_sentry','trip','bulk')),
+    seq              INTEGER NOT NULL CHECK(seq >= 0),
+    total_bytes      INTEGER NOT NULL CHECK(total_bytes >= 0),
+    bytes_uploaded   INTEGER NOT NULL
+                          CHECK(bytes_uploaded >= 0 AND bytes_uploaded <= total_bytes),
+    expected_hash    TEXT CHECK(expected_hash IS NULL OR length(expected_hash) <= 256),
+    verify_alg       TEXT    NOT NULL
+                          CHECK(verify_alg IN ('sha256','md5','crc32c','sha1','quickxor','dropbox','none')),
+    content_sha256   TEXT    NOT NULL
+                          CHECK(length(content_sha256)=64
+                                AND content_sha256 = lower(content_sha256)
+                                AND content_sha256 NOT GLOB '*[^0-9a-f]*'),
+    state            TEXT    NOT NULL
+                          CHECK(state IN ('queued','in_progress','done','failed','parked')),
+    attempts         INTEGER NOT NULL CHECK(attempts >= 0),
+    not_before       INTEGER CHECK(not_before IS NULL OR not_before >= 0),
+    last_error       TEXT CHECK(last_error IS NULL OR length(last_error) <= 512),
+    PRIMARY KEY(destination_id, remote_key)
+);
+
+CREATE TABLE cloud_synced_files (
+    destination_id  TEXT    NOT NULL CHECK(length(destination_id) BETWEEN 1 AND 128),
+    remote_key      TEXT    NOT NULL CHECK(length(remote_key) BETWEEN 1 AND 1024),
+    archive_item_id INTEGER NOT NULL REFERENCES archive_items(id) ON DELETE CASCADE,
+    child_key       TEXT    NOT NULL CHECK(length(child_key) BETWEEN 1 AND 512),
+    content_sha256  TEXT    NOT NULL
+                          CHECK(length(content_sha256)=64
+                                AND content_sha256 = lower(content_sha256)
+                                AND content_sha256 NOT GLOB '*[^0-9a-f]*'),
+    verify_alg      TEXT    NOT NULL
+                          CHECK(verify_alg IN ('sha256','md5','crc32c','sha1','quickxor','dropbox','none')),
+    verify_value    TEXT CHECK(verify_value IS NULL OR length(verify_value) <= 256),
+    size_bytes      INTEGER NOT NULL CHECK(size_bytes >= 0),
+    synced_at       INTEGER NOT NULL CHECK(synced_at >= 0),
+    completion_seq  INTEGER NOT NULL CHECK(completion_seq >= 0),
+    PRIMARY KEY(destination_id, remote_key)
+);
+
+CREATE TABLE cloud_sync_history (
+    id              INTEGER PRIMARY KEY,
+    completion_seq  INTEGER NOT NULL CHECK(completion_seq >= 0),
+    archive_item_id INTEGER NOT NULL REFERENCES archive_items(id) ON DELETE CASCADE,
+    child_key       TEXT    NOT NULL CHECK(length(child_key) BETWEEN 1 AND 512),
+    destination_id  TEXT    NOT NULL CHECK(length(destination_id) BETWEEN 1 AND 128),
+    outcome         TEXT    NOT NULL CHECK(outcome IN ('uploaded','failed')),
+    size_bytes      INTEGER NOT NULL CHECK(size_bytes >= 0),
+    at              INTEGER NOT NULL CHECK(at >= 0),
+    error_class     TEXT CHECK(error_class IS NULL OR length(error_class) <= 128)
+);
+
+CREATE TABLE cloud_meta (
+    id                 INTEGER PRIMARY KEY CHECK(id = 1),
+    completion_seq     INTEGER NOT NULL CHECK(completion_seq >= 0),
+    stats_baseline_seq INTEGER NOT NULL CHECK(stats_baseline_seq >= 0),
+    stats_baseline_at  INTEGER NOT NULL CHECK(stats_baseline_at >= 0),
+    updated_at         INTEGER NOT NULL CHECK(updated_at >= 0)
+);
+INSERT OR IGNORE INTO cloud_meta
+    (id, completion_seq, stats_baseline_seq, stats_baseline_at, updated_at)
+VALUES (1, 0, 0, 0, 0);
+
+CREATE TABLE cloud_provider_config (
+    id                   INTEGER PRIMARY KEY CHECK(id = 1),
+    sentry_enabled       INTEGER NOT NULL CHECK(sentry_enabled IN (0,1)),
+    saved_enabled        INTEGER NOT NULL CHECK(saved_enabled IN (0,1)),
+    recent_enabled       INTEGER NOT NULL CHECK(recent_enabled IN (0,1)),
+    sentry_priority      INTEGER NOT NULL CHECK(sentry_priority >= 0),
+    saved_priority       INTEGER NOT NULL CHECK(saved_priority >= 0),
+    recent_priority      INTEGER NOT NULL CHECK(recent_priority >= 0),
+    reserve_gb           INTEGER NOT NULL CHECK(reserve_gb >= 0),
+    max_attempts         INTEGER NOT NULL CHECK(max_attempts >= 1),
+    base_backoff_secs    INTEGER NOT NULL CHECK(base_backoff_secs >= 0),
+    keep_until_backed_up INTEGER NOT NULL CHECK(keep_until_backed_up IN (0,1)),
+    auto_sync            INTEGER NOT NULL CHECK(auto_sync IN (0,1)),
+    updated_at           INTEGER NOT NULL CHECK(updated_at >= 0)
+);
+INSERT OR IGNORE INTO cloud_provider_config (
+    id, sentry_enabled, saved_enabled, recent_enabled,
+    sentry_priority, saved_priority, recent_priority,
+    reserve_gb, max_attempts, base_backoff_secs,
+    keep_until_backed_up, auto_sync, updated_at
+)
+VALUES (1, 1, 1, 1, 0, 1, 2, 0, 5, 60, 1, 1, 0);
+
+CREATE TABLE cloud_upload_attempts (
+    attempt_id      TEXT PRIMARY KEY CHECK(length(attempt_id) BETWEEN 1 AND 128),
+    destination_id  TEXT NOT NULL CHECK(length(destination_id) BETWEEN 1 AND 128),
+    remote_key      TEXT NOT NULL CHECK(length(remote_key) BETWEEN 1 AND 1024),
+    outcome         TEXT NOT NULL CHECK(outcome IN ('uploaded','failed')),
+    durable_parent  INTEGER NOT NULL CHECK(durable_parent IN (0,1)),
+    completion_seq  INTEGER NOT NULL CHECK(completion_seq >= 0),
+    state_after     TEXT NOT NULL CHECK(state_after IN ('queued','in_progress','done','failed','parked')),
+    hash            TEXT NOT NULL
+                       CHECK((length(hash)=0)
+                             OR (length(hash)=64
+                                 AND hash = lower(hash)
+                                 AND hash NOT GLOB '*[^0-9a-f]*')),
+    size_bytes      INTEGER NOT NULL CHECK(size_bytes >= 0),
+    created_at      INTEGER NOT NULL CHECK(created_at >= 0)
+);
+
+CREATE INDEX idx_cloud_upload_queue_state_category_seq
+    ON cloud_upload_queue(state, category, seq);
+CREATE INDEX idx_cloud_sync_history_completion_seq
+    ON cloud_sync_history(completion_seq);
+CREATE INDEX idx_cloud_synced_files_archive_item_id
+    ON cloud_synced_files(archive_item_id);
 ";
 
 /// v1 DDL: contract D1's proposed schema, plus two internal additions
@@ -344,7 +470,7 @@ mod tests {
 
     use rusqlite::{Connection, params};
 
-    use super::{LATEST_VERSION, MIGRATIONS, V1_SQL, V2_SQL, V3_SQL, V4_SQL, V5_SQL};
+    use super::{LATEST_VERSION, MIGRATIONS, V1_SQL, V2_SQL, V3_SQL, V4_SQL, V5_SQL, V6_SQL};
 
     #[test]
     fn ladder_is_monotonic_and_matches_latest() {
@@ -469,5 +595,110 @@ mod tests {
             .unwrap();
         assert_eq!(row.0, 0);
         assert_eq!(row.1, None);
+    }
+
+    #[test]
+    fn v6_adds_cloud_sync_tables_and_singletons() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(V1_SQL).unwrap();
+        conn.execute_batch(V2_SQL).unwrap();
+        conn.execute_batch(V3_SQL).unwrap();
+        conn.execute_batch(V4_SQL).unwrap();
+        conn.execute_batch(V5_SQL).unwrap();
+        for version in 1_i64..=5 {
+            conn.execute(
+                "INSERT INTO schema_version(version, applied_at, note) VALUES(?1, 0, 'seed')",
+                params![version],
+            )
+            .unwrap();
+        }
+
+        let tx = conn.transaction().unwrap();
+        tx.execute_batch(V6_SQL).unwrap();
+        tx.execute(
+            "INSERT INTO schema_version(version, applied_at, note) VALUES(6, 0, 'v6')",
+            [],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let queue_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='cloud_upload_queue'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(queue_exists, 1);
+
+        let meta_row: (i64, i64) = conn
+            .query_row(
+                "SELECT completion_seq, stats_baseline_seq FROM cloud_meta WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(meta_row, (0, 0));
+    }
+
+    #[test]
+    fn v6_enforces_cloud_queue_checks() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(V1_SQL).unwrap();
+        conn.execute_batch(V2_SQL).unwrap();
+        conn.execute_batch(V3_SQL).unwrap();
+        conn.execute_batch(V4_SQL).unwrap();
+        conn.execute_batch(V5_SQL).unwrap();
+        conn.execute_batch(V6_SQL).unwrap();
+        conn.execute(
+            "INSERT INTO archive_items
+                (id, folder_class, path, size_bytes, file_count, archived_at, created_at, updated_at)
+             VALUES (1, 'RecentClips', 'archive/t1', 1, 1, 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+
+        let bad_negative = conn.execute(
+            "INSERT INTO cloud_upload_queue
+                (archive_item_id, child_key, destination_id, remote_key, category, seq, total_bytes,
+                 bytes_uploaded, expected_hash, verify_alg, content_sha256, state, attempts)
+             VALUES
+                (1, 'c1', 'dest', 'k1', 'bulk', 0, -1, 0, NULL, 'none',
+                 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'queued', 0)",
+            [],
+        );
+        assert!(bad_negative.is_err());
+
+        let bad_uploaded_gt_total = conn.execute(
+            "INSERT INTO cloud_upload_queue
+                (archive_item_id, child_key, destination_id, remote_key, category, seq, total_bytes,
+                 bytes_uploaded, expected_hash, verify_alg, content_sha256, state, attempts)
+             VALUES
+                (1, 'c2', 'dest', 'k2', 'bulk', 0, 5, 6, NULL, 'none',
+                 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'queued', 0)",
+            [],
+        );
+        assert!(bad_uploaded_gt_total.is_err());
+
+        let bad_hash_len = conn.execute(
+            "INSERT INTO cloud_upload_queue
+                (archive_item_id, child_key, destination_id, remote_key, category, seq, total_bytes,
+                 bytes_uploaded, expected_hash, verify_alg, content_sha256, state, attempts)
+             VALUES
+                (1, 'c3', 'dest', 'k3', 'bulk', 0, 5, 0, NULL, 'none', 'abc', 'queued', 0)",
+            [],
+        );
+        assert!(bad_hash_len.is_err());
+
+        let bad_enum = conn.execute(
+            "INSERT INTO cloud_upload_queue
+                (archive_item_id, child_key, destination_id, remote_key, category, seq, total_bytes,
+                 bytes_uploaded, expected_hash, verify_alg, content_sha256, state, attempts)
+             VALUES
+                (1, 'c4', 'dest', 'k4', 'bogus', 0, 5, 0, NULL, 'none',
+                 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc', 'queued', 0)",
+            [],
+        );
+        assert!(bad_enum.is_err());
     }
 }

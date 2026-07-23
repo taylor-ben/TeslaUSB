@@ -83,7 +83,8 @@ mod unix_app {
     /// so a stall here means a hung server — drop and reconnect. (Applies
     /// only while reading a reply; the idle gap between passes is a plain
     /// `sleep`, not a blocked read.)
-    const IO_TIMEOUT: Duration = Duration::from_secs(60);
+    const SCANNER_IO_TIMEOUT: Duration = Duration::from_secs(60);
+    const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(15);
     const OLDEST_BACKLOG_RESERVE: usize = 2;
 
     #[derive(Debug, Clone)]
@@ -305,8 +306,9 @@ mod unix_app {
             boot.boot_id()
         );
 
-        let _server_thread = server::spawn(&conn, &boot, &indexd_socket_path, IO_TIMEOUT)
-            .map_err(|e| format!("binding {}: {e}", indexd_socket_path.display()))?;
+        let _server_thread =
+            server::spawn(&conn, &boot, &indexd_socket_path, CONTROL_IO_TIMEOUT)
+                .map_err(|e| format!("binding {}: {e}", indexd_socket_path.display()))?;
 
         let socket_display = scannerd_socket_path.display().to_string();
         let derive_cfg = DeriveConfig::default();
@@ -357,11 +359,11 @@ mod unix_app {
         health_path: &Path,
         health_write_error_logged: &mut bool,
     ) {
-        if let Err(e) = stream.set_read_timeout(Some(IO_TIMEOUT)) {
+        if let Err(e) = stream.set_read_timeout(Some(SCANNER_IO_TIMEOUT)) {
             eprintln!("indexd: set read timeout failed: {e}");
             return;
         }
-        if let Err(e) = stream.set_write_timeout(Some(IO_TIMEOUT)) {
+        if let Err(e) = stream.set_write_timeout(Some(SCANNER_IO_TIMEOUT)) {
             eprintln!("indexd: set write timeout failed: {e}");
             return;
         }
