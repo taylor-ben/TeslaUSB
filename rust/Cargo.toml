@@ -23,6 +23,7 @@ members = [
     "crates/wifid",
     "crates/uploadd",
     "crates/schedulerd",
+    "crates/teslausb-creds",
 ]
 
 # Shared package metadata. Each crate inherits via `field.workspace = true`
