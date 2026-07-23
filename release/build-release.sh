@@ -2,8 +2,8 @@
 #
 # TeslaUSB B-1 — release BUILDER (Task 7.2, Phase 7.0 contract §3/§7).
 #
-# Produces a release artifact for the 7 service daemons + SPA + units:
-#   1. resolve the aarch64 service binaries (cross-compile via podman, or take a
+# Produces a release artifact for the 8 service daemons + SPA + units:
+#   1. resolve the aarch64 service binaries (cross-compile via WSLC, or take a
 #      prebuilt --bin-dir);
 #   2. assert each binary is a real aarch64 ELF (wrong-arch guard — a host-arch
 #      binary must NEVER enter SHA256SUMS as aarch64);
@@ -21,7 +21,8 @@
 # unless --skip-arch-check is given.
 #
 # Documented release host: Linux / WSL / container (contract §7). The cross
-# build uses podman with a Debian image + gcc-aarch64-linux-gnu cross linker.
+# build uses WSLC (wslc.exe, a Docker-compatible CLI) with a Debian image +
+# gcc-aarch64-linux-gnu cross linker.
 #
 # Exit codes:
 #   0  artifact built + self-verified
@@ -47,12 +48,12 @@ br__die() { local code="$1"; shift; br__log "ERROR: $*"; exit "$code"; }
 
 br__usage() {
     cat >&2 <<'EOF'
-usage: build-release.sh --version VER (--bin-dir DIR | --cross-podman)
+usage: build-release.sh --version VER (--bin-dir DIR | --cross-wslc)
                         (--spa-dir DIR | --spa-project DIR) [options]
 
 binary source (exactly one):
   --bin-dir DIR             use prebuilt aarch64 binaries from DIR/<service>
-  --cross-podman            cross-compile the 7 daemons via podman + Debian
+  --cross-wslc              cross-compile the 8 daemons via WSLC + Debian
 
 spa source (exactly one):
   --spa-dir DIR             stage a prebuilt SPA bundle from DIR (vite dist/)
@@ -87,10 +88,10 @@ br__is_aarch64_elf() {
     [ "$emachine" = "b700" ]
 }
 
-br__cross_build_podman() {
+br__cross_build_wslc() {
     local repo="$1" outbin="$2"
-    command -v podman >/dev/null 2>&1 || br__die "$BR_EX_MISSING" "podman not found (needed for --cross-podman)"
-    br__log "cross-compiling 7 daemons via podman (Debian + gcc-aarch64-linux-gnu)..."
+    command -v wslc >/dev/null 2>&1 || br__die "$BR_EX_MISSING" "wslc not found (needed for --cross-wslc)"
+    br__log "cross-compiling 8 daemons via wslc (Debian + gcc-aarch64-linux-gnu)..."
     mkdir -p "$outbin"
     # The container copies sources off the (read-only) bind mount, builds into a
     # named cargo volume, asserts arch, and installs the binaries to /out/bin.
@@ -120,19 +121,19 @@ for b in gadgetd scannerd indexd webd uploadd retentiond wifid schedulerd; do
   aarch64-linux-gnu-readelf -h "$src" | grep -qE "Machine:.*AArch64"
   install -m0755 "$src" /out/bin/$b
 done'
-    podman run --rm \
-        --mount "type=bind,source=${repo},target=/src,ro" \
-        --mount "type=bind,source=${outbin%/bin},target=/out" \
-        --mount "type=volume,source=teslausb-cargo-target,target=/cargo-target" \
-        --mount "type=volume,source=teslausb-cargo-home,target=/root/.cargo" \
-        --mount "type=volume,source=teslausb-rustup,target=/root/.rustup" \
-        debian:bookworm bash -lc "$inner" \
-        || br__die "$BR_EX_FAIL" "podman cross build failed"
+    wslc run --rm \
+        -v "${repo}:/src:ro" \
+        -v "${outbin%/bin}:/out" \
+        -v "teslausb-cargo-target:/cargo-target" \
+        -v "teslausb-cargo-home:/root/.cargo" \
+        -v "teslausb-rustup:/root/.rustup" \
+        docker.io/library/debian:bookworm bash -lc "$inner" \
+        || br__die "$BR_EX_FAIL" "wslc cross build failed"
 }
 
 main() {
     local version='' commit='' triple="$DEFAULT_TRIPLE"
-    local bin_dir='' cross_podman=0 spa_dir='' spa_project=''
+    local bin_dir='' cross_wslc=0 spa_dir='' spa_project=''
     local units_dir="${ROOT}/deploy/systemd"
     local unit_ver='1' out_dir="${ROOT}/release/.build/dist"
     local build_host='' skip_arch=0 keep_stage=0
@@ -143,7 +144,7 @@ main() {
             --commit) commit="${2:?}"; shift 2 ;;
             --triple) triple="${2:?}"; shift 2 ;;
             --bin-dir) bin_dir="${2:?}"; shift 2 ;;
-            --cross-podman) cross_podman=1; shift ;;
+            --cross-wslc) cross_wslc=1; shift ;;
             --spa-dir) spa_dir="${2:?}"; shift 2 ;;
             --spa-project) spa_project="${2:?}"; shift 2 ;;
             --units-dir) units_dir="${2:?}"; shift 2 ;;
@@ -158,11 +159,11 @@ main() {
     done
 
     [ -n "$version" ] || { br__usage; br__die "$BR_EX_USAGE" "--version is required"; }
-    if [ -n "$bin_dir" ] && [ "$cross_podman" -eq 1 ]; then
-        br__die "$BR_EX_USAGE" "--bin-dir and --cross-podman are mutually exclusive"
+    if [ -n "$bin_dir" ] && [ "$cross_wslc" -eq 1 ]; then
+        br__die "$BR_EX_USAGE" "--bin-dir and --cross-wslc are mutually exclusive"
     fi
-    if [ -z "$bin_dir" ] && [ "$cross_podman" -eq 0 ]; then
-        br__die "$BR_EX_USAGE" "one of --bin-dir or --cross-podman is required"
+    if [ -z "$bin_dir" ] && [ "$cross_wslc" -eq 0 ]; then
+        br__die "$BR_EX_USAGE" "one of --bin-dir or --cross-wslc is required"
     fi
     if [ -n "$spa_dir" ] && [ -n "$spa_project" ]; then
         br__die "$BR_EX_USAGE" "--spa-dir and --spa-project are mutually exclusive"
@@ -193,9 +194,9 @@ main() {
     mkdir -p "$stage/bin" "$stage/spa" "$stage/units"
 
     # --- 1) binaries ----------------------------------------------------------
-    if [ "$cross_podman" -eq 1 ]; then
+    if [ "$cross_wslc" -eq 1 ]; then
         bin_dir="${out_dir}/${name}.binsrc/bin"
-        br__cross_build_podman "$ROOT" "$bin_dir"
+        br__cross_build_wslc "$ROOT" "$bin_dir"
     fi
     local svc
     for svc in $SERVICES; do

@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 #
 # Tests for release/build-release.sh (Task 7.2). Hermetic: uses the labelled
-# release/fixtures stand-ins (no podman, no real cross-compile) to prove the
+# release/fixtures stand-ins (no WSLC, no real cross-compile) to prove the
 # pipeline mechanics — stage -> generate -> SELF-VERIFY (verify-release.sh) ->
 # package -> the packaged tarball re-verifies and fails closed on mutation.
 # Also proves the wrong-arch guard rejects a non-aarch64 binary.
 #
 # The REAL aarch64 build (arch check ON) is exercised live in the task report,
-# not here, because it needs podman + the compiled binaries.
+# not here, because it needs WSLC + the compiled binaries.
 # Exits 0 iff every case passes.
 set -u
 
@@ -72,7 +72,7 @@ assert_code 2 "no binary source is usage error" -- \
 assert_code 2 "no spa source is usage error" -- \
     bash "$BR" --version "$VERSION" --bin-dir "${FIXGOOD}/bin" --out "$OUT3"
 assert_code 2 "both binary sources is usage error" -- \
-    bash "$BR" --version "$VERSION" --bin-dir "${FIXGOOD}/bin" --cross-podman \
+    bash "$BR" --version "$VERSION" --bin-dir "${FIXGOOD}/bin" --cross-wslc \
         --spa-dir "${FIXGOOD}/spa" --out "$OUT3"
 assert_code 3 "missing a binary fails closed" -- \
     bash "$BR" --version "$VERSION" --commit "$COMMIT" --bin-dir "${OUT3}" --spa-dir "${FIXGOOD}/spa" \

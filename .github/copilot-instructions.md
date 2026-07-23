@@ -44,7 +44,7 @@ ones ("make it work") force constant clarification.
 ## Rust + TS only — no Python, ever (binding)
 
 B-1 is **Rust** (daemons: `gadgetd`, `scannerd`, `indexd`, `webd`, `retentiond`,
-`uploadd`, `wifid`) plus the **preact/TypeScript SPA** under `spa/`. **No Python**
+`uploadd`, `wifid`, `schedulerd`) plus the **preact/TypeScript SPA** under `spa/`. **No Python**
 in the shipped solution or the build/deploy surface — no runtime, Flask, Jinja,
 gunicorn, or `.py` file.
 
@@ -54,27 +54,34 @@ clip loss. You MAY read v1 to recover an authoritative Tesla path, folder name,
 or validation rule, and port the *behavior* idiomatically. You MUST NOT copy v1
 Python (verbatim or line-translated) or reintroduce any Python.
 
-## Builds — podman only, never local WSL (binding)
+## Builds — WSLC containers from PowerShell (binding)
 
-All cross-builds run through **podman on the Windows host** (debian:bookworm,
-`gcc-aarch64-linux-gnu` cross linker, target `aarch64-unknown-linux-gnu`,
-toolchain 1.85.0). Podman is installed (`podman.exe`, `podman-machine-default`).
-**Do not** drop to local WSL (slow, not reproducible).
+All cross-builds run through **WSLC (Windows Subsystem for Linux Containers) on
+the Windows host** (debian:bookworm, `gcc-aarch64-linux-gnu` cross linker, target
+`aarch64-unknown-linux-gnu`, toolchain 1.85.0). WSLC ships with WSL as `wslc.exe`
+(aliased `container.exe`, at `C:\Program Files\WSL\`) — a Docker-compatible CLI
+that runs Linux containers natively on Windows, no Docker Desktop or podman
+needed. **Do not** drop to a native WSL `cargo` build (slow, not reproducible);
+drive `wslc` from PowerShell instead.
 
-### Critical gotcha — invoke podman from PowerShell, not WSL bash (saves trial-and-error)
+### Critical gotcha — invoke wslc from PowerShell, not WSL bash (saves trial-and-error)
 
-`release/build-release.sh --cross-podman` **fails on this host** because the only
-`bash` is **WSL** (`bash --version` → `x86_64-pc-linux-gnu`, paths are `/mnt/c/...`):
-the script's `command -v podman` doesn't find the Windows `podman.exe` inside WSL
-(→ `ERROR: podman not found`), and even if shimmed, podman.exe bind mounts need
-**Windows paths** (`C:\...`), not WSL `/mnt/c/...` paths. So:
+`wslc.exe` is a **Windows** binary and its bind mounts take **Windows paths**
+(`C:\...`), not WSL `/mnt/c/...` paths — so running `release/build-release.sh
+--cross-wslc` from the only `bash` on this host (**WSL**, `bash --version` →
+`x86_64-pc-linux-gnu`, paths `/mnt/c/...`) is fragile: the `/mnt/c/...` mount
+sources won't resolve. So:
 
-- **Run the container recipe directly via `podman.exe` from PowerShell** with
-  `C:\...` bind-mount sources. This is the documented "mirror the container
-  recipe" path and is the fast, reliable way here.
+- **Run the container recipe directly via `wslc` from PowerShell** with `C:\...`
+  bind-mount sources. This is the documented "mirror the container recipe" path
+  and is the fast, reliable way here.
+- WSLC `run` has **no `--mount` flag** — use Docker-style `-v`: a bind mount is
+  `-v "C:\path:/target:ro"`, a named volume is `-v name:/target` (auto-created on
+  first use; `wslc volume ls` to inspect).
 - Reuse the **warm named volumes** so rebuilds are ~seconds, not minutes:
   `teslausb-cargo-target`, `teslausb-cargo-home`, `teslausb-rustup` (cross-build);
-  `teslausb-test-target` + `teslausb-cargo-home` (tests).
+  `teslausb-test-target` + `teslausb-cargo-home` (tests). These are WSLC volumes —
+  the old podman machine + its volumes are gone, so the first WSLC run is cold.
 - **Build only the changed crates** with `-p <crate>` (e.g. `-p webd -p schedulerd`).
 - If you pipe a host-authored `.sh` into the container, **strip CR first**
   (`tr -d '\r' < script.sh | bash`) — Windows-created files are CRLF and bash
@@ -84,12 +91,12 @@ the script's `command -v podman` doesn't find the Windows `podman.exe` inside WS
 ```powershell
 $repo = (Get-Location).Path           # C:\...\TeslaUSB
 $out  = "$repo\release\.build\aarch64-bin"   # holds bin/<crate>
-podman run --rm `
-  --mount "type=bind,source=$repo,target=/src,ro" `
-  --mount "type=bind,source=$out,target=/out" `
-  --mount "type=volume,source=teslausb-cargo-target,target=/cargo-target" `
-  --mount "type=volume,source=teslausb-cargo-home,target=/root/.cargo" `
-  --mount "type=volume,source=teslausb-rustup,target=/root/.rustup" `
+wslc run --rm `
+  -v "${repo}:/src:ro" `
+  -v "${out}:/out" `
+  -v teslausb-cargo-target:/cargo-target `
+  -v teslausb-cargo-home:/root/.cargo `
+  -v teslausb-rustup:/root/.rustup `
   docker.io/library/debian:bookworm bash -lc "tr -d '\r' < /out/build.sh | bash"
 ```
 where `/out/build.sh` mirrors `build-release.sh`'s inner recipe: apt-install
@@ -106,7 +113,7 @@ install into the volumes; subsequent runs skip it.
 
 **Canonical test recipe (host-arch unit tests) — PowerShell, warm volumes:**
 ```powershell
-podman run --rm -v "${PWD}:/work" `
+wslc run --rm -v "${PWD}:/work" `
   -v teslausb-cargo-home:/cargo-home -v teslausb-test-target:/test-target `
   -e CARGO_HOME=/cargo-home -e CARGO_TARGET_DIR=/test-target `
   -w /work/rust docker.io/library/rust:1.85-bookworm `
@@ -115,9 +122,9 @@ podman run --rm -v "${PWD}:/work" `
 (Unix-socket crates don't build on Windows host cargo — use the container.)
 
 For a full signed/manifested release artifact, `release/build-release.sh` is still
-the source of truth for the staging/manifest/verify steps; run it where a Linux
-`bash` *and* a PATH-visible `podman` coexist (its `--cross-podman` step is the same
-recipe above). For a one-off scoped binary deploy, the direct podman call is enough.
+the source of truth for the staging/manifest/verify steps; on this host run its
+`--cross-wslc` step's recipe directly from PowerShell (above). For a one-off
+scoped binary deploy, the direct wslc call is enough.
 
 ## Speed & cost — risk-tiered effort (binding)
 

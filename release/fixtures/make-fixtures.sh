@@ -21,7 +21,7 @@ build_good() {
     # Stand-in service binaries (real releases ship aarch64 ELF; fixtures only
     # exercise hashing/verification, so fixed text bytes are sufficient).
     local svc
-    for svc in gadgetd scannerd indexd webd uploadd retentiond wifid; do
+    for svc in gadgetd scannerd indexd webd uploadd retentiond wifid schedulerd; do
         printf 'fake %s binary for fixture\n' "$svc" > "${good}/bin/${svc}"
     done
 
