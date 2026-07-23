@@ -72,8 +72,9 @@ segment-clips (each with camera angles) plus two folder-level sidecars.
   `archive_item_clips` is **M:N** (`indexd/db/migrations.rs:261-300`). Repeated
   registrations for different segment keys sharing one archive path upsert **one**
   item and append links (`indexd/db/ingest.rs:328-364`). (But each call resets
-  `durable=0`, rewrites the legacy `clip_id`, and never removes stale links — see
-  OPEN-1.)
+  `durable=0`, rewrites the legacy `clip_id`, and never removes stale links — which is
+  why **events** use the dedicated `finalize_event_archive` RPC (§5.2), not this
+  per-call accumulation; `register_archived_clip` stays as-is for RecentClips.)
 - **The event-archive policy core exists + is unit-tested.** `serve.rs`
   `archive_event_folder`(554, **`pub`**) → `decide_event_archive`(`archive.rs:313`)
   → `run_verified_pass`(`archive.rs:184`, copy-then-verify) →
@@ -139,28 +140,74 @@ folder, the segment set (canonical keys, partition, timestamps, camera angle
 `file_ref`s) + the sidecar list + source-volume identity. Add the indexd read
 RPC(s) needed to enumerate event folders and their segments/sidecars.
 
-### 5.2 Verified copy + a realizable registration/finalization contract
+### 5.2 Verified copy + a realizable registration/finalization contract  **[OPEN-1 RESOLVED]**
 `record_verified_pass(folder_key, {id,digest,bytes})` (`serve.rs:100-106`) structurally
 **cannot** build an `ArchiveRegistration` (which needs canonical_key, partition,
 timestamps, duration, angle paths — `register_client.rs:18-35`). So the event arm
-does not rely on that callback to register. Instead (design intent, OPEN-1/§6):
-1. Stage → `run_verified_pass` copies **every** manifest entry (camera segments +
-   sidecars) to the Pi archive dest and dest-hashes them (`archive.rs:195-261` copies
-   without extension filtering — sidecars are archived, confirmed).
-2. Register each **segment** via the existing per-clip `register_archived_clip`
-   (folder_class=Sentry/Saved, `durable=0`), sharing one event **archive path** so
-   `archive_item_clips` accumulates the N segment links onto **one** event
-   `archive_items` row (N:1 mechanism, §3.1).
-3. **Atomically finalize** the event archive_item bound to `(source-volume identity,
-   event folder key, exact manifest digest)` — persisting sidecar metadata
-   (`has_event_json`/`has_geo`/`event.json` facts) and reconciling the link set
-   (removing stale links). The exact finalize verb (extend `register_archived_clip`
-   vs. a new `finalize_event_archive` RPC) is **OPEN-1**.
+does not rely on that callback to register, and it does **not** reuse the published
+per-segment `register_archived_clip` path for events (that path makes partial rows/
+angles observable pre-finalize, re-clobbers aggregates on replay, and resets `durable`
+— unsafe for an atomic event; it stays **unchanged** for RecentClips only). Instead:
 
-Frame safety: a single whole-event payload can exceed `MAX_REQUEST_FRAME`=64 KiB
-(`register_client.rs:13-14`; `indexd/proto.rs:10-11`) for events with hundreds of
-segments/angles → the protocol **must** be incremental (per-segment register +
-bounded finalize), never one giant frame (OPEN-4).
+**A. A new `finalize_event_archive` RPC — one atomic, idempotent, digest-bound
+transaction** registering the whole verified event as **one** `archive_items` row.
+`register_archived_clip` is untouched.
+
+**B. Physical publication (BEFORE the DB tx).** The event arm publishes the verified
+copy into a **fresh, pass-specific immutable generation directory** and verifies its
+**exact** destination file set. Reason: `run_verified_pass` (`archive.rs:195-261`)
+re-checks the *source* set/identities but **never** inspects the destination for stale
+extras, so reusing a prior dest can leave orphan files that inflate the true
+`file_count`/`size_bytes`. A pre-commit crash then leaves only an orphan dir (GC'd
+later); the tx switches `archive_items.path` to the new generation dir, cleanly
+swapping generations.
+
+**C. The finalize frame** (single, bounded — see frame-safety below) carries:
+`pass_id`, `source_event_key`, `source_generation` (opaque composite, incl. boot
+identity — see §5.4), `source_volume_id?` (nullable until propagated — §6 deferred),
+`manifest_digest`, `segment_set_digest`, `expected_segment_count`, `size_bytes`,
+`file_count`, `archived_at`, `generation_dir_path`, sidecar facts
+(`has_event_json`/`has_geo`/`event_severity?`), and the authoritative **video-segment
+clip identity set** (canonical keys). Sidecars (`event.json`/`thumb`) are **not** clips:
+they count toward `size_bytes`/`file_count` (whole-manifest totals) but are **not**
+linked in `archive_item_clips`.
+
+**D. The finalize transaction** (single SQLite tx; readers see only the old or the new
+complete generation, never a partial one):
+1. Resolve the row by **source-event identity** `(source_volume_id, source_event_key)`
+   (partial UNIQUE — §6/v7), not path alone.
+2. Validate the supplied set is self-consistent: `count == expected_segment_count`,
+   recomputed `segment_set_digest` matches, every key has the event-folder prefix,
+   partition/`folder_class` match, no duplicate camera per segment.
+3. Cross-check `size_bytes == VerifiedArchivePass.bytes` and
+   `file_count == manifest.len()` (both whole-manifest totals incl. sidecars).
+4. **Idempotent replay:** if the stored `manifest_digest == incoming` **and**
+   `verified_pass_id` is set → recompute/compare aggregates + link-set, return the
+   existing id, **write nothing** (crucially, do **not** touch `durable` — uploadd may
+   have set it since).
+5. **Stale rejection:** a stored row whose `source_generation`/`manifest_digest`
+   indicates a **newer** observation than the incoming pass → reject (the pass is
+   stale; e.g. the event expanded after verification).
+6. **New generation** (new/changed digest): reject if a delete lease / cloud op is
+   active; set `durable = 0` (a new local generation has no off-device copy — §5.4);
+   write aggregates + sidecar flags + the full verification tuple
+   (`manifest_digest`, `verified_pass_id`, `source_generation`, `source_event_key`,
+   `source_volume_id?`, `segment_set_digest`); **replace links atomically** (delete
+   *this* item's `archive_item_clips`, insert exactly the supplied segment clip set);
+   reconcile archive angles for pruned links; switch `path` to `generation_dir_path`.
+7. Commit; return the item id.
+
+Frame safety: one archive_items row = **one event folder** (one trigger's timestamped
+subfolder), whose child set is provably bounded (~10-min window, TrackMode ≤ ~1 hr,
+≤ 6 cameras ⇒ tens to a few hundred files ≈ 6–36 KiB of keys, well under
+`MAX_REQUEST_FRAME`=64 KiB — `register_client.rs:13-14`, `indexd/proto.rs:10-11`). The
+caller supplies the set in **one** finalize frame — this decouples finalize from the
+live catalog (robust to card-pull) without a staging state machine. **Fail-safe:** if
+a set would exceed the frame budget, finalize **rejects** with a distinct "event too
+large — chunked staging not implemented" error (fail-closed: the archive copy exists
+and is safe; it is simply unregistered until chunked staging ships — OPEN-4). Chunked
+staging, if ever needed, slots behind the same RPC name; not observed in real
+TeslaCam data.
 
 ### 5.3 Wire an event-only arm into the daemon (reviewer's third option)
 - **Keep the production RecentClips driver unchanged** (its staging/probe/promote/
@@ -192,26 +239,51 @@ the persisted verified digest. (Since P0.5 does no car-delete, the danger here i
 registering a *partial/incomplete* event, not deleting one — still must be
 prevented.)
 
+**Two independent axes — do not conflate** (`durability.rs:1-22,64-75`):
+`ArchiveVerification` (Pi-side copy trustworthy; the `verified_pass_id` this contract
+writes) is **separate** from `Durability` (`archive_items.durable` = a durable
+**off-device** copy, flipped by **uploadd** on remote verify). So finalize records
+*verification*, sets `durable = 0` on a new generation, and **never** rewrites
+`durable` on idempotent replay. `source_generation` is an **opaque composite** that
+includes boot identity, because the scanner generation counter resets to 0 every
+process/reboot (`indexd/main.rs:315,351-353,374`) and a naked `u64` would alias a
+pre-reboot pass as current. The verified tuple is persisted on `archive_items` via
+**migration v7** (§6/OPEN-1).
+
 ## 6. OPEN ITEMS (close in-phase — do NOT pre-freeze)
 
-1. **Registration/finalization contract (the core OPEN).** Reconcile the per-segment
-   `register_archived_clip` (resets `durable=0`, rewrites legacy `clip_id`, never
-   prunes stale `archive_item_clips` links) with an event = N segments + sidecars.
-   Choose: extend the existing RPC vs. add `finalize_event_archive`. Must be atomic,
-   digest-bound, idempotent, and persist sidecar metadata (`has_event_json`/`has_geo`
-   — which `ArchiveRegistration` does **not** carry today and the SQL does **not**
-   write, `register_client.rs:18-48`, `indexd/db/ingest.rs:328-356`).
-2. **Idempotency across reboots (RTC-less, boot_id leases).** Event `FolderFact`
-   lacks the volume serial + source fingerprint the Recent path carries
-   (`candidates.rs:41-44`; `archive_driver.rs:129-140`). Bind registration to
-   source-volume identity + manifest digest; replace the link set transactionally;
-   stage/promote an exact directory generation (or verify the dest file set — a
-   stale extra dest file is not caught by `run_verified_pass` today).
+1. **Registration/finalization contract (the core OPEN).**  **[RESOLVED — §5.2.]**
+   Decision: a **new `finalize_event_archive` RPC** (NOT extending
+   `register_archived_clip`, which stays unchanged for RecentClips); one atomic,
+   idempotent, digest-bound tx; a **single bounded** frame carrying the caller-supplied
+   verified segment set (no staging state machine — the per-event child set is bounded;
+   oversize fails closed → chunked staging deferred to OPEN-4). Persist via **migration
+   v7** (additive/forward-only/idempotent, like v6): nullable `archive_items` columns
+   `manifest_digest`, `verified_pass_id`, `source_generation`, `source_event_key`,
+   `source_volume_id`, `segment_set_digest`, plus a **partial UNIQUE** over
+   `(source_volume_id, source_event_key) WHERE source_event_key IS NOT NULL` (legacy/
+   Recent rows exempt). `has_event_json`/`has_geo` already exist — finalize is their
+   **sole writer**. `durable` is **off-device** (uploadd-owned): finalize sets `0` on a
+   new generation and never rewrites it on replay (§5.4).
+2. **Idempotency across reboots (RTC-less, boot_id leases).**  **[MOSTLY RESOLVED —
+   §5.2/§5.4.]** Registration binds to `(source_volume_id, source_event_key)` +
+   `manifest_digest`; the link set is replaced transactionally; the event arm
+   stages/promotes an **exact immutable generation dir** and verifies its dest set
+   (closing the `run_verified_pass` stale-dest-extra hole). `source_generation` is an
+   opaque composite incl. boot identity (naked counter aliases across reboot). **Still
+   open (wiring dep):** `volume_serial` exists at scan time (`boot.rs:50`) but is **not**
+   propagated into `ScanBatch` (`record.rs:336-383`), so `source_volume_id` is NULL
+   until the scan wire protocol carries it; until then event identity = `source_event_key`
+   alone (single-recording-volume appliance ⇒ low collision risk).
 3. **Sidecar persistence.** Persist archived `event.json`/`thumb.png` identity +
    parsed metadata **at finalization** (do NOT depend on ephemeral `clip_events`,
    which is pruned when the car folder disappears).
-4. **Frame-bounded protocol** (§5.2): incremental per-segment + finalize, with
-   crash-recovery + frame-boundary tests.
+4. **Frame-bounded protocol** (§5.2): **[RESOLVED to a single bounded finalize frame.]**
+   The per-event child set is bounded (one trigger's subfolder), so the caller supplies
+   it in one 64 KiB-safe frame; oversize **fails closed** with a distinct error. Chunked
+   staging (begin/stage/finalize) is deferred here — add behind the same RPC name only
+   if real data ever exceeds the frame (not observed). Crash-recovery + frame-boundary
+   tests still required (§7).
 5. **TeslaTrackMode `event.json`.** `scannerd/produce.rs:282-296` collects sidecars
    only for Saved/Sentry. Decide if TrackMode parity is in P0.5; if yes, open the gate.
 6. **Indexd event-enumeration read RPC(s)** (§5.1) — exact shape.
@@ -238,7 +310,23 @@ prevented.)
   under 64 KiB; finalization yields **one** `archive_items` row (`durable=0`,
   correct `folder_class`, `has_event_json`/`has_geo` set), linked to the N segment
   `clips`; re-run is idempotent (no dup item, no stale links) bound to volume
-  identity + digest.
+  identity + digest. Plus:
+  - **Idempotent replay preserves `durable`:** finalize, flip `durable=1` (simulated
+    uploadd), replay the same pass → row unchanged, **`durable` stays 1** (finalize
+    must not reset it).
+  - **Stale rejection:** an event that gains a segment (new `manifest_digest`) between
+    verification and finalize → the stale pass is **rejected**, not registered.
+  - **New generation prunes:** a larger prior generation → links **and** stale archive
+    angles for dropped segments are removed; `path` switches to the new generation dir.
+  - **Concurrent reader:** a reader during finalize observes only the old-complete or
+    new-complete row — never partial aggregates/links (single-tx atomicity).
+  - **Oversize fail-closed:** a set exceeding the frame budget → distinct
+    "event too large" error, **no** partial row written.
+  - **Generation alias after reboot:** a pre-reboot `source_generation` (counter reset
+    to 0) does **not** alias as current — the opaque composite (boot identity) rejects it.
+- **Migration v7:** `v6→v7` upgrade and fresh-schema both yield the nullable columns +
+  partial UNIQUE; legacy/Recent rows (NULL `source_event_key`) are exempt from the
+  event-identity constraint; re-running the migration is idempotent.
 - **Regression:** RecentClips archiving unchanged (byte-for-byte) — the event arm is
   additive; the Recent driver + single governor drain are untouched.
 - **Hardware (hardware-test skill):** a real Sentry event on `cybertruckusb.local`
