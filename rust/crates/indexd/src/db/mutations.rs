@@ -765,9 +765,13 @@ pub fn set_pref(conn: &Connection, key: &str, value: &str) -> Result<(), DbError
             "prefs.key must match [a-z0-9_]+".to_owned(),
         )));
     }
-    if value.is_empty() || value.len() > 8192 {
+    // Empty values are permitted: an empty `display_timezone` is the "Auto /
+    // use device-local time" sentinel that webd validates and forwards (see
+    // webd `validate_setting` + the `put_settings_display_timezone_empty`
+    // test). Rejecting it here broke the settings form's "Auto" option.
+    if value.len() > 8192 {
         return Err(DbError::Sqlite(rusqlite::Error::InvalidParameterName(
-            "prefs.value must be 1..=8192 bytes".to_owned(),
+            "prefs.value must be at most 8192 bytes".to_owned(),
         )));
     }
 
@@ -1356,6 +1360,19 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn set_pref_allows_empty_value_and_round_trips() {
+        // An empty `display_timezone` is the "Auto" sentinel webd forwards; the
+        // store must accept it and round-trip it (it was previously rejected,
+        // which broke the settings form's "Auto (device local)" option).
+        let conn = open_in_memory().unwrap();
+        set_pref(&conn, "display_timezone", "").unwrap();
+        assert_eq!(
+            get_pref(&conn, "display_timezone").unwrap().as_deref(),
+            Some("")
+        );
     }
 
     #[test]
