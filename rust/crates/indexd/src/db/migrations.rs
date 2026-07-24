@@ -29,7 +29,7 @@ pub const SCHEMA_VERSION_NOTE: &str = "v1 (PROVISIONAL — pre-OP-3 freeze)";
 /// The highest schema version this binary knows how to produce. A DB
 /// reporting a higher version was written by a newer `indexd` and must
 /// not be opened read-write.
-pub const LATEST_VERSION: i64 = 6;
+pub const LATEST_VERSION: i64 = 7;
 
 /// The ordered migration ladder. Index order MUST match ascending
 /// `version`; [`MIGRATIONS`] is validated by a test.
@@ -63,6 +63,11 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 6,
         note: "v6 — cloud sync persistence tables + indexes",
         sql: V6_SQL,
+    },
+    Migration {
+        version: 7,
+        note: "v7 — sealed upload set durability schema + guards",
+        sql: V7_SQL,
     },
 ];
 
@@ -268,6 +273,200 @@ CREATE INDEX idx_cloud_synced_files_archive_item_id
     ON cloud_synced_files(archive_item_id);
 ";
 
+/// v7 DDL: sealed-upload-set durability schema and DB-level guardrails.
+const V7_SQL: &str = "
+ALTER TABLE archive_items
+    ADD COLUMN manifest_digest TEXT CHECK(
+        manifest_digest IS NULL
+        OR (length(manifest_digest)=32
+            AND manifest_digest = lower(manifest_digest)
+            AND manifest_digest NOT GLOB '*[^0-9a-f]*')
+    );
+ALTER TABLE archive_items
+    ADD COLUMN verified_pass_id TEXT CHECK(
+        verified_pass_id IS NULL
+        OR (length(verified_pass_id)=32
+            AND verified_pass_id = lower(verified_pass_id)
+            AND verified_pass_id NOT GLOB '*[^0-9a-f]*')
+    );
+ALTER TABLE archive_items
+    ADD COLUMN source_generation TEXT CHECK(
+        source_generation IS NULL OR length(source_generation) BETWEEN 1 AND 256
+    );
+ALTER TABLE archive_items
+    ADD COLUMN source_event_key TEXT CHECK(
+        source_event_key IS NULL OR length(source_event_key) BETWEEN 1 AND 512
+    );
+ALTER TABLE archive_items
+    ADD COLUMN source_volume_id TEXT CHECK(
+        source_volume_id IS NULL OR length(source_volume_id) BETWEEN 1 AND 128
+    );
+ALTER TABLE archive_items
+    ADD COLUMN segment_set_digest TEXT CHECK(
+        segment_set_digest IS NULL
+        OR (length(segment_set_digest)=64
+            AND segment_set_digest = lower(segment_set_digest)
+            AND segment_set_digest NOT GLOB '*[^0-9a-f]*')
+    );
+ALTER TABLE archive_items
+    ADD COLUMN metadata_digest TEXT CHECK(
+        metadata_digest IS NULL
+        OR (length(metadata_digest)=64
+            AND metadata_digest = lower(metadata_digest)
+            AND metadata_digest NOT GLOB '*[^0-9a-f]*')
+    );
+
+CREATE UNIQUE INDEX uq_archive_items_source_volume_event
+    ON archive_items(source_volume_id, source_event_key)
+    WHERE source_event_key IS NOT NULL;
+
+CREATE TRIGGER trg_archive_items_source_identity_insert
+BEFORE INSERT ON archive_items
+WHEN NEW.source_event_key IS NOT NULL
+  AND EXISTS (
+      SELECT 1
+        FROM archive_items existing
+       WHERE existing.source_event_key = NEW.source_event_key
+         AND (
+             NEW.source_volume_id IS NULL
+             OR existing.source_volume_id IS NULL
+             OR existing.source_volume_id = NEW.source_volume_id
+         )
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'conflicting source event identity');
+END;
+
+CREATE TRIGGER trg_archive_items_source_identity_update
+BEFORE UPDATE OF source_event_key, source_volume_id ON archive_items
+WHEN NEW.source_event_key IS NOT NULL
+  AND EXISTS (
+      SELECT 1
+        FROM archive_items existing
+       WHERE existing.id <> OLD.id
+         AND existing.source_event_key = NEW.source_event_key
+         AND (
+             NEW.source_volume_id IS NULL
+             OR existing.source_volume_id IS NULL
+             OR existing.source_volume_id = NEW.source_volume_id
+         )
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'conflicting source event identity');
+END;
+
+CREATE TABLE cloud_parent_upload_sets (
+    upload_set_id           TEXT PRIMARY KEY
+                                 CHECK(length(upload_set_id)=32
+                                       AND upload_set_id = lower(upload_set_id)
+                                       AND upload_set_id NOT GLOB '*[^0-9a-f]*'),
+    archive_item_id         INTEGER NOT NULL REFERENCES archive_items(id) ON DELETE CASCADE,
+    destination_id          TEXT    NOT NULL CHECK(length(destination_id) BETWEEN 1 AND 128),
+    source_manifest_digest  TEXT    NOT NULL
+                                 CHECK(length(source_manifest_digest)=32
+                                       AND source_manifest_digest = lower(source_manifest_digest)
+                                       AND source_manifest_digest NOT GLOB '*[^0-9a-f]*'),
+    request_digest          TEXT    NOT NULL
+                                 CHECK(length(request_digest)=64
+                                       AND request_digest = lower(request_digest)
+                                       AND request_digest NOT GLOB '*[^0-9a-f]*'),
+    expected_child_count    INTEGER NOT NULL CHECK(expected_child_count > 0),
+    created_at              INTEGER NOT NULL CHECK(created_at >= 0),
+    finalized_at            INTEGER CHECK(finalized_at IS NULL OR finalized_at >= 0),
+    superseded_at           INTEGER CHECK(superseded_at IS NULL OR superseded_at >= 0),
+    UNIQUE(upload_set_id, destination_id)
+);
+CREATE UNIQUE INDEX uq_cloud_parent_upload_sets_current_parent
+    ON cloud_parent_upload_sets(archive_item_id)
+    WHERE superseded_at IS NULL;
+CREATE INDEX idx_cloud_parent_upload_sets_parent_request
+    ON cloud_parent_upload_sets(archive_item_id, request_digest);
+
+CREATE TABLE cloud_parent_upload_set_children (
+    upload_set_id      TEXT    NOT NULL,
+    child_key          TEXT    NOT NULL CHECK(length(child_key) BETWEEN 1 AND 512),
+    destination_id     TEXT    NOT NULL CHECK(length(destination_id) BETWEEN 1 AND 128),
+    remote_key         TEXT    NOT NULL CHECK(length(remote_key) BETWEEN 1 AND 1024),
+    category           TEXT    NOT NULL CHECK(category IN ('event_sentry','trip','bulk')),
+    seq                INTEGER NOT NULL CHECK(seq >= 0),
+    total_bytes        INTEGER NOT NULL CHECK(total_bytes >= 0),
+    manifest_mtime_ms  INTEGER NOT NULL,
+    content_sha256     TEXT    NOT NULL
+                             CHECK(length(content_sha256)=64
+                                   AND content_sha256 = lower(content_sha256)
+                                   AND content_sha256 NOT GLOB '*[^0-9a-f]*'),
+    expected_hash      TEXT    NOT NULL CHECK(length(expected_hash) BETWEEN 1 AND 256),
+    verify_alg         TEXT    NOT NULL
+                             CHECK(verify_alg IN ('sha256','md5','crc32c','sha1','quickxor','dropbox')),
+    PRIMARY KEY(upload_set_id, child_key),
+    UNIQUE(upload_set_id, destination_id, remote_key),
+    FOREIGN KEY(upload_set_id, destination_id)
+        REFERENCES cloud_parent_upload_sets(upload_set_id, destination_id) ON DELETE CASCADE
+);
+
+ALTER TABLE cloud_upload_queue
+    ADD COLUMN upload_set_id TEXT
+        REFERENCES cloud_parent_upload_sets(upload_set_id) ON DELETE SET NULL;
+CREATE UNIQUE INDEX uq_cloud_upload_queue_upload_set_child
+    ON cloud_upload_queue(upload_set_id, child_key)
+    WHERE upload_set_id IS NOT NULL;
+CREATE INDEX idx_cloud_upload_queue_upload_set_id
+    ON cloud_upload_queue(upload_set_id);
+
+ALTER TABLE cloud_upload_attempts
+    ADD COLUMN upload_set_id TEXT
+        REFERENCES cloud_parent_upload_sets(upload_set_id) ON DELETE SET NULL;
+
+CREATE TRIGGER trg_archive_items_durable_guard
+BEFORE UPDATE OF durable ON archive_items
+WHEN OLD.durable = 0
+  AND NEW.durable = 1
+  AND NOT EXISTS (
+      SELECT 1
+        FROM cloud_parent_upload_sets s
+       WHERE s.archive_item_id = NEW.id
+         AND s.superseded_at IS NULL
+         AND s.finalized_at IS NOT NULL
+         AND NEW.delete_state = 'LIVE'
+         AND NEW.manifest_digest IS NOT NULL
+         AND NEW.manifest_digest = s.source_manifest_digest
+         AND s.expected_child_count > 0
+         AND s.expected_child_count = (
+             SELECT COUNT(*)
+               FROM cloud_parent_upload_set_children c
+              WHERE c.upload_set_id = s.upload_set_id
+         )
+         AND s.expected_child_count = (
+             SELECT COUNT(*)
+               FROM cloud_upload_queue q
+              WHERE q.upload_set_id = s.upload_set_id
+         )
+         AND NOT EXISTS (
+             SELECT 1
+               FROM cloud_parent_upload_set_children m
+               LEFT JOIN cloud_upload_queue q
+                 ON q.upload_set_id = m.upload_set_id
+                AND q.destination_id = m.destination_id
+                AND q.remote_key = m.remote_key
+              WHERE m.upload_set_id = s.upload_set_id
+                AND (
+                    q.upload_set_id IS NULL
+                    OR q.state <> 'done'
+                    OR q.content_sha256 <> m.content_sha256
+                    OR q.verify_alg <> m.verify_alg
+                    OR COALESCE(q.expected_hash, '') <> m.expected_hash
+                    OR q.child_key <> m.child_key
+                    OR q.category <> m.category
+                    OR q.seq <> m.seq
+                    OR q.total_bytes <> m.total_bytes
+                )
+         )
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'durable requires finalized complete upload set');
+END;
+";
+
 /// v1 DDL: contract D1's proposed schema, plus two internal additions
 /// flagged in the build notes:
 ///   * `trips.polyline` BLOB — the RDP-simplified cached polyline (OQ-2
@@ -470,7 +669,8 @@ mod tests {
 
     use rusqlite::{Connection, params};
 
-    use super::{LATEST_VERSION, MIGRATIONS, V1_SQL, V2_SQL, V3_SQL, V4_SQL, V5_SQL, V6_SQL};
+    use super::{LATEST_VERSION, MIGRATIONS, V1_SQL, V2_SQL, V3_SQL, V4_SQL, V5_SQL, V6_SQL, V7_SQL};
+    use crate::db::{DbError, apply_migrations};
 
     #[test]
     fn ladder_is_monotonic_and_matches_latest() {
@@ -700,5 +900,212 @@ mod tests {
             [],
         );
         assert!(bad_enum.is_err());
+    }
+
+    #[test]
+    fn v7_migrates_from_v6_and_reapply_is_noop() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        conn.execute_batch(V1_SQL).unwrap();
+        conn.execute_batch(V2_SQL).unwrap();
+        conn.execute_batch(V3_SQL).unwrap();
+        conn.execute_batch(V4_SQL).unwrap();
+        conn.execute_batch(V5_SQL).unwrap();
+        conn.execute_batch(V6_SQL).unwrap();
+        for version in 1_i64..=6 {
+            conn.execute(
+                "INSERT INTO schema_version(version, applied_at, note) VALUES(?1, 0, 'seed')",
+                params![version],
+            )
+            .unwrap();
+        }
+
+        assert_eq!(apply_migrations(&mut conn).unwrap(), LATEST_VERSION);
+        assert_eq!(apply_migrations(&mut conn).unwrap(), LATEST_VERSION);
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, LATEST_VERSION);
+    }
+
+    #[test]
+    fn v7_forward_only_guard_rejects_future_schema() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        conn.execute_batch(V1_SQL).unwrap();
+        conn.execute(
+            "INSERT INTO schema_version(version, applied_at, note) VALUES (?1, 0, 'future')",
+            params![LATEST_VERSION + 1],
+        )
+        .unwrap();
+        let result = apply_migrations(&mut conn);
+        assert!(matches!(result, Err(DbError::SchemaTooNew { .. })));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn v7_enforces_new_checks_and_guards() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(V1_SQL).unwrap();
+        conn.execute_batch(V2_SQL).unwrap();
+        conn.execute_batch(V3_SQL).unwrap();
+        conn.execute_batch(V4_SQL).unwrap();
+        conn.execute_batch(V5_SQL).unwrap();
+        conn.execute_batch(V6_SQL).unwrap();
+        conn.execute_batch(V7_SQL).unwrap();
+
+        conn.execute(
+            "INSERT INTO archive_items
+                (id, folder_class, path, size_bytes, file_count, archived_at, created_at, updated_at)
+             VALUES
+                (1, 'RecentClips', 'archive/v7-1', 1, 1, 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO archive_items
+                (id, folder_class, path, size_bytes, file_count, archived_at, created_at, updated_at)
+             VALUES
+                (2, 'RecentClips', 'archive/v7-2', 1, 1, 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO archive_items
+                (id, folder_class, path, size_bytes, file_count, archived_at, created_at, updated_at)
+             VALUES
+                (3, 'RecentClips', 'archive/v7-3', 1, 1, 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+
+        let bad_manifest_len = conn.execute(
+            "UPDATE archive_items SET manifest_digest='abc', verified_pass_id='0123456789abcdef0123456789abcdef'
+              WHERE id=1",
+            [],
+        );
+        assert!(bad_manifest_len.is_err());
+
+        let bad_manifest_case = conn.execute(
+            "UPDATE archive_items
+                SET manifest_digest='ABCDEFabcdefabcdefabcdefabcdefab',
+                    verified_pass_id='0123456789abcdef0123456789abcdef'
+              WHERE id=1",
+            [],
+        );
+        assert!(bad_manifest_case.is_err());
+
+        let bad_manifest_hex = conn.execute(
+            "UPDATE archive_items
+                SET manifest_digest='gggggggggggggggggggggggggggggggg',
+                    verified_pass_id='0123456789abcdef0123456789abcdef'
+              WHERE id=1",
+            [],
+        );
+        assert!(bad_manifest_hex.is_err());
+
+        let bad_verified_len = conn.execute(
+            "UPDATE archive_items
+                SET manifest_digest='0123456789abcdef0123456789abcdef',
+                    verified_pass_id='abc'
+              WHERE id=1",
+            [],
+        );
+        assert!(bad_verified_len.is_err());
+
+        let bad_verified_case = conn.execute(
+            "UPDATE archive_items
+                SET manifest_digest='0123456789abcdef0123456789abcdef',
+                    verified_pass_id='ABCDEFabcdefabcdefabcdefabcdefab'
+              WHERE id=1",
+            [],
+        );
+        assert!(bad_verified_case.is_err());
+
+        let bad_verified_hex = conn.execute(
+            "UPDATE archive_items
+                SET manifest_digest='0123456789abcdef0123456789abcdef',
+                    verified_pass_id='gggggggggggggggggggggggggggggggg'
+              WHERE id=1",
+            [],
+        );
+        assert!(bad_verified_hex.is_err());
+
+        let bad_segment_len = conn.execute(
+            "UPDATE archive_items
+                SET manifest_digest='0123456789abcdef0123456789abcdef',
+                    verified_pass_id='0123456789abcdef0123456789abcdef',
+                    segment_set_digest='abc'
+              WHERE id=1",
+            [],
+        );
+        assert!(bad_segment_len.is_err());
+
+        let bad_segment_case = conn.execute(
+            "UPDATE archive_items
+                SET manifest_digest='0123456789abcdef0123456789abcdef',
+                    verified_pass_id='0123456789abcdef0123456789abcdef',
+                    segment_set_digest='ABCDEFabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd'
+              WHERE id=1",
+            [],
+        );
+        assert!(bad_segment_case.is_err());
+
+        let bad_segment_hex = conn.execute(
+            "UPDATE archive_items
+                SET manifest_digest='0123456789abcdef0123456789abcdef',
+                    verified_pass_id='0123456789abcdef0123456789abcdef',
+                    segment_set_digest='gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg'
+              WHERE id=1",
+            [],
+        );
+        assert!(bad_segment_hex.is_err());
+
+        conn.execute(
+            "UPDATE archive_items
+                SET manifest_digest='0123456789abcdef0123456789abcdef',
+                    verified_pass_id='fedcba9876543210fedcba9876543210',
+                    segment_set_digest='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+              WHERE id=1",
+            [],
+        )
+        .unwrap();
+
+        conn.execute(
+            "UPDATE archive_items
+                SET source_event_key='event-key-1',
+                    source_volume_id=NULL
+              WHERE id=1",
+            [],
+        )
+        .unwrap();
+        let null_volume_conflict = conn.execute(
+            "UPDATE archive_items
+                SET source_event_key='event-key-1',
+                    source_volume_id='vol-2'
+              WHERE id=2",
+            [],
+        );
+        assert!(null_volume_conflict.is_err());
+
+        conn.execute(
+            "UPDATE archive_items
+                SET source_event_key='event-key-2',
+                    source_volume_id='vol-1'
+              WHERE id=2",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE archive_items
+                SET source_event_key='event-key-2',
+                    source_volume_id='vol-2'
+              WHERE id=3",
+            [],
+        )
+        .unwrap();
+
+        let durable_without_complete = conn.execute("UPDATE archive_items SET durable=1 WHERE id=1", []);
+        assert!(durable_without_complete.is_err());
     }
 }

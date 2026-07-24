@@ -49,13 +49,13 @@
 //! lane; this module delivers and proves the orchestration core.
 
 use std::collections::HashSet;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::UploaddConfig;
 use crate::engine::{StepOutcome, UploadEngine};
 use crate::error::EngineError;
 use crate::priority::PriorityPolicy;
-use crate::queue::{QueueItem, QueueStore, UploadQueue};
-use crate::source::ArchiveItemId;
+use crate::queue::{QueueItem, QueueKey, QueueStore, UploadQueue};
 use crate::throttle::{GateReason, PauseAction};
 use crate::time::Waiter;
 
@@ -174,7 +174,7 @@ pub struct Scheduler<P: UploadProcessor> {
     policy: PriorityPolicy,
     max_attempts: u32,
     /// Items denied a lease this drain pass (skip to avoid head-of-line block).
-    lease_denied: HashSet<ArchiveItemId>,
+    lease_denied: HashSet<QueueKey>,
 }
 
 impl<P: UploadProcessor> Scheduler<P> {
@@ -202,7 +202,7 @@ impl<P: UploadProcessor> Scheduler<P> {
         &self.queue
     }
 
-    /// Idempotently offer one item to the queue (a no-op if its id is already
+    /// Idempotently offer one item to the queue (a no-op if its key is already
     /// present). Returns `true` if it was added.
     pub fn enqueue(&mut self, item: QueueItem) -> bool {
         self.queue.enqueue(item)
@@ -229,22 +229,25 @@ impl<P: UploadProcessor> Scheduler<P> {
         Ok(self.queue.items().len())
     }
 
-    /// The id of the highest-priority ready item not currently skipped, or `None`.
-    fn select(&self) -> Option<ArchiveItemId> {
+    /// The key of the highest-priority ready item not currently skipped, or
+    /// `None`.
+    fn select(&self) -> Option<QueueKey> {
+        let now_unix_s = now_unix_s();
         self.queue
             .items()
             .iter()
             .filter(|item| {
-                item.is_ready(self.max_attempts) && !self.lease_denied.contains(&item.id)
+                item.is_ready(self.max_attempts, now_unix_s)
+                    && !self.lease_denied.contains(&item.key)
             })
             .min_by_key(|item| item.priority_key(&self.policy))
-            .map(|item| item.id)
+            .map(|item| item.key.clone())
     }
 
     /// Select and process exactly one item, returning what happened. Pure (no
     /// waiting) — the caller decides how to yield based on the result.
     pub fn step(&mut self) -> SchedulerStep {
-        let Some(id) = self.select() else {
+        let Some(key) = self.select() else {
             // Nothing non-skipped is ready: clear the transient skip set so the
             // next pass (after a hydrate) reconsiders everything.
             self.lease_denied.clear();
@@ -253,7 +256,7 @@ impl<P: UploadProcessor> Scheduler<P> {
         // `self.queue` (mutable) and `self.processor` (shared) are disjoint
         // fields, so this split borrow is sound.
         let outcome = {
-            let Some(item) = self.queue.get_mut(id) else {
+            let Some(item) = self.queue.get_mut(&key) else {
                 return SchedulerStep::Idle;
             };
             match self.processor.process(item) {
@@ -261,12 +264,12 @@ impl<P: UploadProcessor> Scheduler<P> {
                 Err(err) => return SchedulerStep::Infra(err.to_string()),
             }
         };
-        self.apply_outcome(outcome)
+        self.apply_outcome(outcome, Some(key))
     }
 
     /// Fold the per-item outcome into a [`SchedulerStep`], maintaining the
     /// lease-denied skip set and lifting a pause out of the `Processed` case.
-    fn apply_outcome(&mut self, outcome: StepOutcome) -> SchedulerStep {
+    fn apply_outcome(&mut self, outcome: StepOutcome, selected_key: Option<QueueKey>) -> SchedulerStep {
         match outcome {
             StepOutcome::Paused { reason, action } => {
                 // A pause is global; the skip set is stale once uploads resume.
@@ -274,7 +277,9 @@ impl<P: UploadProcessor> Scheduler<P> {
                 SchedulerStep::Paused { reason, action }
             }
             StepOutcome::SkippedLeaseDenied { item, reason } => {
-                self.lease_denied.insert(item);
+                if let Some(key) = selected_key {
+                    self.lease_denied.insert(key);
+                }
                 SchedulerStep::Processed(StepOutcome::SkippedLeaseDenied { item, reason })
             }
             other => SchedulerStep::Processed(other),
@@ -350,6 +355,13 @@ impl<P: UploadProcessor> Scheduler<P> {
     }
 }
 
+fn now_unix_s() -> i64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
+        Err(_) => 0,
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -365,10 +377,11 @@ mod tests {
     use crate::config::UploaddConfig;
     use crate::engine::StepOutcome;
     use crate::priority::UploadCategory;
-    use crate::queue::{QueueItem, QueueStore, UploadState};
-    use crate::source::{ArchiveItemId, ContentHash};
+    use crate::queue::{QueueItem, QueueKey, QueueStore, UploadState};
+    use crate::source::ArchiveItemId;
     use crate::throttle::{GateReason, PauseAction, PauseReason};
     use crate::time::Waiter;
+    use crate::transfer::{VerifyAlg, VerifySpec};
 
     /// A scripted behavior for one `process` call on a given item.
     #[derive(Clone)]
@@ -423,31 +436,31 @@ mod tests {
 
     impl UploadProcessor for FakeProcessor {
         fn process(&self, item: &mut QueueItem) -> Result<StepOutcome, crate::error::EngineError> {
-            self.calls.borrow_mut().push(item.id.0);
-            match self.next_act(item.id.0) {
+            self.calls.borrow_mut().push(item.archive_item_id.0);
+            match self.next_act(item.archive_item_id.0) {
                 Act::Upload => {
                     item.complete();
                     Ok(StepOutcome::Uploaded {
-                        item: item.id,
+                        item: item.archive_item_id,
                         bytes: item.total_bytes,
                     })
                 }
                 Act::Fail(reason) => {
                     item.fail(reason.clone(), false);
-                    if item.is_ready(self.max_attempts) {
+                    if item.is_retryable(self.max_attempts) {
                         Ok(StepOutcome::Retry {
-                            item: item.id,
+                            item: item.archive_item_id,
                             reason,
                         })
                     } else {
                         Ok(StepOutcome::Exhausted {
-                            item: item.id,
+                            item: item.archive_item_id,
                             reason,
                         })
                     }
                 }
                 Act::LeaseDenied(reason) => Ok(StepOutcome::SkippedLeaseDenied {
-                    item: item.id,
+                    item: item.archive_item_id,
                     reason,
                 }),
                 Act::Paused => Ok(StepOutcome::Paused {
@@ -488,14 +501,22 @@ mod tests {
 
     fn item(id: i64, cat: UploadCategory, seq: u64) -> QueueItem {
         QueueItem::new(
+            key(id),
             ArchiveItemId(id),
+            format!("clip/{id}.mp4"),
             format!("clips/{id}.mp4"),
-            format!("remote/{id}.mp4"),
             cat,
             seq,
             1_000,
-            ContentHash::new([0u8; 32]),
+            VerifySpec::Native {
+                alg: VerifyAlg::Sha256,
+                expected: format!("{id:064x}"),
+            },
         )
+    }
+
+    fn key(id: i64) -> QueueKey {
+        QueueKey::new("dest-a", format!("remote/{id}.mp4"))
     }
 
     fn timings() -> SchedulerTimings {
@@ -535,7 +556,7 @@ mod tests {
         // we assert through queue state instead: everything is Done.)
         for id in [1, 2, 3, 4] {
             assert_eq!(
-                sched.queue().get(ArchiveItemId(id)).unwrap().state,
+                sched.queue().get(&key(id)).unwrap().state,
                 UploadState::Done
             );
         }
@@ -571,12 +592,12 @@ mod tests {
         assert_eq!(sched.step(), SchedulerStep::Idle);
 
         assert_eq!(
-            sched.queue().get(ArchiveItemId(2)).unwrap().state,
+            sched.queue().get(&key(2)).unwrap().state,
             UploadState::Done
         );
         // The denied item's state was left untouched (retentiond owns it).
         assert_eq!(
-            sched.queue().get(ArchiveItemId(3)).unwrap().state,
+            sched.queue().get(&key(3)).unwrap().state,
             UploadState::Queued
         );
     }
@@ -674,7 +695,7 @@ mod tests {
         // Terminal Failed is never reselected.
         assert_eq!(sched.step(), SchedulerStep::Idle);
         assert_eq!(
-            sched.queue().get(ArchiveItemId(1)).unwrap().state,
+            sched.queue().get(&key(1)).unwrap().state,
             UploadState::Failed
         );
     }
@@ -700,9 +721,9 @@ mod tests {
             ],
         };
         assert_eq!(sched.hydrate(&store2).unwrap(), 2);
-        assert!(sched.queue().get(ArchiveItemId(1)).is_none(), "1 reaped");
-        assert!(sched.queue().get(ArchiveItemId(2)).is_some(), "2 kept");
-        assert!(sched.queue().get(ArchiveItemId(3)).is_some(), "3 added");
+        assert!(sched.queue().get(&key(1)).is_none(), "1 reaped");
+        assert!(sched.queue().get(&key(2)).is_some(), "2 kept");
+        assert!(sched.queue().get(&key(3)).is_some(), "3 added");
     }
 
     #[test]

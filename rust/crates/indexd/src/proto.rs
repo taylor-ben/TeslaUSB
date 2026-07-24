@@ -83,6 +83,13 @@ pub enum Request {
         /// Page size (server capped).
         limit: u32,
     },
+    /// Paginated cloud catalog discover page.
+    CloudDiscover {
+        /// Optional opaque keyset cursor.
+        after_cursor: Option<String>,
+        /// Page size (server capped).
+        limit: u32,
+    },
     /// Paginated durable upload queue load.
     CloudQueueLoad {
         /// Optional opaque keyset cursor.
@@ -167,6 +174,12 @@ pub enum Request {
         /// Page size (server capped).
         limit: u32,
     },
+    /// Finalize one immutable verified event archive generation.
+    FinalizeEventArchive(FinalizeEventArchiveRequest),
+    /// Prepare and seal one parent upload set.
+    CloudPrepareParentUpload(CloudPrepareParentUploadRequest),
+    /// Finalize one sealed parent upload set.
+    CloudFinalizeParentUpload(CloudFinalizeParentUploadRequest),
 }
 
 /// Archive registration payload.
@@ -322,6 +335,21 @@ pub struct CloudCandidateWire {
     pub seq: i64,
 }
 
+/// Discover row over the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudDiscoverWire {
+    /// Parent archive item id.
+    pub archive_item_id: i64,
+    /// Source folder class.
+    pub folder_class: String,
+    /// Source path.
+    pub path: String,
+    /// Parent manifest digest, when available.
+    pub manifest_digest: Option<String>,
+    /// Upload category.
+    pub category: String,
+}
+
 /// Queue row over the wire.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CloudQueueRowWire {
@@ -341,6 +369,10 @@ pub struct CloudQueueRowWire {
     pub total_bytes: i64,
     /// Uploaded bytes.
     pub bytes_uploaded: i64,
+    /// Expected backend verification value.
+    pub expected_hash: Option<String>,
+    /// Expected backend verification algorithm.
+    pub verify_alg: String,
     /// Local content hash.
     pub content_sha256: String,
     /// Queue state.
@@ -404,6 +436,164 @@ pub struct CloudConfigWire {
     pub auto_sync: bool,
 }
 
+/// Finalize-event authoritative segment record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FinalizeEventArchiveSegmentWire {
+    /// Segment key relative to the generation root.
+    pub segment_key: String,
+    /// Segment bytes.
+    pub size_bytes: i64,
+    /// Segment modified time in milliseconds.
+    pub mtime_ms: i64,
+    /// Segment content sha256.
+    pub content_sha256: String,
+}
+
+/// Finalize-event authoritative clip record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FinalizeEventArchiveClipWire {
+    /// Clip canonical key.
+    pub canonical_key: String,
+    /// Clip start epoch seconds.
+    pub started_at: i64,
+    /// Clip end epoch seconds.
+    pub ended_at: i64,
+    /// Source folder class.
+    pub folder_class: String,
+    /// Source partition label.
+    pub partition: String,
+}
+
+/// Finalize-event authoritative angle record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FinalizeEventArchiveAngleWire {
+    /// Clip canonical key.
+    pub canonical_key: String,
+    /// Camera name.
+    pub camera: String,
+    /// Archive-root-relative file reference.
+    pub file_ref: String,
+    /// Relative offset in milliseconds.
+    pub offset_ms: i64,
+    /// Optional duration in seconds.
+    pub duration_s: Option<i64>,
+    /// File bytes.
+    pub size_bytes: i64,
+}
+
+/// `finalize_event_archive` request payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FinalizeEventArchiveRequest {
+    /// Verification pass id (32-hex).
+    pub pass_id: String,
+    /// Source event key.
+    pub source_event_key: String,
+    /// Source volume id when known.
+    pub source_volume_id: Option<String>,
+    /// Opaque source generation id.
+    pub source_generation: String,
+    /// Compare-and-swap prior digest.
+    pub expected_prior_manifest_digest: Option<String>,
+    /// Event manifest digest (FNV-1a-128, 32-hex).
+    pub manifest_digest: String,
+    /// Event segment-set digest (sha256, 64-hex).
+    pub segment_set_digest: String,
+    /// Expected segment count.
+    pub expected_segment_count: i64,
+    /// Archive bytes.
+    pub size_bytes: i64,
+    /// Archive file count.
+    pub file_count: i64,
+    /// Archive completion epoch seconds.
+    pub archived_at: i64,
+    /// Immutable generation directory path.
+    pub generation_dir_path: String,
+    /// Source folder class.
+    pub folder_class: String,
+    /// Source partition.
+    pub partition: String,
+    /// Authoritative segment records.
+    pub segments: Vec<FinalizeEventArchiveSegmentWire>,
+    /// Authoritative clip records.
+    pub clips: Vec<FinalizeEventArchiveClipWire>,
+    /// Authoritative angle records.
+    pub angles: Vec<FinalizeEventArchiveAngleWire>,
+}
+
+/// `finalize_event_archive` response payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FinalizeEventArchiveResponse {
+    /// Parent archive item id.
+    pub archive_item_id: i64,
+    /// True when this was an idempotent replay.
+    pub already_finalized: bool,
+}
+
+/// `cloud_prepare_parent_upload` child payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudPrepareParentUploadChildWire {
+    /// Child discriminator.
+    pub child_key: String,
+    /// Destination id.
+    pub destination_id: String,
+    /// Destination remote key.
+    pub remote_key: String,
+    /// Upload category.
+    pub category: String,
+    /// Queue ordering sequence.
+    pub seq: i64,
+    /// Total bytes.
+    pub total_bytes: i64,
+    /// Manifest mtime in milliseconds.
+    pub manifest_mtime_ms: i64,
+    /// Local content sha256.
+    pub content_sha256: String,
+    /// Expected backend verify hash.
+    pub expected_hash: String,
+    /// Verify algorithm.
+    pub verify_alg: String,
+}
+
+/// `cloud_prepare_parent_upload` request payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudPrepareParentUploadRequest {
+    /// Parent archive item id.
+    pub archive_item_id: i64,
+    /// Destination id.
+    pub destination_id: String,
+    /// Source manifest digest (32-hex).
+    pub source_manifest_digest: String,
+    /// Sealed child membership.
+    pub children: Vec<CloudPrepareParentUploadChildWire>,
+}
+
+/// `cloud_prepare_parent_upload` response payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudPrepareParentUploadResponse {
+    /// Upload-set id.
+    pub upload_set_id: String,
+    /// True when this was an idempotent replay.
+    pub already_prepared: bool,
+}
+
+/// `cloud_finalize_parent_upload` request payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudFinalizeParentUploadRequest {
+    /// Upload-set id.
+    pub upload_set_id: String,
+}
+
+/// `cloud_finalize_parent_upload` response payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudFinalizeParentUploadResponse {
+    /// Finalize request accepted.
+    pub ok: bool,
+    /// Parent became durable.
+    pub durable_parent: bool,
+    /// True when this was an idempotent replay.
+    pub already_finalized: bool,
+}
+
 /// Outbound RPC response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -457,6 +647,13 @@ pub enum Response {
     CloudCandidates {
         /// Candidate rows.
         items: Vec<CloudCandidateWire>,
+        /// Opaque next cursor.
+        next_cursor: Option<String>,
+    },
+    /// Cloud discover page.
+    CloudDiscoverPage {
+        /// Discover rows.
+        items: Vec<CloudDiscoverWire>,
         /// Opaque next cursor.
         next_cursor: Option<String>,
     },
@@ -537,6 +734,12 @@ pub enum Response {
         /// Opaque next cursor.
         next_cursor: Option<String>,
     },
+    /// Finalize-event response.
+    FinalizeEventArchive(FinalizeEventArchiveResponse),
+    /// Prepare-parent-upload response.
+    CloudPrepareParentUpload(CloudPrepareParentUploadResponse),
+    /// Finalize-parent-upload response.
+    CloudFinalizeParentUpload(CloudFinalizeParentUploadResponse),
 }
 
 /// Read one framed payload (4-byte LE length then bytes).
@@ -605,10 +808,15 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ArchiveAngle, ArchiveUnit, CloudCandidateWire, CloudConfigWire, CloudHistoryRowWire,
-        CloudQueuePkWire, CloudQueueRetryResolutionWire, CloudQueueRowWire, CloudQueueUpsertWire,
-        EvictionCandidateWire, MAX_REQUEST_FRAME, RecoveryRowWire, RegisterArchivedClip, Request,
-        Response, read_frame, read_request, write_frame, write_response,
+        ArchiveAngle, ArchiveUnit, CloudCandidateWire, CloudConfigWire, CloudDiscoverWire,
+        CloudFinalizeParentUploadRequest, CloudFinalizeParentUploadResponse, CloudHistoryRowWire,
+        CloudPrepareParentUploadChildWire, CloudPrepareParentUploadRequest,
+        CloudPrepareParentUploadResponse, CloudQueuePkWire, CloudQueueRetryResolutionWire,
+        CloudQueueRowWire, CloudQueueUpsertWire, EvictionCandidateWire,
+        FinalizeEventArchiveAngleWire, FinalizeEventArchiveClipWire, FinalizeEventArchiveRequest,
+        FinalizeEventArchiveResponse, FinalizeEventArchiveSegmentWire, MAX_REQUEST_FRAME,
+        RecoveryRowWire, RegisterArchivedClip, Request, Response, read_frame, read_request,
+        write_frame, write_response,
     };
 
     #[test]
@@ -824,6 +1032,13 @@ mod tests {
                 },
             ),
             (
+                "cloud_discover",
+                Request::CloudDiscover {
+                    after_cursor: Some("opaque".to_owned()),
+                    limit: 10,
+                },
+            ),
+            (
                 "cloud_queue_upsert",
                 Request::CloudQueueUpsert {
                     item: CloudQueueUpsertWire {
@@ -925,6 +1140,78 @@ mod tests {
                     limit: 25,
                 },
             ),
+            (
+                "finalize_event_archive",
+                Request::FinalizeEventArchive(FinalizeEventArchiveRequest {
+                    pass_id: "11111111111111111111111111111111".to_owned(),
+                    source_event_key: "event-1".to_owned(),
+                    source_volume_id: Some("vol-1".to_owned()),
+                    source_generation: "boot-a:42".to_owned(),
+                    expected_prior_manifest_digest: None,
+                    manifest_digest: "22222222222222222222222222222222".to_owned(),
+                    segment_set_digest:
+                        "3333333333333333333333333333333333333333333333333333333333333333"
+                            .to_owned(),
+                    expected_segment_count: 1,
+                    size_bytes: 10,
+                    file_count: 1,
+                    archived_at: 123,
+                    generation_dir_path: "archive/events/e1".to_owned(),
+                    folder_class: "SavedClips".to_owned(),
+                    partition: "slot0".to_owned(),
+                    segments: vec![FinalizeEventArchiveSegmentWire {
+                        segment_key: "f.mp4".to_owned(),
+                        size_bytes: 10,
+                        mtime_ms: 1,
+                        content_sha256:
+                            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                                .to_owned(),
+                    }],
+                    clips: vec![FinalizeEventArchiveClipWire {
+                        canonical_key: "clip-1".to_owned(),
+                        started_at: 1,
+                        ended_at: 2,
+                        folder_class: "SavedClips".to_owned(),
+                        partition: "slot0".to_owned(),
+                    }],
+                    angles: vec![FinalizeEventArchiveAngleWire {
+                        canonical_key: "clip-1".to_owned(),
+                        camera: "front".to_owned(),
+                        file_ref: "archive/events/e1/front.mp4".to_owned(),
+                        offset_ms: 0,
+                        duration_s: Some(1),
+                        size_bytes: 10,
+                    }],
+                }),
+            ),
+            (
+                "cloud_prepare_parent_upload",
+                Request::CloudPrepareParentUpload(CloudPrepareParentUploadRequest {
+                    archive_item_id: 1,
+                    destination_id: "dest".to_owned(),
+                    source_manifest_digest: "44444444444444444444444444444444".to_owned(),
+                    children: vec![CloudPrepareParentUploadChildWire {
+                        child_key: "child-1".to_owned(),
+                        destination_id: "dest".to_owned(),
+                        remote_key: "rk/1".to_owned(),
+                        category: "bulk".to_owned(),
+                        seq: 0,
+                        total_bytes: 10,
+                        manifest_mtime_ms: 1,
+                        content_sha256:
+                            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                                .to_owned(),
+                        expected_hash: "etag-1".to_owned(),
+                        verify_alg: "md5".to_owned(),
+                    }],
+                }),
+            ),
+            (
+                "cloud_finalize_parent_upload",
+                Request::CloudFinalizeParentUpload(CloudFinalizeParentUploadRequest {
+                    upload_set_id: "55555555555555555555555555555555".to_owned(),
+                }),
+            ),
         ];
 
         for (expected_cmd, request) in cases {
@@ -1023,6 +1310,8 @@ mod tests {
                         seq: 1,
                         total_bytes: 10,
                         bytes_uploaded: 0,
+                        expected_hash: Some("etag-value".to_owned()),
+                        verify_alg: "md5".to_owned(),
                         content_sha256:
                             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
                                 .to_owned(),
@@ -1032,6 +1321,21 @@ mod tests {
                         last_error: None,
                     }],
                     next_cursor: None,
+                },
+            ),
+            (
+                "cloud_discover_page",
+                Response::CloudDiscoverPage {
+                    items: vec![CloudDiscoverWire {
+                        archive_item_id: 1,
+                        folder_class: "RecentClips".to_owned(),
+                        path: "archive/a".to_owned(),
+                        manifest_digest: Some(
+                            "cccccccccccccccccccccccccccccccc".to_owned(),
+                        ),
+                        category: "bulk".to_owned(),
+                    }],
+                    next_cursor: Some("opaque".to_owned()),
                 },
             ),
             (
@@ -1124,6 +1428,28 @@ mod tests {
                     next_cursor: None,
                 },
             ),
+            (
+                "finalize_event_archive",
+                Response::FinalizeEventArchive(FinalizeEventArchiveResponse {
+                    archive_item_id: 7,
+                    already_finalized: false,
+                }),
+            ),
+            (
+                "cloud_prepare_parent_upload",
+                Response::CloudPrepareParentUpload(CloudPrepareParentUploadResponse {
+                    upload_set_id: "66666666666666666666666666666666".to_owned(),
+                    already_prepared: false,
+                }),
+            ),
+            (
+                "cloud_finalize_parent_upload",
+                Response::CloudFinalizeParentUpload(CloudFinalizeParentUploadResponse {
+                    ok: true,
+                    durable_parent: false,
+                    already_finalized: false,
+                }),
+            ),
         ];
 
         for (expected_status, response) in cases {
@@ -1145,5 +1471,108 @@ mod tests {
         });
         let result = serde_json::from_value::<Request>(raw);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn finalize_event_archive_structs_roundtrip() {
+        let request = FinalizeEventArchiveRequest {
+            pass_id: "77777777777777777777777777777777".to_owned(),
+            source_event_key: "event-2".to_owned(),
+            source_volume_id: None,
+            source_generation: "boot-b:9".to_owned(),
+            expected_prior_manifest_digest: Some("88888888888888888888888888888888".to_owned()),
+            manifest_digest: "99999999999999999999999999999999".to_owned(),
+            segment_set_digest:
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            expected_segment_count: 2,
+            size_bytes: 20,
+            file_count: 2,
+            archived_at: 456,
+            generation_dir_path: "archive/events/e2".to_owned(),
+            folder_class: "SentryClips".to_owned(),
+            partition: "slot1".to_owned(),
+            segments: vec![FinalizeEventArchiveSegmentWire {
+                segment_key: "seg-1".to_owned(),
+                size_bytes: 20,
+                mtime_ms: 2,
+                content_sha256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    .to_owned(),
+            }],
+            clips: vec![FinalizeEventArchiveClipWire {
+                canonical_key: "clip-2".to_owned(),
+                started_at: 10,
+                ended_at: 20,
+                folder_class: "SentryClips".to_owned(),
+                partition: "slot1".to_owned(),
+            }],
+            angles: vec![FinalizeEventArchiveAngleWire {
+                canonical_key: "clip-2".to_owned(),
+                camera: "back".to_owned(),
+                file_ref: "archive/events/e2/back.mp4".to_owned(),
+                offset_ms: 100,
+                duration_s: Some(10),
+                size_bytes: 20,
+            }],
+        };
+        let response = FinalizeEventArchiveResponse {
+            archive_item_id: 12,
+            already_finalized: true,
+        };
+        let decoded_request: FinalizeEventArchiveRequest =
+            serde_json::from_value(serde_json::to_value(&request).unwrap()).unwrap();
+        let decoded_response: FinalizeEventArchiveResponse =
+            serde_json::from_value(serde_json::to_value(&response).unwrap()).unwrap();
+        assert_eq!(decoded_request, request);
+        assert_eq!(decoded_response, response);
+    }
+
+    #[test]
+    fn cloud_prepare_parent_upload_structs_roundtrip() {
+        let request = CloudPrepareParentUploadRequest {
+            archive_item_id: 99,
+            destination_id: "dest".to_owned(),
+            source_manifest_digest: "cccccccccccccccccccccccccccccccc".to_owned(),
+            children: vec![CloudPrepareParentUploadChildWire {
+                child_key: "child-z".to_owned(),
+                destination_id: "dest".to_owned(),
+                remote_key: "rk/z".to_owned(),
+                category: "trip".to_owned(),
+                seq: 5,
+                total_bytes: 50,
+                manifest_mtime_ms: 1234,
+                content_sha256: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                    .to_owned(),
+                expected_hash: "etag-z".to_owned(),
+                verify_alg: "sha1".to_owned(),
+            }],
+        };
+        let response = CloudPrepareParentUploadResponse {
+            upload_set_id: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_owned(),
+            already_prepared: true,
+        };
+        let decoded_request: CloudPrepareParentUploadRequest =
+            serde_json::from_value(serde_json::to_value(&request).unwrap()).unwrap();
+        let decoded_response: CloudPrepareParentUploadResponse =
+            serde_json::from_value(serde_json::to_value(&response).unwrap()).unwrap();
+        assert_eq!(decoded_request, request);
+        assert_eq!(decoded_response, response);
+    }
+
+    #[test]
+    fn cloud_finalize_parent_upload_structs_roundtrip() {
+        let request = CloudFinalizeParentUploadRequest {
+            upload_set_id: "ffffffffffffffffffffffffffffffff".to_owned(),
+        };
+        let response = CloudFinalizeParentUploadResponse {
+            ok: true,
+            durable_parent: true,
+            already_finalized: true,
+        };
+        let decoded_request: CloudFinalizeParentUploadRequest =
+            serde_json::from_value(serde_json::to_value(&request).unwrap()).unwrap();
+        let decoded_response: CloudFinalizeParentUploadResponse =
+            serde_json::from_value(serde_json::to_value(&response).unwrap()).unwrap();
+        assert_eq!(decoded_request, request);
+        assert_eq!(decoded_response, response);
     }
 }

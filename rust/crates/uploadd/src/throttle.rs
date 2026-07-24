@@ -57,6 +57,8 @@ pub enum PauseReason {
     None,
     /// AP onboarding active — no cloud path.
     ApMode,
+    /// AP+STA concurrent mode active — no cloud path.
+    ApConcurrent,
     /// Not associated / no reachability.
     LinkDown,
     /// SDIO watchdog resetting `brcmfmac`.
@@ -383,5 +385,11 @@ mod tests {
         // Empty now; 500 bytes at 1000 B/s ⇒ ~500ms.
         let w = p.wait_ms_for(500, 0);
         assert!((400..=600).contains(&w), "unexpected wait {w}");
+    }
+
+    #[test]
+    fn pause_reason_deserializes_ap_concurrent() {
+        let reason: PauseReason = serde_json::from_str("\"ap_concurrent\"").unwrap();
+        assert_eq!(reason, PauseReason::ApConcurrent);
     }
 }

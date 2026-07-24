@@ -252,6 +252,18 @@ pre-reboot pass as current. The verified tuple is persisted on `archive_items` v
 
 ## 6. OPEN ITEMS (close in-phase — do NOT pre-freeze)
 
+> **STATUS (cloud lane B1):** the migration-v7 schema and the `finalize_event_archive`
+> RPC (item 1) are now **FROZEN and being implemented** as the *shared* v7 alongside the
+> cloud sealed-upload-set protocol — authority `docs/specs/contracts/indexd-cloud-schema.md`
+> §7 (one v7, no competing migration). B1 builds v7 + `finalize_event_archive` +
+> `cloud_prepare/finalize_parent_upload`, **fully tested via fixtures that call
+> `finalize_event_archive` directly**. The **production event-arm daemon wiring** that
+> actually calls `finalize_event_archive` in-flight (the `volume_serial`→`ScanBatch`
+> propagation in item 2, sidecar persistence item 3, TrackMode item 5, the
+> enumeration/`ArchiveStore` seams items 6–7) remains **this spec's separate P0.5 lane —
+> NOT built under B1**. Until it lands, event `archive_items` carry `manifest_digest=NULL`,
+> so cloud `prepare` fails closed and no event is cloud-evictable in production (intended).
+
 1. **Registration/finalization contract (the core OPEN).**  **[RESOLVED — §5.2.]**
    Decision: a **new `finalize_event_archive` RPC** (NOT extending
    `register_archived_clip`, which stays unchanged for RecentClips); one atomic,

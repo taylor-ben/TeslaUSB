@@ -11,6 +11,10 @@ mod live;
 use std::process::ExitCode;
 
 #[cfg(unix)]
+use std::fs::File;
+#[cfg(unix)]
+use std::io::Read;
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -78,6 +82,10 @@ struct HealthHeartbeat {
 struct GovernorStatus {
     schema: u32,
     updated_at: i64,
+    uploads_allowed: bool,
+    seq: u64,
+    interval_secs: u64,
+    publisher_instance: String,
     /// "armed" (real deletion) | "dryrun" (projection only).
     mode: &'static str,
     /// True when the archive copy pass is skipped (drain-only).
@@ -290,6 +298,13 @@ fn run_serve(_args: &[String]) -> ExitCode {
 
 #[cfg(unix)]
 #[allow(clippy::too_many_lines)]
+// run_serve is the single top-level cycle orchestrator (statfs -> archive gate ->
+// drain -> governor-status publish); it is deliberately kept as one loop and is
+// already exempt from too_many_lines. Publishing the governor upload-backpressure
+// status inline (post-drain re-evaluate) adds branching that trips
+// cognitive_complexity; splitting the recording-critical cycle across helpers would
+// obscure the ordering guarantees, so it shares the same orchestration exemption.
+#[allow(clippy::cognitive_complexity)]
 fn run_serve(args: &[String]) -> ExitCode {
     let parsed = match parse_serve_args(args) {
         Ok(parsed) => parsed,
@@ -512,6 +527,8 @@ fn run_serve(args: &[String]) -> ExitCode {
     let mut evict_budget = EvictBudget::default();
     let mut prev_space_tier = Tier::Healthy;
     let mut archive_paused_prev = false;
+    let publisher_instance = publisher_instance_hex_128();
+    let mut governor_seq: u64 = 0;
 
     match governor.recover() {
         Ok(report) => {
@@ -525,11 +542,15 @@ fn run_serve(args: &[String]) -> ExitCode {
     retentiond::watchdog::pet();
 
     while !SHUTDOWN.load(Ordering::Relaxed) {
+        let cycle_prev_tier = prev_space_tier;
+        let mut pre_uploads_unsafe = true;
+        let mut pre_status_bytes: Option<(u64, u64)> = None;
         // Fail-closed default: if statfs fails below we stay paused for this cycle
         // (the Ok arm overwrites this with the real assessment).
         let mut archive_paused = true;
         match statfs.statfs(archive_root_str.as_str()) {
             Ok(stat) => {
+                pre_status_bytes = Some((stat.free_bytes, stat.total_bytes));
                 let samples = [FsSample {
                     role: FsRole::Data,
                     stat,
@@ -546,6 +567,9 @@ fn run_serve(args: &[String]) -> ExitCode {
                 );
                 prev_space_tier = assessment.space_tier;
                 archive_paused = assessment.tier >= Tier::Critical;
+                if assessment.tier < Tier::Emergency {
+                    pre_uploads_unsafe = false;
+                }
                 if archive_paused != archive_paused_prev {
                     eprintln!(
                         "retentiond archive gate: {} at tier={:?} free={} bytes",
@@ -569,6 +593,26 @@ fn run_serve(args: &[String]) -> ExitCode {
             }
         }
         archive_paused_prev = archive_paused;
+        if pre_uploads_unsafe {
+            let (free_bytes, total_bytes) = pre_status_bytes.unwrap_or((0, 0));
+            governor_seq = governor_seq.saturating_add(1);
+            write_governor_status_best_effort(
+                &governor_status_file,
+                false,
+                governor_seq,
+                parsed.interval_secs,
+                &publisher_instance,
+                free_bytes,
+                total_bytes,
+                "skipped",
+                0,
+                0,
+                effective_dry_run,
+                parsed.drain_only,
+                &cfg,
+                &mut governor_status_write_error_logged,
+            );
+        }
         // --drain-only (emergency): SKIP the archive pass entirely and run ONLY the
         // eviction drain below. At a near-full disk the archive pass hard-blocks on
         // the full filesystem (marker/outbox/candidate I/O) longer than the watchdog
@@ -659,6 +703,7 @@ fn run_serve(args: &[String]) -> ExitCode {
             }
         }
 
+        let mut last_outcome: Option<DrainOutcome> = None;
         if !evict_budget.latched {
             shared.set_cycle_context(
                 now_epoch_s_saturating().saturating_sub(cfg.target_drain.recency_floor_secs),
@@ -675,20 +720,12 @@ fn run_serve(args: &[String]) -> ExitCode {
             match governor.drain_to_target(&input) {
                 Ok(outcome) => {
                     log_drain(&outcome, effective_dry_run, &cfg, parsed.interval_secs);
-                    write_governor_status_best_effort(
-                        &governor_status_file,
-                        effective_dry_run,
-                        parsed.drain_only,
-                        &outcome,
-                        &cfg,
-                        &mut governor_status_write_error_logged,
-                    );
                     if !effective_dry_run {
                         // size the episode budget to the level the drain actually drives free UP to (exit hysteresis), else an honest convergence to exit_frac would exceed a free_frac-sized budget and false-latch
                         let target_free_bytes =
                             frac_bytes(outcome.total_bytes, cfg.target_drain.target_exit_frac);
                         let stop_healthy = matches!(
-                            outcome.stop,
+                            &outcome.stop,
                             DrainStop::TargetReached | DrainStop::AlreadyHealthy
                         );
                         if evict_budget.observe(
@@ -704,11 +741,64 @@ fn run_serve(args: &[String]) -> ExitCode {
                             );
                         }
                     }
+                    last_outcome = Some(outcome);
                 }
                 Err(err) => eprintln!("retentiond governor: drain cycle error: {err}"),
             }
             retentiond::watchdog::pet();
         }
+
+        let mut uploads_allowed = false;
+        let (free_bytes, total_bytes) = match statfs.statfs(archive_root_str.as_str()) {
+            Ok(stat) => {
+                let post = governor::evaluate(
+                    cycle_prev_tier,
+                    &[FsSample {
+                        role: FsRole::Data,
+                        stat,
+                    }],
+                    DiskImgAccounting {
+                        nominal_bytes: 0,
+                        allocated_bytes: 0,
+                    },
+                    true,
+                    &cfg.governor,
+                );
+                uploads_allowed = governor.upload_backpressure(&post).uploads_allowed;
+                (stat.free_bytes, stat.total_bytes)
+            }
+            Err(_) => last_outcome
+                .as_ref()
+                .map_or((0, 0), |outcome| (outcome.free_after, outcome.total_bytes)),
+        };
+        if evict_budget.latched {
+            uploads_allowed = false;
+        }
+        let (last_stop, last_bytes_freed, last_items) = match last_outcome.as_ref() {
+            Some(outcome) => (
+                drain_stop_tag(&outcome.stop),
+                outcome.bytes_freed,
+                u64::try_from(outcome.records.len()).unwrap_or(u64::MAX),
+            ),
+            None => ("skipped", 0, 0),
+        };
+        governor_seq = governor_seq.saturating_add(1);
+        write_governor_status_best_effort(
+            &governor_status_file,
+            uploads_allowed,
+            governor_seq,
+            parsed.interval_secs,
+            &publisher_instance,
+            free_bytes,
+            total_bytes,
+            last_stop,
+            last_bytes_freed,
+            last_items,
+            effective_dry_run,
+            parsed.drain_only,
+            &cfg,
+            &mut governor_status_write_error_logged,
+        );
 
         sleep_interruptible(parsed.interval_secs);
     }
@@ -733,6 +823,20 @@ fn now_epoch_s_saturating() -> i64 {
         Ok(duration) => i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
         Err(_) => 0,
     }
+}
+
+#[cfg(unix)]
+fn publisher_instance_hex_128() -> String {
+    let mut bytes = [0_u8; 16];
+    if File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .is_ok()
+    {
+        return format!("{:032x}", u128::from_le_bytes(bytes));
+    }
+    let fallback = (u128::from(std::process::id()) << 64)
+        | u128::try_from(now_epoch_s_saturating()).unwrap_or(0);
+    format!("{fallback:032x}")
 }
 
 #[cfg(unix)]
@@ -811,25 +915,37 @@ fn write_governor_status_atomic(path: &Path, body: &str) -> std::io::Result<()> 
 #[allow(clippy::too_many_arguments)]
 fn write_governor_status_best_effort(
     path: &Path,
+    uploads_allowed: bool,
+    seq: u64,
+    interval_secs: u64,
+    publisher_instance: &str,
+    free_bytes: u64,
+    total_bytes: u64,
+    last_stop: &'static str,
+    last_bytes_freed: u64,
+    last_items: u64,
     effective_dry_run: bool,
     drain_only: bool,
-    outcome: &DrainOutcome,
     cfg: &RetentionConfig,
     write_error_logged: &mut bool,
 ) {
     let status = GovernorStatus {
-        schema: 1,
+        schema: 2,
         updated_at: now_epoch_s_saturating(),
+        uploads_allowed,
+        seq,
+        interval_secs,
+        publisher_instance: publisher_instance.to_owned(),
         mode: if effective_dry_run { "dryrun" } else { "armed" },
         drain_only,
-        free_bytes: outcome.free_after,
-        total_bytes: outcome.total_bytes,
+        free_bytes,
+        total_bytes,
         target_free_frac: cfg.target_drain.target_free_frac,
         target_exit_frac: cfg.target_drain.target_exit_frac,
         recency_floor_secs: cfg.target_drain.recency_floor_secs,
-        last_stop: drain_stop_tag(&outcome.stop),
-        last_bytes_freed: outcome.bytes_freed,
-        last_items: u64::try_from(outcome.records.len()).unwrap_or(u64::MAX),
+        last_stop,
+        last_bytes_freed,
+        last_items,
     };
     let body = match serde_json::to_string(&status) {
         Ok(b) => b,
@@ -997,10 +1113,18 @@ fn install_shutdown_handlers() {
 #[cfg(all(test, unix))]
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
+    use std::rc::Rc;
+
+    use retentiond::config::RetentionConfig;
+    use retentiond::governor::{GovernorAssessment, Tier};
+    use retentiond::index_delete_client::IndexDeleteClient;
+    use retentiond::read_client::VolumeReadFileClient;
+
     use super::{
-        cumulative_evict_budget, drain_stop_tag, parse_serve_args, render_health,
-        resolve_eviction_mode, validate_phase1_mode, DrainStop, EvictBudget, EvictionMode,
-        GovernorStatus, ServeArgs,
+        LiveArchiveDeleteOps, LiveArchiveStore, LiveCatalog, LiveClock, LiveIndexClient, LiveRand,
+        LiveStatfs, NoCarHandoff, Seams, cumulative_evict_budget, drain_stop_tag, parse_serve_args,
+        publisher_instance_hex_128, render_health, resolve_eviction_mode, validate_phase1_mode,
+        DrainStop, EvictBudget, EvictionMode, GovernorStatus, RetentionLoop, ServeArgs,
     };
 
     #[test]
@@ -1365,9 +1489,14 @@ mod tests {
 
     #[test]
     fn governor_status_serializes_expected_shape() {
+        let publisher_instance = publisher_instance_hex_128();
         let status = GovernorStatus {
-            schema: 1,
+            schema: 2,
             updated_at: 1_700_000_000,
+            uploads_allowed: false,
+            seq: 7,
+            interval_secs: 20,
+            publisher_instance: publisher_instance.clone(),
             mode: "armed",
             drain_only: true,
             free_bytes: 50,
@@ -1387,8 +1516,12 @@ mod tests {
             Ok(value) => value,
             Err(err) => panic!("governor_status should be valid json: {err}"),
         };
-        assert_eq!(value["schema"], 1);
+        assert_eq!(value["schema"], 2);
         assert_eq!(value["updated_at"], 1_700_000_000);
+        assert_eq!(value["uploads_allowed"], false);
+        assert_eq!(value["seq"], 7);
+        assert_eq!(value["interval_secs"], 20);
+        assert_eq!(value["publisher_instance"], publisher_instance);
         assert_eq!(value["mode"], "armed");
         assert_eq!(value["drain_only"], true);
         assert_eq!(value["free_bytes"], 50);
@@ -1399,6 +1532,111 @@ mod tests {
         assert_eq!(value["last_stop"], "already_healthy");
         assert_eq!(value["last_bytes_freed"], 0);
         assert_eq!(value["last_items"], 0);
+    }
+
+    fn assessment_with_tier(tier: Tier) -> GovernorAssessment {
+        GovernorAssessment {
+            tier,
+            shared_device: false,
+            root_reserve_breached: false,
+            sparse_image_warning: false,
+            space_tier: tier,
+            inode_tier: Tier::Healthy,
+            data_free_bytes: 0,
+            data_free_inodes: 0,
+            usable_for_archive_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn upload_backpressure_tracks_emergency_threshold() {
+        let cfg = RetentionConfig::default();
+        let archive_root = "/data/teslausb/archive";
+        let read = VolumeReadFileClient::new("/data/teslausb/teslacam.img", 0);
+        let store = LiveArchiveStore::new(Box::new(read), archive_root);
+        let shared = Rc::new(IndexDeleteClient::new("/run/teslausb/indexd.sock"));
+        let clock = LiveClock;
+        let rand = LiveRand;
+        let statfs = LiveStatfs;
+        let handoff = NoCarHandoff;
+        let fs = LiveArchiveDeleteOps::new(archive_root);
+        let index = LiveIndexClient::new(Rc::clone(&shared));
+        let catalog = LiveCatalog::new(
+            Rc::clone(&shared),
+            archive_root,
+            format!("{archive_root}/.retention-trash"),
+        );
+        let seams = Seams {
+            clock: &clock,
+            store: &store,
+            handoff: &handoff,
+            statfs: &statfs,
+            fs: &fs,
+            index: &index,
+            catalog: &catalog,
+            rand: &rand,
+        };
+        let rl = RetentionLoop::new(&cfg, seams, format!("{archive_root}/.retention-trash"));
+
+        for tier in [
+            Tier::Healthy,
+            Tier::Low,
+            Tier::Critical,
+            Tier::Emergency,
+            Tier::Exhausted,
+        ] {
+            let assessment = assessment_with_tier(tier);
+            assert_eq!(
+                rl.upload_backpressure(&assessment).uploads_allowed,
+                tier < Tier::Emergency
+            );
+        }
+    }
+
+    #[test]
+    fn governor_status_seq_increases_and_publisher_instance_is_stable() {
+        let publisher_instance = publisher_instance_hex_128();
+        assert!(!publisher_instance.is_empty());
+
+        let first = GovernorStatus {
+            schema: 2,
+            updated_at: 1_700_000_000,
+            uploads_allowed: true,
+            seq: 1,
+            interval_secs: 20,
+            publisher_instance: publisher_instance.clone(),
+            mode: "armed",
+            drain_only: false,
+            free_bytes: 100,
+            total_bytes: 200,
+            target_free_frac: 0.08,
+            target_exit_frac: 0.10,
+            recency_floor_secs: 3_600,
+            last_stop: "target_reached",
+            last_bytes_freed: 50,
+            last_items: 1,
+        };
+        let second = GovernorStatus {
+            schema: first.schema,
+            updated_at: first.updated_at,
+            uploads_allowed: first.uploads_allowed,
+            seq: first.seq.saturating_add(1),
+            interval_secs: first.interval_secs,
+            publisher_instance: publisher_instance.clone(),
+            mode: first.mode,
+            drain_only: first.drain_only,
+            free_bytes: first.free_bytes,
+            total_bytes: first.total_bytes,
+            target_free_frac: first.target_free_frac,
+            target_exit_frac: first.target_exit_frac,
+            recency_floor_secs: first.recency_floor_secs,
+            last_stop: first.last_stop,
+            last_bytes_freed: first.last_bytes_freed,
+            last_items: first.last_items,
+        };
+
+        assert!(second.seq > first.seq);
+        assert_eq!(first.publisher_instance, second.publisher_instance);
     }
 
     #[test]

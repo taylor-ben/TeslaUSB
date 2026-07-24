@@ -70,6 +70,7 @@ mode_install() {
     BOOT_CHANGED=0
     configure_boot_dwc2
     configure_networkmanager_wifi
+    configure_system_tuning
     if [ "${BOOTSTRAP_IMAGE:-0}" = "1" ]; then
         log_warn "bootstrap: enabling ${TESLAUSB_PROVISION_UNIT} — gadgetd will create disk.img IF ABSENT, then bring the gadget up"
         log_warn "staged-reboot model: boot mutations are backed up; post-boot validation gates success (setup.md §7 step 9)"

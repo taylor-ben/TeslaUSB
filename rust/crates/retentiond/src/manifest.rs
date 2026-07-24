@@ -248,6 +248,23 @@ mod tests {
     }
 
     #[test]
+    fn digest_matches_shared_core_golden_vector() {
+        // Ties retentiond's canonical (hand-written) DirManifest::digest to the
+        // shared teslausb-core golden vector. indexd reconstructs the same
+        // digest from a cloud upload set via teslausb_core::manifest_digest, so
+        // any drift in EITHER fold implementation fails this test (or its twin
+        // in teslausb-core) rather than silently breaking cloud durability.
+        let m = manifest(vec![
+            entry("back.mp4", 20, 2, 2),
+            entry("front.mp4", 10, 1, 1),
+        ]);
+        assert_eq!(
+            format!("{:032x}", m.digest().0),
+            teslausb_core::manifest_digest::MANIFEST_DIGEST_V1_GOLDEN
+        );
+    }
+
+    #[test]
     fn digest_changes_on_any_field() {
         let base = manifest(vec![entry("front.mp4", 10, 1, 1)]);
         assert_ne!(

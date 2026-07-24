@@ -16,4 +16,5 @@
 
 pub mod chime;
 pub mod fs;
+pub mod manifest_digest;
 pub mod sei;

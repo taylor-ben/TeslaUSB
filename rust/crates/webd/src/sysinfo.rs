@@ -399,13 +399,21 @@ pub struct Storage {
     pub quarantined: Option<QuarantinedDto>,
 }
 
-/// Mirror of retentiond's `retentiond.governor.json` (schema 1). Parsed then
+/// Mirror of retentiond's `retentiond.governor.json` (schema 1/2). Parsed then
 /// re-serialized into `Storage.governor` so the SPA gets a validated, typed
 /// object (garbage/absent file → `governor: None`).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct GovernorDto {
     schema: u32,
     updated_at: i64,
+    #[serde(default)]
+    uploads_allowed: bool,
+    #[serde(default)]
+    seq: u64,
+    #[serde(default)]
+    interval_secs: u64,
+    #[serde(default)]
+    publisher_instance: String,
     mode: String,
     drain_only: bool,
     free_bytes: u64,
@@ -979,7 +987,7 @@ fn filesystem_dto(probe: &dyn SystemProbe, path: &Path) -> Option<FilesystemDto>
 }
 
 fn validate_governor(dto: GovernorDto, now: i64) -> Option<GovernorDto> {
-    if dto.schema != 1 {
+    if dto.schema != 1 && dto.schema != 2 {
         return None;
     }
     let age = now.saturating_sub(dto.updated_at);
@@ -1403,6 +1411,10 @@ mod tests {
         GovernorDto {
             schema: 1,
             updated_at,
+            uploads_allowed: true,
+            seq: 1,
+            interval_secs: 20,
+            publisher_instance: "publisher".to_owned(),
             mode: "armed".to_owned(),
             drain_only: true,
             free_bytes: 53_687_091_200,
@@ -2071,7 +2083,7 @@ tmpfs /run tmpfs rw 0 0
     fn storage_governor_none_when_wrong_schema() {
         let probe = FakeProbe {
             governor_file: Some(
-                "{\"schema\":2,\"updated_at\":1700000000,\"mode\":\"armed\",\"drain_only\":true,\"free_bytes\":1,\"total_bytes\":2,\"target_free_frac\":0.08,\"target_exit_frac\":0.1,\"recency_floor_secs\":3600,\"last_stop\":\"already_healthy\",\"last_bytes_freed\":0,\"last_items\":0}".to_owned(),
+                "{\"schema\":3,\"updated_at\":1700000000,\"mode\":\"armed\",\"drain_only\":true,\"free_bytes\":1,\"total_bytes\":2,\"target_free_frac\":0.08,\"target_exit_frac\":0.1,\"recency_floor_secs\":3600,\"last_stop\":\"already_healthy\",\"last_bytes_freed\":0,\"last_items\":0}".to_owned(),
             ),
             ..FakeProbe::default()
         };
@@ -2080,6 +2092,30 @@ tmpfs /run tmpfs rw 0 0
         };
         let out = storage(&probe, &paths(), &stats, None);
         assert!(out.governor.is_none());
+    }
+
+    #[test]
+    fn storage_reads_schema2_governor_when_present_and_valid() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let probe = FakeProbe {
+            governor_file: Some(format!(
+                "{{\"schema\":2,\"updated_at\":{now},\"uploads_allowed\":false,\"seq\":9,\"interval_secs\":20,\"publisher_instance\":\"inst\",\"mode\":\"armed\",\"drain_only\":true,\"free_bytes\":53687091200,\"total_bytes\":504658657280,\"target_free_frac\":0.08,\"target_exit_frac\":0.1,\"recency_floor_secs\":3600,\"last_stop\":\"already_healthy\",\"last_bytes_freed\":0,\"last_items\":0}}"
+            )),
+            ..FakeProbe::default()
+        };
+        let stats = FakeStatsClient {
+            outcome: Some(VolumeStatsOutcome::Unavailable),
+        };
+        let out = storage(&probe, &paths(), &stats, None);
+        let governor = out.governor.expect("governor");
+        assert_eq!(governor["schema"], 2);
+        assert_eq!(governor["uploads_allowed"], false);
+        assert_eq!(governor["seq"], 9);
+        assert_eq!(governor["interval_secs"], 20);
+        assert_eq!(governor["publisher_instance"], "inst");
     }
 
     #[test]
@@ -2102,6 +2138,22 @@ tmpfs /run tmpfs rw 0 0
         let now = 1_700_000_000;
         let dto = valid_governor_dto(now);
         assert!(validate_governor(dto, now).is_some());
+    }
+
+    #[test]
+    fn validate_governor_accepts_schema2_and_schema1_without_new_fields() {
+        let now = 1_700_000_000;
+        let schema2: GovernorDto = serde_json::from_str(
+            "{\"schema\":2,\"updated_at\":1700000000,\"uploads_allowed\":false,\"seq\":5,\"interval_secs\":20,\"publisher_instance\":\"inst\",\"mode\":\"armed\",\"drain_only\":true,\"free_bytes\":1,\"total_bytes\":2,\"target_free_frac\":0.08,\"target_exit_frac\":0.1,\"recency_floor_secs\":3600,\"last_stop\":\"already_healthy\",\"last_bytes_freed\":0,\"last_items\":0}",
+        )
+        .expect("schema2 parse");
+        assert!(validate_governor(schema2, now).is_some());
+
+        let schema1_without_new_fields: GovernorDto = serde_json::from_str(
+            "{\"schema\":1,\"updated_at\":1700000000,\"mode\":\"armed\",\"drain_only\":true,\"free_bytes\":1,\"total_bytes\":2,\"target_free_frac\":0.08,\"target_exit_frac\":0.1,\"recency_floor_secs\":3600,\"last_stop\":\"already_healthy\",\"last_bytes_freed\":0,\"last_items\":0}",
+        )
+        .expect("schema1 parse");
+        assert!(validate_governor(schema1_without_new_fields, now).is_some());
     }
 
     #[test]

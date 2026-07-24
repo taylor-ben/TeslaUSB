@@ -30,7 +30,7 @@ use crate::queue::{QueueItem, QueueStore};
 use crate::source::{ArchiveItemId, ArchiveRoot, ArchiveSource, ContentHash};
 use crate::throttle::{GateReason, Pacer, PauseAction, ThrottleSource, UploadGate};
 use crate::time::{Clock, MonoMs, Waiter};
-use crate::transfer::{Integrity, Uploader, verify_digest};
+use crate::transfer::{Integrity, RemoteVerify, Uploader, VerifySpec, verify_digest};
 
 /// The set of I/O seams plus config the engine drives. Fields are public so the
 /// engine can be assembled with a struct literal (avoiding a wide constructor);
@@ -160,11 +160,11 @@ impl UploadEngine<'_> {
             } => (max_tx_bytes_per_s, max_chunk_bytes),
         };
 
-        let held = match self.acquire(item.id) {
+        let held = match self.acquire(item.archive_item_id) {
             Ok(held) => held,
             Err(reason) => {
                 return Ok(StepOutcome::SkippedLeaseDenied {
-                    item: item.id,
+                    item: item.archive_item_id,
                     reason,
                 });
             }
@@ -288,7 +288,7 @@ impl UploadEngine<'_> {
             }
 
             self.uploader
-                .put_chunk(&item.remote_key, offset, &data)
+                .put_chunk(&item.key.remote_key, offset, &data)
                 .map_err(|e| stop_from_transfer(&e))?;
 
             let sent = u64::try_from(data.len()).unwrap_or(0);
@@ -300,7 +300,7 @@ impl UploadEngine<'_> {
         }
 
         self.uploader
-            .finalize(&item.remote_key, total)
+            .finalize(&item.key.remote_key, total)
             .map_err(|e| stop_from_transfer(&e))
     }
 
@@ -367,19 +367,29 @@ impl UploadEngine<'_> {
         item: &mut QueueItem,
         remote_digest: ContentHash,
     ) -> Result<StepOutcome, EngineError> {
-        match verify_digest(item.expected_hash, remote_digest) {
+        let remote = match item.verify {
+            VerifySpec::CopyIntegrity => RemoteVerify::CopyIntegrity {
+                size_bytes: item.total_bytes,
+            },
+            VerifySpec::Native { .. } => RemoteVerify::sha256(remote_digest),
+        };
+        match verify_digest(&item.verify, &remote, item.total_bytes) {
             Integrity::Corrupt => {
-                self.fail_item(item, "integrity check failed: remote digest mismatch", true)
+                self.fail_item(
+                    item,
+                    "integrity check failed: remote verification mismatch",
+                    true,
+                )
             }
             Integrity::Verified => {
                 // Durability is the ONLY authority uploadd asserts over the file;
                 // it never deletes. The mark is idempotent, so a crash before the
                 // queue persist below simply re-marks on resume.
-                self.durability.mark_uploaded_verified(item.id)?;
+                self.durability.mark_uploaded_verified(item.archive_item_id)?;
                 item.complete();
                 self.queue_store.persist(item)?;
                 Ok(StepOutcome::Uploaded {
-                    item: item.id,
+                    item: item.archive_item_id,
                     bytes: item.total_bytes,
                 })
             }
@@ -395,14 +405,14 @@ impl UploadEngine<'_> {
     ) -> Result<StepOutcome, EngineError> {
         item.fail(reason, reset_offset);
         self.queue_store.persist(item)?;
-        if item.is_ready(self.cfg.retry.max_attempts) {
+        if item.is_retryable(self.cfg.retry.max_attempts) {
             Ok(StepOutcome::Retry {
-                item: item.id,
+                item: item.archive_item_id,
                 reason: reason.to_owned(),
             })
         } else {
             Ok(StepOutcome::Exhausted {
-                item: item.id,
+                item: item.archive_item_id,
                 reason: reason.to_owned(),
             })
         }
@@ -451,13 +461,14 @@ mod tests {
         LeaseClient, LeaseGen, LeaseGrant, LeaseId, LeaseKind, ReleaseResult, RenewResult,
     };
     use crate::priority::UploadCategory;
-    use crate::queue::{QueueItem, QueueStore};
+    use crate::queue::{QueueItem, QueueKey, QueueStore};
     use crate::source::{ArchiveItemId, ArchivePath, ArchiveRoot, ArchiveSource, ContentHash};
     use crate::throttle::{
         LinkMode, PauseAction, PauseReason, StoragePressure, ThrottleSnapshot, ThrottleSource,
         WifiThrottle,
     };
     use crate::time::{BootId, Clock, MonoMs, Waiter};
+    use crate::transfer::{VerifyAlg, VerifySpec};
 
     /// Deterministic digest used by both the source-expected hash and the mock
     /// uploader, so a correct end-to-end transfer verifies.
@@ -467,6 +478,14 @@ mod tests {
             h[i % 32] = h[i % 32].wrapping_add(*b);
         }
         ContentHash::new(h)
+    }
+
+    fn hash_hex(hash: ContentHash) -> String {
+        let mut out = String::with_capacity(64);
+        for b in hash.0 {
+            out.push_str(&format!("{b:02x}"));
+        }
+        out
     }
 
     /// A shared synthetic timeline: the `Clock` reads it, the `Waiter` advances
@@ -713,7 +732,7 @@ mod tests {
                 return Err(IndexError::new("persist", "injected persist failure"));
             }
             let mut p = self.persisted.borrow_mut();
-            if let Some(slot) = p.iter_mut().find(|i| i.id == item.id) {
+            if let Some(slot) = p.iter_mut().find(|i| i.key == item.key) {
                 *slot = item.clone();
             } else {
                 p.push(item.clone());
@@ -776,13 +795,17 @@ mod tests {
 
     fn test_item(total: u64, expected: ContentHash) -> QueueItem {
         QueueItem::new(
+            QueueKey::new("dest-a", "remote/event.mp4"),
             ArchiveItemId(42),
+            "event.mp4",
             "SentryClips/2026/event.mp4",
-            "remote/event.mp4",
             UploadCategory::EventSentry,
             0,
             total,
-            expected,
+            VerifySpec::Native {
+                alg: VerifyAlg::Sha256,
+                expected: hash_hex(expected),
+            },
         )
     }
 
@@ -1128,13 +1151,17 @@ mod tests {
             waiter: &timeline,
         };
         let mut item = QueueItem::new(
+            QueueKey::new("dest-a", "remote/x.mp4"),
             ArchiveItemId(7),
+            "x.mp4",
             "../../mnt/cam/live.mp4", // escapes the archive root
-            "remote/x.mp4",
             UploadCategory::Bulk,
             0,
             100,
-            digest(&[9; 100]),
+            VerifySpec::Native {
+                alg: VerifyAlg::Sha256,
+                expected: hash_hex(digest(&[9; 100])),
+            },
         );
 
         let outcome = engine.process(&mut item).expect("no infra error");

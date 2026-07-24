@@ -73,6 +73,23 @@ TESLAUSB_NM_WIFI_CONF="${TESLAUSB_PREFIX}/etc/NetworkManager/conf.d/10-teslausb-
 TESLAUSB_BOOT_MARKER_BEGIN="# >>> TeslaUSB B-1 (managed) >>>"
 TESLAUSB_BOOT_MARKER_END="# <<< TeslaUSB B-1 (managed) <<<"
 
+# --- performance / footprint tuning (managed drops; applied on the post-install
+#     reboot) --------------------------------------------------------------------
+# Fresh-image install-time concerns for the 512 MB Pi Zero 2 W: keep swap OFF the
+# microSD (zram), bound the journal's microSD writes, and shed daemons the
+# appliance never uses. gpu_mem reclaim rides in the managed boot block
+# (configure_boot_config). noatime is intentionally NOT managed here: Raspberry Pi
+# OS Bookworm already mounts / with noatime, and editing fstab on a physically-
+# unrecoverable in-car device is not worth a redundant flag.
+TESLAUSB_ZRAMSWAP_CONF="${TESLAUSB_PREFIX}/etc/default/zramswap"
+TESLAUSB_JOURNALD_CONF="${TESLAUSB_PREFIX}/etc/systemd/journald.conf.d/10-teslausb.conf"
+# Passwordless sudo for the admin user so a re-imaged device self-configures for
+# autonomous management: the imaging-set password bootstraps the FIRST
+# `sudo ./setup.sh`, and this drop-in makes subsequent sudo password-free. 0440,
+# visudo-validated before install.
+TESLAUSB_ADMIN_USER="${TESLAUSB_ADMIN_USER:-pi}"
+TESLAUSB_SUDOERS_NOPASSWD="${TESLAUSB_PREFIX}/etc/sudoers.d/010_${TESLAUSB_ADMIN_USER}-nopasswd"
+
 # --- service / unit sets -----------------------------------------------------
 # App services: ENABLED + restarted by the install/deploy/update modes because
 # their live loops are wired today. (Per-service OOM kill order is set in each
@@ -96,6 +113,19 @@ TESLAUSB_STAGED_SERVICES="uploadd retentiond"
 TESLAUSB_GADGET_UNITS="gadgetd gadgetd-control"
 # Provisioning unit: enabled ONLY by `install --bootstrap-image` (contract §2).
 TESLAUSB_PROVISION_UNIT="gadgetd-provision"
+# Unnecessary services masked on a headless in-car recorder to free RAM/CPU.
+# STRICTLY the lifeline-safe set: NEVER avahi-daemon (publishes the
+# cybertruckusb.local mDNS name the operator reaches the car over) and NEVER
+# wpa_supplicant / NetworkManager (the Wi-Fi link itself).
+TESLAUSB_MASK_SERVICES="bluetooth.service triggerhappy.service ModemManager.service"
+# Lifeline units the installer must NEVER mask or disable — severing any of these
+# permanently cuts the only remote path to this in-car device (mDNS name +
+# Wi-Fi link + SSH channel). assert_not_lifeline enforces this at RUNTIME as
+# defense-in-depth (mirroring assert_safe_dest for the LUN images), so even a
+# future edit that mistakenly adds one of these to TESLAUSB_MASK_SERVICES cannot
+# brick the device. Matched on the bare stem: "avahi-daemon" and
+# "avahi-daemon.service" both trip the guard.
+TESLAUSB_LIFELINE_SERVICES="avahi-daemon wpa_supplicant NetworkManager ssh sshd"
 
 # --- logging -----------------------------------------------------------------
 log_info() { printf '[setup] %s\n' "$*" >&2; }
@@ -165,6 +195,21 @@ assert_safe_dest() {
     if [ -L "$dst" ]; then
         die "$EX_STEP" "refusing to write through symlink at managed path: ${dst}"
     fi
+}
+
+# assert_not_lifeline <unit> — guard EVERY mask/disable driven by a service LIST.
+# Refuses (dies) when <unit> is one of the remote-access lifelines
+# (TESLAUSB_LIFELINE_SERVICES): mDNS, the Wi-Fi link, or SSH. Defense-in-depth
+# mirroring assert_safe_dest — a caller "shouldn't" pass one, but on a physically
+# unrecoverable in-car device we fail closed rather than risk severing access.
+assert_not_lifeline() {
+    local unit="$1" stem lifeline
+    stem="${unit%.service}"
+    for lifeline in $TESLAUSB_LIFELINE_SERVICES; do
+        if [ "$stem" = "${lifeline%.service}" ]; then
+            die "$EX_STEP" "refusing to mask/disable lifeline unit: ${unit}"
+        fi
+    done
 }
 
 # --- mutation helpers (thin wrappers; all route through run_mutation) ---------

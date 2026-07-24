@@ -1,12 +1,12 @@
 # Copilot instructions — TeslaUSB
 
 Binding working notes for any Copilot agent (CLI, cloud, code review) on this
-repo. The code-quality charter (`docs/03-CODE-QUALITY-CHARTER.md`) wins on any
-conflict; this file adds the operator directives below.
+repo. This file is the authority; the operator directives below are binding on
+every change.
 
 ## Core engineering principles (binding)
 
-These four disciplines govern every change; the charter still wins on any conflict.
+These four disciplines govern every change.
 
 ### 1. Think before coding
 
@@ -138,7 +138,8 @@ When unsure which tier applies, pick the higher one.**
   single-file surgical change (≲40 lines) with no behavior change to a daemon, a
   contract, or the recording path. → **Opus edits directly at medium effort.** No
   parallel second opinion, no separate review agent — self-review against the
-  five-axis checklist + the cheapest relevant test (unit and/or the one affected
+  five-axis checklist (correctness, readability, architecture, security,
+  performance) + the cheapest relevant test (unit and/or the one affected
   Playwright spec). Commit.
 - **Tier 2 — Medium risk.** A feature or fix within one module/screen that is
   well understood and touches no recording path, `gadgetd`/handoff,
@@ -175,7 +176,7 @@ The orchestrator is **Claude Opus 4.8**; it owns the session and routes work:
 - **Write code → `gpt-5.3-codex` (background sub-agent).** Substantive
   implementation (features, multi-file changes, porting v1 behavior) is delegated
   with a self-contained prompt: exact files, the contract, the constraints (this
-  file + charter), and the acceptance tests to pass. **Tier 1 changes Opus edits
+  file), and the acceptance tests to pass. **Tier 1 changes Opus edits
   directly; Tier 2–3 go to codex.** For a multi-step lane, keep **one persistent**
   background coder agent (multi-turn) rather than spawning a fresh stateless agent
   per micro-task — this stops re-transmitting files+contract+constraints every
@@ -194,20 +195,20 @@ Delegation routes work, not judgment: Opus verifies the coder's diff (builds/tes
 reads it) and reconciles review findings against the artifact rather than
 rubber-stamping them.
 
-## Implementation workflow — `docs/status.md` is the driver (binding)
+## Implementation workflow — one item at a time (binding)
 
-`docs/status.md` is the single source of truth for what remains to reach parity
-with `docs/Requirements.md`. Work it one item at a time through this loop; Opus
-runs the loop and routes each step per "Model division of labor":
+The operator directs which item to work next; run it through this loop, tracking
+the requirement it satisfies, progress, and the working breakdown as session
+`todos`/`todo_deps` and the session `plan.md`. Opus runs the loop and routes each
+step per "Model division of labor":
 
-1. **Select** the next unchecked `[ ]` item from `status.md`. Respect its gates
-   and the recommended build order — never start an item whose dependency
-   (`gated:F1/F3/C1/…`) is unmet; prefer the foundation slice before features.
-   Tier-C (operator/hardware-only) items are not started autonomously.
+1. **Select** the item the operator directs.
+   Respect its dependencies and a sensible build order — never start an item whose
+   dependency is unmet; prefer the foundation slice before features. Hardware-only
+   items are not started autonomously.
 2. **Plan (Opus).** Design the implementation and break it into verifiable tasks
-   (`todos`/`todo_deps`). **Check for an existing spec/task/ADR first** and
-   validate it still aligns with the open item; **if it has drifted, fix the
-   spec/task before coding.** Write one if none exists.
+   (`todos`/`todo_deps`). Capture the requirement it satisfies and the acceptance
+   criteria up front so the item can be verified independently.
 3. **Implement.** Tier 1: Opus edits directly. Tier 2–3: delegate the code to a
    `gpt-5.3-codex` sub-agent with the acceptance tests it must make pass.
 4. **Review (tier-scaled).** Tier 1: self-review against the five-axis checklist.
@@ -219,8 +220,9 @@ runs the loop and routes each step per "Model division of labor":
    any UI change — **scoped to the affected spec(s) during iteration, full suite
    once before commit** (see below); the hardware-test skill for device behavior.
    A box is checked only after a tested-successful run.
-6. **Update `status.md`.** Tick `[x]`, link the evidence (Playwright report /
-   `files/hw-results.md` / test name), and commit the status update with the change.
+6. **Record progress.** Mark the item done in the session `todos`/`plan.md`, link
+   the evidence (Playwright report / `files/hw-results.md` / test name), and commit
+   it with the change.
 
 ### Parallelism — max throughput, zero collisions
 
@@ -232,13 +234,13 @@ Run as many items in parallel as can proceed **without collision or rework**:
   module, same screen, the gadgetd handoff state machine, a shared contract),
   **serialize them.**
 - **Gates are hard ordering.** Never parallelize an item with the foundation it
-  is `gated:` on; encode this in `todo_deps`.
-- **One writer per shared artifact.** `status.md`, `plan.md`, and each spec/
+  depends on; encode this in `todo_deps`.
+- **One writer per shared artifact.** `plan.md` and any shared
   contract have a single writer; Opus serializes edits and merges sub-agent
   results.
 - **One self-contained coder lane per item**, each with its own files + tests;
   reviews fan out to GPT-5.5 per lane. Opus tracks lanes (`lanes`/`todos`),
-  reconciles, and updates `status.md` once per completed item.
+  reconciles, and records each completed item once (session `todos`/`plan.md`).
 - **When unsure whether two items collide, assume they do and serialize.**
 
 ## Problem-solving — parallel GPT-5.5 second opinion (Tier 3)
@@ -272,8 +274,9 @@ existing UAT suite under `spa/test/uat/` rather than starting from scratch.
 at one viewport with `UAT_FAST=1` for a fast inner loop. The full six-step
 protocol below — full suite, both viewports, perf + console + visual + wiring +
 report — is the **pre-commit gate, run once** before the change is marked done.
-Don't re-run 455×2 executions on every intermediate tweak; do run the full gate
-exactly once before commit, and always for Tier 3.
+Don't re-run the entire two-viewport suite (~546 executions) on every
+intermediate tweak; do run the full gate exactly once before commit, and always
+for Tier 3.
 
 For every UI-affecting change, the pre-commit gate asserts:
 

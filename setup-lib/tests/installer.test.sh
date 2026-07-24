@@ -67,12 +67,39 @@ assert_grep 'libcomposite' "${TESLAUSB_PREFIX}/etc/modules-load.d/teslausb-gadge
 assert_file_exists "${TESLAUSB_PREFIX}/etc/NetworkManager/conf.d/10-teslausb-wifi.conf" "install writes the NM Wi-Fi hardening drop-in (wifid §7.3)"
 assert_grep 'wifi\.powersave=2' "${TESLAUSB_PREFIX}/etc/NetworkManager/conf.d/10-teslausb-wifi.conf" "NM drop-in disables Wi-Fi power save (barrier #1)"
 assert_grep 'unmanaged-devices=interface-name:uap0' "${TESLAUSB_PREFIX}/etc/NetworkManager/conf.d/10-teslausb-wifi.conf" "NM drop-in keeps NM off the uap0 AP vif (barrier #4)"
+# --- system tuning (footprint/perf for the 512 MB Pi Zero 2 W) ---
+assert_grep 'gpu_mem=16' "${TESLAUSB_PREFIX}/boot/firmware/config.txt" "config.txt gains gpu_mem=16 (headless RAM reclaim)"
+assert_file_exists "${TESLAUSB_PREFIX}/etc/default/zramswap" "install writes the zram swap config"
+assert_grep 'ALGO=zstd'  "${TESLAUSB_PREFIX}/etc/default/zramswap" "zram config selects zstd"
+assert_grep 'PERCENT=50' "${TESLAUSB_PREFIX}/etc/default/zramswap" "zram config sizes to 50% RAM"
+assert_grep 'enable zramswap\.service'          "$SYSTEMCTL_LOG" "install enables zramswap"
+assert_grep 'disable dphys-swapfile\.service'   "$SYSTEMCTL_LOG" "install disables microSD dphys-swapfile"
+assert_grep 'install .*zram-tools'              "$APT_LOG"       "bootstrap apt-installs zram-tools"
+assert_file_exists "${TESLAUSB_PREFIX}/etc/systemd/journald.conf.d/10-teslausb.conf" "install writes the journald cap"
+assert_grep 'SystemMaxUse=64M' "${TESLAUSB_PREFIX}/etc/systemd/journald.conf.d/10-teslausb.conf" "journald cap bounds SystemMaxUse"
+assert_grep 'mask bluetooth\.service'    "$SYSTEMCTL_LOG" "install masks bluetooth"
+assert_grep 'mask triggerhappy\.service' "$SYSTEMCTL_LOG" "install masks triggerhappy"
+assert_grep 'mask ModemManager\.service' "$SYSTEMCTL_LOG" "install masks ModemManager"
+assert_nogrep 'mask avahi'                      "$SYSTEMCTL_LOG" "install NEVER masks avahi (mDNS lifeline)"
+assert_nogrep 'mask (wpa_supplicant|NetworkManager)' "$SYSTEMCTL_LOG" "install NEVER masks the Wi-Fi link"
+assert_file_exists "${TESLAUSB_PREFIX}/etc/sudoers.d/010_pi-nopasswd" "install writes passwordless-sudo drop-in"
+assert_grep 'pi ALL=\(ALL\) NOPASSWD:ALL' "${TESLAUSB_PREFIX}/etc/sudoers.d/010_pi-nopasswd" "sudoers grants pi passwordless sudo"
 if ls "${TESLAUSB_PREFIX}/boot/firmware/"config.txt.b1-backup-* >/dev/null 2>&1; then
     _ok "config.txt backup sidecar created"
 else
     _fail "config.txt backup sidecar created"
 fi
 cleanup_sandbox "$sbx"
+
+# A1c: the lifeline guard (defense-in-depth) refuses to mask/disable any unit that
+# provides the device's only remote access — even if a future edit adds one to the
+# mask list. Pure-function check, run in a separate bash process so sourcing
+# common.sh cannot perturb this test shell's sandbox state.
+_lifeline_rc() { bash "${HERE}/lib/lifeline-probe.sh" "$1" >/dev/null 2>&1; }
+_lifeline_rc NetworkManager.service; assert_eq "$?" 4 "assert_not_lifeline dies (EX_STEP) on NetworkManager.service"
+_lifeline_rc avahi-daemon;           assert_eq "$?" 4 "assert_not_lifeline dies on the bare avahi-daemon stem"
+_lifeline_rc wpa_supplicant.service; assert_eq "$?" 4 "assert_not_lifeline dies on wpa_supplicant.service"
+_lifeline_rc bluetooth.service;      assert_eq "$?" 0 "assert_not_lifeline allows a genuinely unnecessary unit"
 
 # A2b: already-configured bootstrap is idempotent and starts gadget immediately.
 new_sandbox; sbx="$SANDBOX"
@@ -228,6 +255,8 @@ assert_grep 'dr_mode=host' "${TESLAUSB_PREFIX}/boot/firmware/config.txt" "dry-ru
 assert_nogrep 'dtoverlay=dwc2,dr_mode=peripheral' "${TESLAUSB_PREFIX}/boot/firmware/config.txt" "dry-run does not append dwc2 overlay"
 assert_file_absent "${TESLAUSB_PREFIX}/etc/NetworkManager/conf.d/10-teslausb-wifi.conf" "dry-run does not write the NM Wi-Fi drop-in"
 assert_file_absent "${TESLAUSB_PREFIX}/etc/modules-load.d/teslausb-gadget.conf" "dry-run does not write modules-load file"
+assert_file_absent "${TESLAUSB_PREFIX}/etc/default/zramswap" "dry-run does not write zram config"
+assert_file_absent "${TESLAUSB_PREFIX}/etc/sudoers.d/010_pi-nopasswd" "dry-run does not write sudoers drop-in"
 cleanup_sandbox "$sbx"
 
 # ============================================================================

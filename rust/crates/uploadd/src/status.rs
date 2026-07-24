@@ -71,7 +71,7 @@ impl UploadItemStatus {
     #[must_use]
     pub fn from_item(item: &QueueItem) -> Self {
         Self {
-            id: item.id.0,
+            id: item.archive_item_id.0,
             state: state_name(item.state),
             category: category_name(item.category),
             bytes_uploaded: item.bytes_uploaded,
@@ -115,20 +115,26 @@ mod tests {
     use super::CloudUploadStatus;
     use crate::priority::UploadCategory;
     use crate::queue::{QueueItem, UploadQueue};
-    use crate::source::{ArchiveItemId, ContentHash};
+    use crate::queue::QueueKey;
+    use crate::source::ArchiveItemId;
     use crate::throttle::{StoragePressure, ThrottleSnapshot, WifiThrottle};
+    use crate::transfer::{VerifyAlg, VerifySpec};
 
     #[test]
     fn status_projects_queue_and_gate() {
         let mut q = UploadQueue::default();
         q.enqueue(QueueItem::new(
+            QueueKey::new("dest-a", "remote/1.mp4"),
             ArchiveItemId(1),
+            "clip/1.mp4",
             "clips/1.mp4",
-            "remote/1.mp4",
             UploadCategory::EventSentry,
             0,
             1000,
-            ContentHash::new([0u8; 32]),
+            VerifySpec::Native {
+                alg: VerifyAlg::Sha256,
+                expected: "0".repeat(64),
+            },
         ));
         let snap = ThrottleSnapshot {
             wifi: WifiThrottle::closed(),

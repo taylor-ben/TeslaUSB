@@ -487,9 +487,18 @@ mod tests {
             Ok(value) => value,
             Err(err) => panic!("render_indexd_health should produce valid json: {err}"),
         };
-        assert_eq!(value["schema"], 1);
-        assert_eq!(value["updated_at"], 1234);
-        assert_eq!(value["running"], true);
+        assert_eq!(
+            value.get("schema").and_then(serde_json::Value::as_i64),
+            Some(1)
+        );
+        assert_eq!(
+            value.get("updated_at").and_then(serde_json::Value::as_i64),
+            Some(1234)
+        );
+        assert_eq!(
+            value.get("running").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
     }
 
     #[test]

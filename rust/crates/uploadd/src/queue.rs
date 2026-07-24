@@ -8,8 +8,9 @@
 //!   transitions over it. A transition mutates *only* in-memory state; the engine
 //!   persists each one through the [`QueueStore`] seam so it survives a crash.
 //! * [`UploadQueue`] — a pure in-memory index over the items the live daemon
-//!   hydrates from the store at boot. It enforces **idempotent enqueue** (an
-//!   item id is never duplicated) and computes the **priority-ordered** next item
+//!   hydrates from the store at boot. It enforces **idempotent enqueue** (a
+//!   child-object queue key is never duplicated) and computes the
+//!   **priority-ordered** next item
 //!   to work, treating a leftover `InProgress` item (a crash mid-transfer) as
 //!   *resumable* rather than restarting it from scratch.
 //!
@@ -20,8 +21,8 @@
 //!
 //! # Why this is idempotent / non-duplicating
 //!
-//! - **Enqueue** dedupes on [`ArchiveItemId`]: re-enqueuing an item already in
-//!   the queue is a no-op, so a scanner that re-offers the same item cannot
+//! - **Enqueue** dedupes on [`QueueKey`]: re-enqueuing an item already in the
+//!   queue is a no-op, so a scanner that re-offers the same child object cannot
 //!   create a second upload.
 //! - **Resume** continues an `InProgress` item from its persisted
 //!   [`QueueItem::bytes_uploaded`] checkpoint; it never appends a duplicate row.
@@ -33,7 +34,8 @@
 
 use crate::error::IndexError;
 use crate::priority::{PriorityKey, PriorityPolicy, UploadCategory};
-use crate::source::{ArchiveItemId, ContentHash};
+use crate::source::ArchiveItemId;
+use crate::transfer::VerifySpec;
 
 /// The lifecycle state of one queued upload ([`uploadd.md`] §2.1).
 ///
@@ -51,32 +53,55 @@ pub enum UploadState {
     Failed,
 }
 
+/// Stable child-object queue identity (`cloud_upload_queue` PK).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct QueueKey {
+    /// Which configured destination this row belongs to.
+    pub destination_id: String,
+    /// Canonical object key on that destination.
+    pub remote_key: String,
+}
+
+impl QueueKey {
+    /// Construct a key from destination + remote object key.
+    #[must_use]
+    pub fn new(destination_id: impl Into<String>, remote_key: impl Into<String>) -> Self {
+        Self {
+            destination_id: destination_id.into(),
+            remote_key: remote_key.into(),
+        }
+    }
+}
+
 /// One item in the durable upload queue.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueueItem {
-    /// Stable archive-item identity (the dedupe key for idempotent enqueue).
-    pub id: ArchiveItemId,
+    /// Child-object queue identity (`destination_id`, `remote_key`).
+    pub key: QueueKey,
+    /// Parent archive-item id (lease subject).
+    pub archive_item_id: ArchiveItemId,
+    /// Child discriminator under the parent event.
+    pub child_key: String,
     /// Item-relative source path under the archive root (resolved to a guarded
     /// [`crate::source::ArchivePath`] at transfer time — never an absolute/LUN
     /// path).
     pub source_rel: String,
-    /// Destination object key on the remote.
-    pub remote_key: String,
     /// User-policy class, for prioritization.
     pub category: UploadCategory,
     /// Enqueue sequence (monotonic), the FIFO tie-break within a priority class.
     pub seq: u64,
     /// Total source size in bytes.
     pub total_bytes: u64,
-    /// Expected whole-file content hash, checked against the remote digest for
-    /// integrity.
-    pub expected_hash: ContentHash,
+    /// Per-item verification contract.
+    pub verify: VerifySpec,
     /// Current lifecycle state.
     pub state: UploadState,
     /// Durable resume checkpoint: bytes confirmed uploaded so far.
     pub bytes_uploaded: u64,
     /// Number of transfer attempts made so far.
     pub attempts: u32,
+    /// Backoff gate (`unix secs`), `None` = immediately eligible.
+    pub not_before: Option<i64>,
     /// Last failure reason, for `/api/cloud` diagnostics.
     pub last_error: Option<String>,
 }
@@ -84,26 +109,30 @@ pub struct QueueItem {
 impl QueueItem {
     /// Create a freshly-`Queued` item.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        id: ArchiveItemId,
+        key: QueueKey,
+        archive_item_id: ArchiveItemId,
+        child_key: impl Into<String>,
         source_rel: impl Into<String>,
-        remote_key: impl Into<String>,
         category: UploadCategory,
         seq: u64,
         total_bytes: u64,
-        expected_hash: ContentHash,
+        verify: VerifySpec,
     ) -> Self {
         Self {
-            id,
+            key,
+            archive_item_id,
+            child_key: child_key.into(),
             source_rel: source_rel.into(),
-            remote_key: remote_key.into(),
             category,
             seq,
             total_bytes,
-            expected_hash,
+            verify,
             state: UploadState::Queued,
             bytes_uploaded: 0,
             attempts: 0,
+            not_before: None,
             last_error: None,
         }
     }
@@ -117,16 +146,23 @@ impl QueueItem {
         }
     }
 
-    /// Whether this item is eligible to be worked now, given `max_attempts`.
-    /// `Queued` and `InProgress` (resume) are always ready; `Failed` is ready
-    /// only while it has retries left; `Done` is never ready.
+    /// Whether this item is retryable by attempt policy alone.
     #[must_use]
-    pub fn is_ready(&self, max_attempts: u32) -> bool {
+    pub fn is_retryable(&self, max_attempts: u32) -> bool {
         match self.state {
             UploadState::Queued | UploadState::InProgress => true,
             UploadState::Failed => self.attempts < max_attempts,
             UploadState::Done => false,
         }
+    }
+
+    /// Whether this item is eligible to be worked now, given `max_attempts` and
+    /// `now_unix_s`.
+    /// `Queued` and `InProgress` (resume) are always ready; `Failed` is ready
+    /// only while it has retries left; `Done` is never ready.
+    #[must_use]
+    pub fn is_ready(&self, max_attempts: u32, now_unix_s: i64) -> bool {
+        self.not_before.is_none_or(|at| at <= now_unix_s) && self.is_retryable(max_attempts)
     }
 
     /// Transition into `InProgress` to begin (or resume) a transfer. Preserves
@@ -170,7 +206,7 @@ pub struct UploadQueue {
 }
 
 impl UploadQueue {
-    /// Build a queue from a hydrated set of items (deduping on id, keeping the
+    /// Build a queue from a hydrated set of items (deduping on queue key, keeping the
     /// first occurrence — the store should never contain duplicates, but this
     /// keeps the invariant total).
     #[must_use]
@@ -183,35 +219,41 @@ impl UploadQueue {
     }
 
     /// Idempotently enqueue `item`. Returns `true` if it was added, `false` if an
-    /// item with the same id was already present (a no-op — no duplicate upload).
+    /// item with the same queue key was already present (a no-op — no duplicate
+    /// upload).
     pub fn enqueue(&mut self, item: QueueItem) -> bool {
-        if self.items.iter().any(|existing| existing.id == item.id) {
+        if self.items.iter().any(|existing| existing.key == item.key) {
             return false;
         }
         self.items.push(item);
         true
     }
 
-    /// The id of the highest-priority ready item, or `None` if nothing is ready.
+    /// The key of the highest-priority ready item, or `None` if nothing is ready.
     /// Order is total: priority class first, then FIFO by enqueue sequence.
     #[must_use]
-    pub fn select_next(&self, policy: &PriorityPolicy, max_attempts: u32) -> Option<ArchiveItemId> {
+    pub fn select_next(
+        &self,
+        policy: &PriorityPolicy,
+        max_attempts: u32,
+        now_unix_s: i64,
+    ) -> Option<QueueKey> {
         self.items
             .iter()
-            .filter(|item| item.is_ready(max_attempts))
+            .filter(|item| item.is_ready(max_attempts, now_unix_s))
             .min_by_key(|item| item.priority_key(policy))
-            .map(|item| item.id)
+            .map(|item| item.key.clone())
     }
 
-    /// Borrow an item by id.
+    /// Borrow an item by queue key.
     #[must_use]
-    pub fn get(&self, id: ArchiveItemId) -> Option<&QueueItem> {
-        self.items.iter().find(|item| item.id == id)
+    pub fn get(&self, key: &QueueKey) -> Option<&QueueItem> {
+        self.items.iter().find(|item| &item.key == key)
     }
 
-    /// Mutably borrow an item by id.
-    pub fn get_mut(&mut self, id: ArchiveItemId) -> Option<&mut QueueItem> {
-        self.items.iter_mut().find(|item| item.id == id)
+    /// Mutably borrow an item by queue key.
+    pub fn get_mut(&mut self, key: &QueueKey) -> Option<&mut QueueItem> {
+        self.items.iter_mut().find(|item| &item.key == key)
     }
 
     /// All items, in insertion order (for status snapshots).
@@ -234,7 +276,7 @@ pub trait QueueStore {
     fn load(&self) -> Result<Vec<QueueItem>, IndexError>;
 
     /// Durably upsert the current state of `item` (state, checkpoint, attempts).
-    /// Keyed on [`QueueItem::id`], so re-applying is idempotent.
+    /// Keyed on [`QueueItem::key`], so re-applying is idempotent.
     ///
     /// # Errors
     /// Propagates an [`IndexError`] if the persist RPC/transaction fails.
@@ -244,28 +286,36 @@ pub trait QueueStore {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use super::{QueueItem, UploadQueue, UploadState};
+    use super::{QueueItem, QueueKey, QueueStore, UploadQueue, UploadState};
+    use crate::error::IndexError;
     use crate::priority::{PriorityPolicy, UploadCategory};
-    use crate::source::{ArchiveItemId, ContentHash};
+    use crate::source::ArchiveItemId;
+    use crate::transfer::{VerifyAlg, VerifySpec};
 
     fn item(id: i64, cat: UploadCategory, seq: u64) -> QueueItem {
         QueueItem::new(
+            QueueKey::new("dest-a", format!("remote/{id}.mp4")),
             ArchiveItemId(id),
+            format!("clip/{id}.mp4"),
             format!("clips/{id}.mp4"),
-            format!("remote/{id}.mp4"),
             cat,
             seq,
             1000,
-            ContentHash::new([0u8; 32]),
+            VerifySpec::Native {
+                alg: VerifyAlg::Sha256,
+                expected: format!("{id:064x}"),
+            },
         )
     }
 
     #[test]
-    fn enqueue_is_idempotent_on_id() {
+    fn enqueue_is_idempotent_on_queue_key() {
         let mut q = UploadQueue::default();
         assert!(q.enqueue(item(1, UploadCategory::Bulk, 0)));
-        // Same id, even with different details, must not duplicate.
-        assert!(!q.enqueue(item(1, UploadCategory::EventSentry, 5)));
+        let mut dup = item(2, UploadCategory::EventSentry, 5);
+        dup.key = QueueKey::new("dest-a", "remote/1.mp4");
+        // Same key, even with different parent id/details, must not duplicate.
+        assert!(!q.enqueue(dup));
         assert_eq!(q.items().len(), 1);
     }
 
@@ -278,7 +328,10 @@ mod tests {
         q.enqueue(item(3, UploadCategory::EventSentry, 2)); // newest, but events first
         q.enqueue(item(4, UploadCategory::EventSentry, 3));
         // Event id=3 (older event) before id=4, both before trip, before bulk.
-        assert_eq!(q.select_next(&policy, 5), Some(ArchiveItemId(3)));
+        assert_eq!(
+            q.select_next(&policy, 5, 100),
+            Some(QueueKey::new("dest-a", "remote/3.mp4"))
+        );
     }
 
     #[test]
@@ -286,8 +339,9 @@ mod tests {
         let policy = PriorityPolicy::default();
         let mut q = UploadQueue::default();
         q.enqueue(item(1, UploadCategory::EventSentry, 0));
-        q.get_mut(ArchiveItemId(1)).unwrap().complete();
-        assert_eq!(q.select_next(&policy, 5), None);
+        let key = QueueKey::new("dest-a", "remote/1.mp4");
+        q.get_mut(&key).unwrap().complete();
+        assert_eq!(q.select_next(&policy, 5, 100), None);
     }
 
     #[test]
@@ -295,17 +349,18 @@ mod tests {
         let policy = PriorityPolicy::default();
         let mut q = UploadQueue::default();
         q.enqueue(item(1, UploadCategory::Trip, 0));
-        let it = q.get_mut(ArchiveItemId(1)).unwrap();
+        let key = QueueKey::new("dest-a", "remote/1.mp4");
+        let it = q.get_mut(&key).unwrap();
         it.fail("net blip", false);
         assert_eq!(it.attempts, 1);
-        assert_eq!(q.select_next(&policy, 5), Some(ArchiveItemId(1)));
+        assert_eq!(q.select_next(&policy, 5, 100), Some(key.clone()));
         // Exhaust retries.
         for _ in 0..4 {
-            q.get_mut(ArchiveItemId(1)).unwrap().fail("again", false);
+            q.get_mut(&key).unwrap().fail("again", false);
         }
-        assert_eq!(q.get(ArchiveItemId(1)).unwrap().attempts, 5);
+        assert_eq!(q.get(&key).unwrap().attempts, 5);
         assert_eq!(
-            q.select_next(&policy, 5),
+            q.select_next(&policy, 5, 100),
             None,
             "terminal Failed not selected"
         );
@@ -323,14 +378,12 @@ mod tests {
         // "Restart": rebuild the queue from the persisted snapshot.
         let q = UploadQueue::from_items(persisted);
         assert_eq!(q.items().len(), 1, "no duplicate row on resume");
-        let resumed = q.get(ArchiveItemId(1)).unwrap();
+        let key = QueueKey::new("dest-a", "remote/1.mp4");
+        let resumed = q.get(&key).unwrap();
         assert_eq!(resumed.state, UploadState::InProgress);
         assert_eq!(resumed.bytes_uploaded, 400, "resumes from checkpoint");
         // And it is still selectable to be resumed.
-        assert_eq!(
-            q.select_next(&PriorityPolicy::default(), 5),
-            Some(ArchiveItemId(1))
-        );
+        assert_eq!(q.select_next(&PriorityPolicy::default(), 5, 100), Some(key));
     }
 
     #[test]
@@ -344,5 +397,62 @@ mod tests {
         it.checkpoint(900);
         it.fail("integrity mismatch", true);
         assert_eq!(it.bytes_uploaded, 0, "integrity failure resets checkpoint");
+    }
+
+    #[test]
+    fn select_next_skips_not_before_until_due() {
+        let policy = PriorityPolicy::default();
+        let mut q = UploadQueue::default();
+        let mut blocked = item(1, UploadCategory::EventSentry, 0);
+        blocked.not_before = Some(200);
+        q.enqueue(blocked);
+        q.enqueue(item(2, UploadCategory::Trip, 1));
+
+        assert_eq!(
+            q.select_next(&policy, 5, 100),
+            Some(QueueKey::new("dest-a", "remote/2.mp4"))
+        );
+        assert_eq!(
+            q.select_next(&policy, 5, 200),
+            Some(QueueKey::new("dest-a", "remote/1.mp4"))
+        );
+    }
+
+    #[derive(Default)]
+    struct FakeStore {
+        items: Vec<QueueItem>,
+    }
+
+    impl QueueStore for std::cell::RefCell<FakeStore> {
+        fn load(&self) -> Result<Vec<QueueItem>, IndexError> {
+            Ok(self.borrow().items.clone())
+        }
+
+        fn persist(&self, item: &QueueItem) -> Result<(), IndexError> {
+            let mut inner = self.borrow_mut();
+            if let Some(slot) = inner.items.iter_mut().find(|existing| existing.key == item.key) {
+                *slot = item.clone();
+            } else {
+                inner.items.push(item.clone());
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn store_round_trips_and_upserts_by_queue_key() {
+        let store = std::cell::RefCell::new(FakeStore::default());
+        let mut first = item(1, UploadCategory::Trip, 0);
+        first.not_before = Some(1234);
+        store.persist(&first).unwrap();
+
+        let mut update = first.clone();
+        update.archive_item_id = ArchiveItemId(9);
+        update.bytes_uploaded = 777;
+        update.last_error = Some("retry".to_owned());
+        store.persist(&update).unwrap();
+
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded, vec![update]);
     }
 }

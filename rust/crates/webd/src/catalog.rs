@@ -20,9 +20,15 @@ use rusqlite::{Connection, OpenFlags};
 ///
 /// v4 adds the internal `front_parse_attempts` provenance table (per-front-clip
 /// parse state) and v5 adds retry/backoff columns (`attempt_count`,
-/// `next_retry_at`) to that same table; `webd` never reads it, so v4 and v5 are
-/// fully read-compatible with the v3 surface this build queries.
-const SUPPORTED_SCHEMA_VERSION: i64 = 5;
+/// `next_retry_at`) to that same table; v6 adds the cloud-sync persistence
+/// tables (`cloud_upload_queue`, `cloud_synced_files`, `cloud_sync_history`,
+/// `cloud_meta`, `cloud_provider_config`, `cloud_upload_attempts`); v7 adds the
+/// sealed-upload-set durability tables (`cloud_parent_upload_sets`,
+/// `cloud_parent_upload_set_children`), nullable `archive_items` durability
+/// columns, and the durable-guard triggers. `webd` never reads any of them (and
+/// opens the catalog read-only, so the triggers never fire), so v4–v7 are fully
+/// read-compatible with the v3 surface this build queries.
+const SUPPORTED_SCHEMA_VERSION: i64 = 7;
 
 /// How long a read-only connection waits on a locked database before erroring.
 /// WAL readers rarely block, but this is cheap insurance against a checkpoint

@@ -137,7 +137,7 @@ configure_boot_config() {
 
     tmp="$(mktemp)"
     cat "$cfg" > "$tmp"
-    printf '\n%s\n[all]\ndtoverlay=dwc2,dr_mode=peripheral\n%s\n' \
+    printf '\n%s\n[all]\ndtoverlay=dwc2,dr_mode=peripheral\ngpu_mem=16\n%s\n' \
         "$TESLAUSB_BOOT_MARKER_BEGIN" "$TESLAUSB_BOOT_MARKER_END" >> "$tmp"
     mut_install_file "$tmp" "$cfg" 0644
     rm -f "$tmp"
@@ -198,5 +198,106 @@ EOF
     fi
 
     mut_install_file "$tmp" "$TESLAUSB_NM_WIFI_CONF" 0644
+    rm -f "$tmp"
+}
+
+# configure_system_tuning — footprint/perf tuning applied at install time so a
+# fresh image comes up optimized for the 512 MB in-car recorder. Each step is an
+# idempotent managed drop routed through the common.sh chokepoints (content-
+# compared, so a converged re-run rewrites nothing); all take effect on the
+# post-install reboot. gpu_mem reclaim is handled separately in the managed boot
+# block (configure_boot_config). noatime is deliberately omitted — see common.sh.
+configure_system_tuning() {
+    configure_swap
+    configure_journald_cap
+    mask_unnecessary_services
+    configure_sudoers_nopasswd
+}
+
+# configure_swap — put swap on zram (compressed RAM), NOT the microSD. On the
+# 512 MB Pi Zero 2 W this gives OOM headroom without the write-wear (and slow
+# reads) of the stock dphys-swapfile. zram-tools (installed via required-
+# packages.list) reads /etc/default/zramswap and runs zramswap.service; we enable
+# it and disable the stock dphys-swapfile so swap is zram-only. Enable/disable are
+# NOT --now (defer to the post-install reboot) to avoid churning swap mid-install.
+configure_swap() {
+    local tmp
+    tmp="$(mktemp)"
+    cat > "$tmp" <<'EOF'
+# TeslaUSB B-1: swap on zram (compressed RAM), NOT the microSD (managed).
+# 512 MB Pi Zero 2 W: ~50% of RAM as zstd-compressed zram holds far more than its
+# footprint, giving OOM headroom with zero microSD swap wear.
+ALGO=zstd
+PERCENT=50
+PRIORITY=100
+EOF
+    if [ -e "${TESLAUSB_ZRAMSWAP_CONF}" ] && cmp -s "$tmp" "${TESLAUSB_ZRAMSWAP_CONF}"; then
+        rm -f "$tmp"
+    else
+        mut_install_file "$tmp" "$TESLAUSB_ZRAMSWAP_CONF" 0644
+        rm -f "$tmp"
+    fi
+    systemctl_do enable zramswap.service \
+        || log_warn "could not enable zramswap.service; device will boot without zram swap"
+    systemctl_do disable dphys-swapfile.service \
+        || log_warn "could not disable dphys-swapfile.service (absent or already disabled)"
+}
+
+# configure_journald_cap — bound the persistent journal so runaway logging can
+# neither fill nor wear out the microSD. Keeps recent history (unlike volatile
+# storage, which would lose post-crash logs on a remote device) but caps total +
+# per-file size. Applies on the next boot; journald is not restarted mid-install.
+configure_journald_cap() {
+    local tmp
+    tmp="$(mktemp)"
+    cat > "$tmp" <<'EOF'
+# TeslaUSB B-1: bound journald's microSD footprint (managed).
+[Journal]
+SystemMaxUse=64M
+SystemMaxFileSize=16M
+EOF
+    if [ -e "${TESLAUSB_JOURNALD_CONF}" ] && cmp -s "$tmp" "${TESLAUSB_JOURNALD_CONF}"; then
+        rm -f "$tmp"
+        return 0
+    fi
+    mut_install_file "$tmp" "$TESLAUSB_JOURNALD_CONF" 0644
+    rm -f "$tmp"
+}
+
+# mask_unnecessary_services — shed daemons a headless in-car recorder never uses,
+# freeing RAM/CPU. STRICTLY the lifeline-safe set (TESLAUSB_MASK_SERVICES): never
+# avahi (mDNS cybertruckusb.local) nor wpa_supplicant / NetworkManager (the Wi-Fi
+# link). `mask` (not just disable) also blocks socket/dbus activation. Idempotent;
+# a missing unit is fine (mask still lays down the /dev/null override).
+mask_unnecessary_services() {
+    local svc
+    for svc in $TESLAUSB_MASK_SERVICES; do
+        assert_not_lifeline "$svc"
+        systemctl_do mask "$svc" \
+            || log_warn "could not mask ${svc} (absent or masking failed)"
+    done
+}
+
+# configure_sudoers_nopasswd — grant the admin user passwordless sudo so a
+# re-imaged device self-configures for autonomous management. The imaging-set
+# password bootstraps the FIRST `sudo ./setup.sh`; this drop-in makes subsequent
+# sudo password-free. Validated with `visudo -cf` BEFORE install (a malformed
+# sudoers file would break sudo entirely, re-creating the very lockout this
+# recovers from), installed 0440 as sudo requires.
+configure_sudoers_nopasswd() {
+    local tmp
+    command -v visudo >/dev/null 2>&1 \
+        || die "$EX_STEP" "visudo not found; refusing to install an unvalidated sudoers drop-in"
+    tmp="$(mktemp)"
+    printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$TESLAUSB_ADMIN_USER" > "$tmp"
+    if ! visudo -cf "$tmp" >/dev/null 2>&1; then
+        rm -f "$tmp"
+        die "$EX_STEP" "generated sudoers drop-in failed visudo validation"
+    fi
+    if [ -e "${TESLAUSB_SUDOERS_NOPASSWD}" ] && cmp -s "$tmp" "${TESLAUSB_SUDOERS_NOPASSWD}"; then
+        rm -f "$tmp"
+        return 0
+    fi
+    mut_install_file "$tmp" "$TESLAUSB_SUDOERS_NOPASSWD" 0440
     rm -f "$tmp"
 }

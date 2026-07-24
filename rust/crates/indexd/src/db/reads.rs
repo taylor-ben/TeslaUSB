@@ -498,7 +498,7 @@ mod tests {
 
         let rows = list_eviction_candidates(&conn, 1_000, 1_000, false, 100).expect("query");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].id, item);
+        assert_eq!(rows.first().map(|row| row.id), Some(item));
     }
 
     fn insert_linked_recent_clip_sentry_flagged(

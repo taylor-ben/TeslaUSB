@@ -52,9 +52,9 @@ use crate::error::EngineError;
 use crate::lease::{LeaseClient, LeaseGen, LeaseGrant, LeaseId, LeaseKind, RenewResult};
 use crate::queue::{QueueItem, QueueStore};
 use crate::serve::UploadProcessor;
-use crate::source::{ArchiveItemId, ArchivePath, ArchiveRoot, ContentHash};
+use crate::source::{ArchiveItemId, ArchivePath, ArchiveRoot};
 use crate::throttle::{ThrottleSource, UploadGate};
-use crate::transfer::{Integrity, verify_digest};
+use crate::transfer::{Integrity, RemoteVerify, VerifyAlg, VerifySpec, verify_digest};
 
 /// Captured result of one external command invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,11 +172,11 @@ impl RcloneUploadEngine<'_> {
             Err(err) => return self.fail(item, &format!("source path rejected: {err}"), false),
         };
 
-        let held = match self.acquire(item.id) {
+        let held = match self.acquire(item.archive_item_id) {
             Ok(held) => held,
             Err(reason) => {
                 return Ok(StepOutcome::SkippedLeaseDenied {
-                    item: item.id,
+                    item: item.archive_item_id,
                     reason,
                 });
             }
@@ -237,11 +237,12 @@ impl RcloneUploadEngine<'_> {
         // hashsum so a single TTL covers both halves. See the module-level note
         // on the mid-copy renewal limitation.
         self.renew(held)?;
-        let remote_digest = self.remote_hash(item)?;
-        match verify_digest(item.expected_hash, remote_digest) {
+        let remote_verify = self.remote_verify(item)?;
+        match verify_digest(&item.verify, &remote_verify, item.total_bytes) {
             Integrity::Verified => Ok(()),
             Integrity::Corrupt => Err(RcloneStop::Corrupt(
-                "integrity check failed: remote digest does not match expected".to_owned(),
+                "integrity check failed: remote verification did not match expected spec"
+                    .to_owned(),
             )),
         }
     }
@@ -256,7 +257,7 @@ impl RcloneUploadEngine<'_> {
         let mut args = self.base_args();
         args.push("copyto".to_owned());
         args.push(path.as_str().to_owned());
-        args.push(self.remote_dest(&item.remote_key));
+        args.push(self.remote_dest(&item.key.remote_key));
         args.push("--bwlimit".to_owned());
         // The `B` suffix makes `rclone` read the limit as bytes/sec (a bare
         // number would be KiB/sec); this is the same cap `wifid` enforces in the
@@ -276,12 +277,26 @@ impl RcloneUploadEngine<'_> {
         Ok(())
     }
 
-    /// `rclone [--config C] hashsum sha256 <remote:key>`, parsed to a digest.
-    fn remote_hash(&self, item: &QueueItem) -> Result<ContentHash, RcloneStop> {
+    fn remote_verify(&self, item: &QueueItem) -> Result<RemoteVerify, RcloneStop> {
+        match &item.verify {
+            VerifySpec::Native { alg, .. } => {
+                let value = self.remote_hashsum(item, *alg)?;
+                Ok(RemoteVerify::Native { alg: *alg, value })
+            }
+            VerifySpec::CopyIntegrity => {
+                let size_bytes = self.remote_size(item)?;
+                Ok(RemoteVerify::CopyIntegrity { size_bytes })
+            }
+        }
+    }
+
+    /// `rclone [--config C] hashsum <alg> <remote:key>`, parsed to the first hash
+    /// token.
+    fn remote_hashsum(&self, item: &QueueItem, alg: VerifyAlg) -> Result<String, RcloneStop> {
         let mut args = self.base_args();
         args.push("hashsum".to_owned());
-        args.push("sha256".to_owned());
-        args.push(self.remote_dest(&item.remote_key));
+        args.push(alg.to_string());
+        args.push(self.remote_dest(&item.key.remote_key));
         let out = self
             .runner
             .run(&self.remote.binary, &args)
@@ -293,9 +308,34 @@ impl RcloneUploadEngine<'_> {
                 first_line(&out.stderr)
             )));
         }
-        parse_sha256(&out.stdout).ok_or_else(|| {
+        parse_hashsum_value(&out.stdout).ok_or_else(|| {
             RcloneStop::Recoverable(format!(
                 "could not parse rclone hashsum output: {:?}",
+                first_line(&out.stdout)
+            ))
+        })
+    }
+
+    /// `rclone [--config C] size --json <remote:key>`, parsed to bytes.
+    fn remote_size(&self, item: &QueueItem) -> Result<u64, RcloneStop> {
+        let mut args = self.base_args();
+        args.push("size".to_owned());
+        args.push("--json".to_owned());
+        args.push(self.remote_dest(&item.key.remote_key));
+        let out = self
+            .runner
+            .run(&self.remote.binary, &args)
+            .map_err(RcloneStop::Recoverable)?;
+        if out.status != 0 {
+            return Err(RcloneStop::Recoverable(format!(
+                "rclone size exited {}: {}",
+                out.status,
+                first_line(&out.stderr)
+            )));
+        }
+        parse_size_bytes(&out.stdout).ok_or_else(|| {
+            RcloneStop::Recoverable(format!(
+                "could not parse rclone size output: {:?}",
                 first_line(&out.stdout)
             ))
         })
@@ -316,11 +356,11 @@ impl RcloneUploadEngine<'_> {
     fn finish_verified(&self, item: &mut QueueItem) -> Result<StepOutcome, EngineError> {
         // Durability is the only authority `uploadd` asserts; it never deletes.
         // The mark is idempotent, so a crash before the persist re-marks safely.
-        self.durability.mark_uploaded_verified(item.id)?;
+        self.durability.mark_uploaded_verified(item.archive_item_id)?;
         item.complete();
         self.queue_store.persist(item)?;
         Ok(StepOutcome::Uploaded {
-            item: item.id,
+            item: item.archive_item_id,
             bytes: item.total_bytes,
         })
     }
@@ -334,14 +374,14 @@ impl RcloneUploadEngine<'_> {
     ) -> Result<StepOutcome, EngineError> {
         item.fail(reason, reset_offset);
         self.queue_store.persist(item)?;
-        if item.is_ready(self.cfg.retry.max_attempts) {
+        if item.is_retryable(self.cfg.retry.max_attempts) {
             Ok(StepOutcome::Retry {
-                item: item.id,
+                item: item.archive_item_id,
                 reason: reason.to_owned(),
             })
         } else {
             Ok(StepOutcome::Exhausted {
-                item: item.id,
+                item: item.archive_item_id,
                 reason: reason.to_owned(),
             })
         }
@@ -368,34 +408,19 @@ fn first_line(s: &str) -> String {
     s.lines().next().unwrap_or("").trim().to_owned()
 }
 
-/// Parse the leading 64-hex-character token of an `rclone hashsum sha256` line
-/// (`"<hex>  <path>"`) into a 32-byte [`ContentHash`]. Returns `None` if the
-/// token is absent, the wrong length, or not valid hex.
-fn parse_sha256(stdout: &str) -> Option<ContentHash> {
+/// Parse the leading hashsum token from one `rclone hashsum` output line
+/// (`"<hash>  <path>"`).
+fn parse_hashsum_value(stdout: &str) -> Option<String> {
     let token = stdout.split_whitespace().next()?;
-    if token.len() != 64 {
+    if token.is_empty() || token.len() > 256 {
         return None;
     }
-    let mut bytes = [0u8; 32];
-    let mut slots = bytes.iter_mut();
-    let mut hexits = token.bytes();
-    loop {
-        let Some(slot) = slots.next() else { break };
-        let hi = hex_val(hexits.next()?)?;
-        let lo = hex_val(hexits.next()?)?;
-        *slot = (hi << 4) | lo;
-    }
-    Some(ContentHash::new(bytes))
+    Some(token.to_owned())
 }
 
-/// One hex digit to its nibble value, or `None` if not a hex character.
-fn hex_val(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    }
+fn parse_size_bytes(stdout: &str) -> Option<u64> {
+    let value: serde_json::Value = serde_json::from_str(stdout).ok()?;
+    value.get("bytes")?.as_u64()
 }
 
 #[cfg(test)]
@@ -417,38 +442,37 @@ mod tests {
         LeaseClient, LeaseGen, LeaseGrant, LeaseId, LeaseKind, ReleaseResult, RenewResult,
     };
     use crate::priority::UploadCategory;
-    use crate::queue::{QueueItem, QueueStore, UploadState};
-    use crate::source::{ArchiveItemId, ArchiveRoot, ContentHash};
+    use crate::queue::{QueueItem, QueueKey, QueueStore, UploadState};
+    use crate::source::{ArchiveItemId, ArchiveRoot};
     use crate::throttle::{
         LinkMode, PauseAction, PauseReason, StoragePressure, ThrottleSnapshot, ThrottleSource,
         WifiThrottle,
     };
+    use crate::transfer::{VerifyAlg, VerifySpec};
 
-    /// 32 bytes of `0x07` and its lowercase hex string, used as the expected hash
-    /// and the matching remote digest for a verified transfer.
-    fn expected_hash() -> ContentHash {
-        ContentHash::new([0x07u8; 32])
+    fn expected_sha256() -> String {
+        "07".repeat(32)
     }
 
-    fn hex_of(h: &ContentHash) -> String {
-        let mut s = String::with_capacity(64);
-        for b in h.0 {
-            s.push_str(&format!("{b:02x}"));
+    fn verify_sha256() -> VerifySpec {
+        VerifySpec::Native {
+            alg: VerifyAlg::Sha256,
+            expected: expected_sha256(),
         }
-        s
     }
 
-    /// Scripted runner: returns a chosen [`CommandOutput`] for `copyto` and for
-    /// `hashsum`, and records every invocation's args.
+    /// Scripted runner: returns chosen outputs for `copyto` / `hashsum` / `size`,
+    /// and records every invocation's args.
     struct FakeRunner {
         copyto: CommandOutput,
         hashsum: CommandOutput,
+        size: CommandOutput,
         spawn_err: Option<String>,
         calls: RefCell<Vec<Vec<String>>>,
     }
 
     impl FakeRunner {
-        fn ok(hash_hex: &str) -> Self {
+        fn ok(hash_value: &str, size_bytes: u64) -> Self {
             Self {
                 copyto: CommandOutput {
                     status: 0,
@@ -457,7 +481,12 @@ mod tests {
                 },
                 hashsum: CommandOutput {
                     status: 0,
-                    stdout: format!("{hash_hex}  remote/clip.mp4\n"),
+                    stdout: format!("{hash_value}  remote/clip.mp4\n"),
+                    stderr: String::new(),
+                },
+                size: CommandOutput {
+                    status: 0,
+                    stdout: format!(r#"{{"count":1,"bytes":{size_bytes}}}"#),
                     stderr: String::new(),
                 },
                 spawn_err: None,
@@ -476,6 +505,8 @@ mod tests {
                 Ok(self.copyto.clone())
             } else if args.iter().any(|a| a == "hashsum") {
                 Ok(self.hashsum.clone())
+            } else if args.iter().any(|a| a == "size") {
+                Ok(self.size.clone())
             } else {
                 Err(format!("unexpected rclone args: {args:?}"))
             }
@@ -606,13 +637,14 @@ mod tests {
 
     fn item() -> QueueItem {
         QueueItem::new(
+            QueueKey::new("dest-a", "remote/clip.mp4"),
             ArchiveItemId(7),
+            "clip.mp4",
             "SentryClips/clip.mp4",
-            "remote/clip.mp4",
             UploadCategory::EventSentry,
             0,
             1_000,
-            expected_hash(),
+            verify_sha256(),
         )
     }
 
@@ -629,7 +661,7 @@ mod tests {
         let cfg = UploaddConfig::default();
         let root = ArchiveRoot::new("/mnt/archive");
         let remote = remote();
-        let runner = FakeRunner::ok(&hex_of(&expected_hash()));
+        let runner = FakeRunner::ok(&expected_sha256(), 1_000);
         let lease = FakeLease::granting();
         let durability = FakeDurability::default();
         let store = FakeStore::default();
@@ -663,7 +695,7 @@ mod tests {
         let cfg = UploaddConfig::default();
         let root = ArchiveRoot::new("/mnt/archive");
         let remote = remote();
-        let runner = FakeRunner::ok(&hex_of(&expected_hash()));
+        let runner = FakeRunner::ok(&expected_sha256(), 1_000);
         let lease = FakeLease::granting();
         let durability = FakeDurability::default();
         let store = FakeStore::default();
@@ -698,7 +730,7 @@ mod tests {
         let cfg = UploaddConfig::default();
         let root = ArchiveRoot::new("/mnt/archive");
         let remote = remote();
-        let runner = FakeRunner::ok(&hex_of(&expected_hash()));
+        let runner = FakeRunner::ok(&expected_sha256(), 1_000);
         let lease = FakeLease {
             deny: Some("delete claimed".to_owned()),
             renew_stale: false,
@@ -729,7 +761,7 @@ mod tests {
         let cfg = UploaddConfig::default();
         let root = ArchiveRoot::new("/mnt/archive");
         let remote = remote();
-        let runner = FakeRunner::ok(&hex_of(&expected_hash()));
+        let runner = FakeRunner::ok(&expected_sha256(), 1_000);
         let lease = FakeLease::granting();
         let durability = FakeDurability::default();
         let store = FakeStore::default();
@@ -756,7 +788,7 @@ mod tests {
         let cfg = UploaddConfig::default();
         let root = ArchiveRoot::new("/mnt/archive");
         let remote = remote();
-        let mut runner = FakeRunner::ok(&hex_of(&expected_hash()));
+        let mut runner = FakeRunner::ok(&expected_sha256(), 1_000);
         runner.copyto = CommandOutput {
             status: 1,
             stdout: String::new(),
@@ -795,8 +827,8 @@ mod tests {
         let cfg = UploaddConfig::default();
         let root = ArchiveRoot::new("/mnt/archive");
         let remote = remote();
-        // Hash of all-zeroes does not match the expected all-0x07.
-        let runner = FakeRunner::ok(&hex_of(&ContentHash::new([0u8; 32])));
+        // Hash of all-zeroes does not match the expected 0x07 digest.
+        let runner = FakeRunner::ok(&"00".repeat(32), 1_000);
         let lease = FakeLease::granting();
         let durability = FakeDurability::default();
         let store = FakeStore::default();
@@ -824,7 +856,7 @@ mod tests {
         let cfg = UploaddConfig::default();
         let root = ArchiveRoot::new("/mnt/archive");
         let remote = remote();
-        let runner = FakeRunner::ok(&hex_of(&expected_hash()));
+        let runner = FakeRunner::ok(&expected_sha256(), 1_000);
         let lease = FakeLease {
             deny: None,
             renew_stale: true,
@@ -864,7 +896,7 @@ mod tests {
         let cfg = UploaddConfig::default();
         let root = ArchiveRoot::new("/mnt/archive");
         let remote = remote();
-        let runner = FakeRunner::ok(&hex_of(&expected_hash()));
+        let runner = FakeRunner::ok(&expected_sha256(), 1_000);
         let lease = FakeLease::granting();
         let durability = FakeDurability::default();
         let store = FakeStore::default();
@@ -880,13 +912,14 @@ mod tests {
             throttle: &throttle,
         };
         let mut it = QueueItem::new(
+            QueueKey::new("dest-a", "remote/x.mp4"),
             ArchiveItemId(9),
+            "x.mp4",
             "../../mnt/cam/live/recent.mp4",
-            "remote/x.mp4",
             UploadCategory::Bulk,
             0,
             10,
-            expected_hash(),
+            verify_sha256(),
         );
         assert!(matches!(
             engine.process(&mut it).unwrap(),
@@ -902,7 +935,7 @@ mod tests {
         cfg.retry.max_attempts = 1;
         let root = ArchiveRoot::new("/mnt/archive");
         let remote = remote();
-        let mut runner = FakeRunner::ok(&hex_of(&expected_hash()));
+        let mut runner = FakeRunner::ok(&expected_sha256(), 1_000);
         runner.copyto = CommandOutput {
             status: 1,
             stdout: String::new(),
@@ -934,10 +967,10 @@ mod tests {
         let cfg = UploaddConfig::default();
         let root = ArchiveRoot::new("/mnt/archive");
         let remote = remote();
-        let mut runner = FakeRunner::ok(&hex_of(&expected_hash()));
+        let mut runner = FakeRunner::ok(&expected_sha256(), 1_000);
         runner.hashsum = CommandOutput {
             status: 0,
-            stdout: "not-a-valid-hash\n".to_owned(),
+            stdout: "\n".to_owned(),
             stderr: String::new(),
         };
         let lease = FakeLease::granting();
@@ -962,11 +995,39 @@ mod tests {
     }
 
     #[test]
-    fn parse_sha256_round_trips() {
-        let h = ContentHash::new([0xABu8; 32]);
-        let line = format!("{}  some/remote/path.mp4", hex_of(&h));
-        assert_eq!(super::parse_sha256(&line), Some(h));
-        assert_eq!(super::parse_sha256("short  path"), None);
-        assert_eq!(super::parse_sha256(""), None);
+    fn parse_hashsum_value_round_trips() {
+        let line = format!("{}  some/remote/path.mp4", "ab".repeat(32));
+        assert_eq!(super::parse_hashsum_value(&line), Some("ab".repeat(32)));
+        assert_eq!(super::parse_hashsum_value(""), None);
+    }
+
+    #[test]
+    fn copy_integrity_uses_remote_size() {
+        let cfg = UploaddConfig::default();
+        let root = ArchiveRoot::new("/mnt/archive");
+        let remote = remote();
+        let runner = FakeRunner::ok("ignored", 1_000);
+        let lease = FakeLease::granting();
+        let durability = FakeDurability::default();
+        let store = FakeStore::default();
+        let throttle = FakeThrottle::running();
+        let engine = RcloneUploadEngine {
+            cfg: &cfg,
+            archive_root: &root,
+            remote: &remote,
+            runner: &runner,
+            lease: &lease,
+            durability: &durability,
+            queue_store: &store,
+            throttle: &throttle,
+        };
+
+        let mut it = item();
+        it.verify = VerifySpec::CopyIntegrity;
+        let outcome = engine.process(&mut it).unwrap();
+        assert!(matches!(outcome, StepOutcome::Uploaded { .. }));
+        let calls = runner.calls.borrow();
+        assert!(calls.iter().any(|args| args.contains(&"size".to_owned())));
+        assert!(!calls.iter().any(|args| args.contains(&"hashsum".to_owned())));
     }
 }

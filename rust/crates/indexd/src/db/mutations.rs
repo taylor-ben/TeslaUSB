@@ -731,21 +731,6 @@ pub fn quarantine(conn: &Connection, archive_item_id: i64, reason: &str) -> Resu
     set_delete_state(conn, archive_item_id, "QUARANTINED", None)
 }
 
-/// Set the `durable` flag on an archive item (D3 §6: `uploadd` calls this
-/// on a verified upload; only then may `retentiond` treat the local copy
-/// as safe to evict). Deletion remains `retentiond`'s alone.
-///
-/// # Errors
-///
-/// Returns [`DbError`] if the statement fails.
-pub fn set_durable(conn: &Connection, archive_item_id: i64, durable: bool) -> Result<(), DbError> {
-    conn.execute(
-        "UPDATE archive_items SET durable = ?2, updated_at = ?3 WHERE id = ?1",
-        params![archive_item_id, i64::from(durable), now_epoch_s()],
-    )?;
-    Ok(())
-}
-
 /// Upsert one settings preference in `prefs`.
 ///
 /// # Errors
@@ -822,8 +807,8 @@ mod tests {
     use super::{
         ClipLeaseGrant, LeaseGrant, LeaseKind, ReleaseResult, RenewResult, claim_eviction_candidate,
         claim_for_delete, get_pref, has_unexpired_lease, lease_acquire, lease_acquire_for_clip,
-        lease_release, lease_renew, mark_deleted, mark_deleting, reap_stale_leases, set_durable,
-        set_pref, wal_checkpoint_truncate,
+        lease_release, lease_renew, mark_deleted, mark_deleting, reap_stale_leases, set_pref,
+        wal_checkpoint_truncate,
     };
     use crate::db::open_in_memory;
 
@@ -1290,7 +1275,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_state_finishers_and_durable() {
+    fn delete_state_finishers() {
         let conn = open_in_memory().unwrap();
         let item = insert_archive_item(&conn, "/a");
         mark_deleting(&conn, item).unwrap();
@@ -1307,15 +1292,6 @@ mod tests {
         // Idempotent re-apply.
         mark_deleted(&conn, item, 4096).unwrap();
 
-        set_durable(&conn, item, true).unwrap();
-        let durable: i64 = conn
-            .query_row(
-                "SELECT durable FROM archive_items WHERE id = ?1",
-                params![item],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(durable, 1);
     }
 
     #[test]
