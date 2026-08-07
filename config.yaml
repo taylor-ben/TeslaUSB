@@ -43,6 +43,9 @@ setup:
 # ============================================================================
 network:
   samba_password: tesla # Samba password for authenticated user (CHANGE THIS!)
+  web_bind: 127.0.0.1 # Interface to listen on. Loopback by default: the UI has NO
+                      # authentication, so 0.0.0.0 exposes full control to anyone on
+                      # the network. Use an SSH tunnel, or set 0.0.0.0 on a trusted LAN.
   web_port: 80 # Web interface port (80 required for captive portal - do not change)
 
 # ============================================================================

@@ -51,6 +51,12 @@ IMG_MUSIC_PATH = os.path.join(GADGET_DIR, IMG_MUSIC_NAME)
 
 # Network & Security
 WEB_PORT = config['network']['web_port']
+# Interface to listen on. Defaults to loopback: this box lives in a car and
+# joins whatever network is around, and the UI has no authentication of any
+# kind, so binding all interfaces hands anyone on that network the ability to
+# delete clips and switch USB modes. Reach it over an SSH tunnel, or set
+# 0.0.0.0 deliberately on a trusted LAN.
+WEB_BIND = config['network'].get('web_bind', '127.0.0.1')
 
 # Web Application Configuration
 _DEFAULT_SECRET = 'CHANGE-THIS-TO-A-RANDOM-SECRET-KEY-ON-FIRST-INSTALL'

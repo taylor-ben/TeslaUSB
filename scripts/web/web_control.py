@@ -20,7 +20,7 @@ logging.basicConfig(
 )
 
 # Import configuration
-from config import SECRET_KEY, WEB_PORT, GADGET_DIR, MAX_UPLOAD_SIZE_MB, MAX_UPLOAD_CHUNK_MB
+from config import SECRET_KEY, WEB_PORT, WEB_BIND, GADGET_DIR, MAX_UPLOAD_SIZE_MB, MAX_UPLOAD_CHUNK_MB
 
 # Flask app initialization
 app = Flask(__name__)
@@ -123,7 +123,7 @@ def wildcard_redirect(path):
 if __name__ == "__main__":
     print(f"Starting Tesla USB Gadget Web Control")
     print(f"Gadget directory: {GADGET_DIR}")
-    print(f"Access the interface at: http://0.0.0.0:{WEB_PORT}/")
+    print(f"Access the interface at: http://{WEB_BIND}:{WEB_PORT}/")
 
     # Phase 3a.2 (#98): one-shot migration of legacy cleanup_config.json
     # into the unified ``cleanup`` config.yaml section. Idempotent and
@@ -509,9 +509,9 @@ if __name__ == "__main__":
         from waitress import serve
         print("Using Waitress production server")
         # 4 threads for Pi Zero 2 W — one extra for API polling while sync runs
-        serve(app, host="0.0.0.0", port=WEB_PORT, threads=4, channel_timeout=120,
+        serve(app, host=WEB_BIND, port=WEB_PORT, threads=4, channel_timeout=120,
               send_bytes=4194304)  # 4MB send buffer for better video streaming
     except ImportError:
         print("Waitress not available, using Flask development server")
         print("WARNING: Flask dev server is slow for large files. Install waitress: pip3 install waitress")
-        app.run(host="0.0.0.0", port=WEB_PORT, debug=False, threaded=True)
+        app.run(host=WEB_BIND, port=WEB_PORT, debug=False, threaded=True)
