@@ -44,7 +44,12 @@ eval "$(yq -r '
   "LABEL1=\"" + .disk_images.cam_label + "\"",
   "LABEL2=\"" + .disk_images.lightshow_label + "\"",
   "LABEL3=\"" + (.disk_images.music_label // "Music") + "\"",
-  "MUSIC_ENABLED=\"" + (.disk_images.music_enabled // true | tostring) + "\"",
+  # NOTE: the jq // operator returns the right side when the left is null OR
+  # FALSE, so .disk_images.music_enabled // true can never yield false, and
+  # music_enabled: false in config.yaml was silently ignored. Default only on
+  # an absent/null key. (No apostrophes here: this jq program lives inside a
+  # single-quoted shell string.)
+  "MUSIC_ENABLED=\"" + ((if .disk_images.music_enabled == null then true else .disk_images.music_enabled end) | tostring) + "\"",
   "MUSIC_FS=\"" + (.disk_images.music_fs // "fat32") + "\"",
   "BOOT_FSCK_ENABLED=\"" + (.disk_images.boot_fsck_enabled | tostring) + "\"",
   "PART1_SIZE=\"" + .setup.part1_size + "\"",
