@@ -105,6 +105,24 @@ The **order of the folders in the list** is also the **upload priority order** (
 
 The priority sort is computed as `folder_index * 1000 + content_score`. The `1000` multiplier is strictly larger than the max per-clip content score, so the folder axis always dominates.
 
+## Metered connections (cellular dongles)
+
+A box that reaches the internet through a cellular dongle sees it as ordinary WiFi — the SSID says nothing about the data plan behind it, and a single Sentry event folder can be 1–2 GB. Automatic sync therefore **pauses while NetworkManager reports the active connection as metered** and resumes the moment an unmetered network takes over. The queue keeps growing during the hold; nothing is dropped.
+
+Setup: mark the dongle's connection profile as metered once —
+
+```
+sudo nmcli connection modify <dongle-ssid> connection.metered yes
+```
+
+Everything else is automatic. The hold is visible as `metered_paused: true` in the sync status API, and in the log line `metered connection, holding sync until unmetered WiFi`.
+
+Notes:
+
+- `unknown` (the default for most profiles) counts as **unmetered** — the gate only engages on an explicit `yes` or NM's own `yes (guessed)` DHCP detection. A host without NetworkManager keeps syncing.
+- Manual per-file archive from the UI and the **Test Connection** button are **not** gated — an explicit user action on a metered link is the user's call.
+- To disable the gate entirely, set `cloud_archive.pause_on_metered: false` in `config.yaml` (default `true`).
+
 ## Reset counters
 
 The dashboard at the top of the Cloud Sync page shows cumulative totals — **Events Synced**, **Events Pending**, **Failed**, and **Transferred**. The **Reset counters** button (just below the cards, on the right) zeros the cumulative totals.

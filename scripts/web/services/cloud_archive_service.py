@@ -33,6 +33,7 @@ from config import (
     CLOUD_ARCHIVE_SYNC_FOLDERS,
     CLOUD_ARCHIVE_PRIORITY_ORDER,
     CLOUD_ARCHIVE_MAX_UPLOAD_MBPS,
+    CLOUD_ARCHIVE_PAUSE_ON_METERED,
     CLOUD_ARCHIVE_DB_PATH,
     CLOUD_PROVIDER_CREDS_PATH,
     CLOUD_ARCHIVE_SYNC_NON_EVENT,
@@ -340,6 +341,10 @@ _sync_status: Dict = {
     "worker_running": False,
     "wake_count": 0,
     "drain_count": 0,
+    # True while the worker is holding off because the active
+    # connection is metered — lets the UI say "waiting for unmetered
+    # WiFi" instead of the misleading "idle".
+    "metered_paused": False,
 }
 
 # Tmpfs directory for short-lived rclone config
@@ -3480,6 +3485,30 @@ def _is_wifi_connected() -> bool:
     return False
 
 
+def _is_network_metered() -> bool:
+    """True when wlan0's active connection is metered per NetworkManager.
+
+    A car box often rides a cellular dongle that presents as ordinary
+    WiFi — the SSID says nothing about the data plan behind it. NM knows
+    a connection is metered when the profile says so
+    (``nmcli connection modify <name> connection.metered yes``) or when
+    the DHCP ANDROID_METERED hint gives it away; both report as ``yes``
+    or ``yes (guessed)``. ``unknown`` and any nmcli failure count as NOT
+    metered — a host without NetworkManager must keep syncing, and the
+    gate is an economy measure, not a correctness one.
+    """
+    try:
+        result = subprocess.run(
+            ["nmcli", "-t", "-f", "GENERAL.METERED", "device", "show", "wlan0"],
+            capture_output=True, text=True, timeout=5,
+        )
+        line = result.stdout.strip().split("\n")[0]
+        value = line.split(":", 1)[1].strip().lower() if ":" in line else ""
+        return value.startswith("yes")
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Reusable rclone upload helper (shared with Live Event Sync)
 # ---------------------------------------------------------------------------
@@ -4317,6 +4346,20 @@ def _worker_loop(teslacam_path: str, db_path: str) -> None:
             if not _is_wifi_connected():
                 logger.debug("Cloud archive worker: WiFi down, idling")
                 continue
+
+            # Skip while the connection is metered (cellular dongle) —
+            # a 12 GB drive drains a data plan fast. The queue keeps
+            # growing; the next NM dispatcher event (or idle timeout)
+            # re-checks once an unmetered network takes over.
+            if CLOUD_ARCHIVE_PAUSE_ON_METERED and _is_network_metered():
+                if not _sync_status.get("metered_paused"):
+                    logger.info(
+                        "Cloud archive worker: metered connection, "
+                        "holding sync until unmetered WiFi",
+                    )
+                _sync_status["metered_paused"] = True
+                continue
+            _sync_status["metered_paused"] = False
 
             # Skip if a single-file archive is running (shared rclone
             # subprocess + bandwidth contention).

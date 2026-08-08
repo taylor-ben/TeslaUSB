@@ -148,6 +148,13 @@ CLOUD_ARCHIVE_PRIORITY_ORDER = _normalize_cloud_folder_list(
     CLOUD_ARCHIVE_SYNC_FOLDERS,
 )
 CLOUD_ARCHIVE_MAX_UPLOAD_MBPS = int(_cloud.get('max_upload_mbps', 5))
+# Pause automatic cloud sync while the active connection is metered
+# (NetworkManager ``GENERAL.METERED`` = yes). A car box often rides a
+# cellular dongle that presents as ordinary WiFi; mark that profile
+# metered (``nmcli connection modify <name> connection.metered yes``)
+# and the sync queue holds until an unmetered network takes over.
+# Manual per-file archive and the connection test are NOT gated.
+CLOUD_ARCHIVE_PAUSE_ON_METERED = bool(_cloud.get('pause_on_metered', True))
 CLOUD_ARCHIVE_RESERVE_GB = float(_cloud.get('cloud_reserve_gb', 1))
 CLOUD_ARCHIVE_SYNC_NON_EVENT = bool(_cloud.get('sync_non_event_videos', False))
 CLOUD_AUTO_CLEANUP = bool(_cloud.get('cloud_auto_cleanup', False))
