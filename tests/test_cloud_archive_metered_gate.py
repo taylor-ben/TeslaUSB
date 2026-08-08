@@ -181,3 +181,26 @@ class TestMeteredGate:
         svc.wake()
         time.sleep(0.5)
         assert svc._sync_status["metered_paused"] is False
+
+
+# ---------------------------------------------------------------------------
+# 3. The hold clears when there is no network at all
+# ---------------------------------------------------------------------------
+
+
+class TestMeteredFlagOnWifiDown:
+    def test_wifi_down_clears_the_metered_hold(
+        self, monkeypatch, _enable_cloud, _stub_recover, _stub_no_archive_running,
+    ):
+        # Unplugging a metered dongle must not leave the UI saying "waiting for
+        # unmetered WiFi": the truth is no network at all, and the reset used
+        # to sit below the WiFi gate where it could never run.
+        monkeypatch.setattr(svc, 'CLOUD_ARCHIVE_PAUSE_ON_METERED', True)
+        monkeypatch.setattr(svc, '_is_wifi_connected', lambda: False)
+        monkeypatch.setattr(svc, '_is_network_metered', lambda: True)
+        monkeypatch.setattr(svc, '_drain_once', lambda *_a, **_k: False)
+        svc._sync_status["metered_paused"] = True
+
+        svc.start(teslacam_path="/x", db_path="/y")
+        time.sleep(0.5)
+        assert svc._sync_status["metered_paused"] is False

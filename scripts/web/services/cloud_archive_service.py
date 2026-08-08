@@ -4344,6 +4344,11 @@ def _worker_loop(teslacam_path: str, db_path: str) -> None:
             # NM dispatcher event when WiFi comes back. The idle
             # timeout also catches "WiFi came back silently".
             if not _is_wifi_connected():
+                # Clear the metered hold here too. Sitting below the WiFi gate
+                # it was unreachable whenever the link dropped, so unplugging a
+                # metered dongle left the UI insisting it was "waiting for
+                # unmetered WiFi" when the truth was no network at all.
+                _sync_status["metered_paused"] = False
                 logger.debug("Cloud archive worker: WiFi down, idling")
                 continue
 
