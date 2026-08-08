@@ -1,0 +1,25 @@
+[Unit]
+Description=TeslaUSB Cam Image Headroom Guard
+After=present_usb_on_boot.service teslausb-safe-mode.service
+ConditionPathExists=!/run/teslausb-safe-mode
+
+[Service]
+Type=oneshot
+# Root, not the target user: this mounts the image to read its true free space
+# and drives the gadget swap scripts.
+User=root
+WorkingDirectory=__GADGET_DIR__
+ExecStart=/usr/bin/python3 __GADGET_DIR__/scripts/cam_headroom.py
+StandardOutput=journal
+StandardError=journal
+
+Nice=10
+MemoryMax=100M
+
+# A sweep detaches the drive from the car, so a failed run must not be retried
+# in a tight loop. The timer comes back in five minutes either way.
+Restart=no
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

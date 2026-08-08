@@ -1,0 +1,126 @@
+"""Headroom guard for the cam image.
+
+A full cam image does not degrade gracefully: the car stops recording
+altogether, so there is no dashcam footage and no SentryClips folder for a
+Sentry event. Boot cleanup cannot prevent it, because its policy protects
+everything younger than an hour and Tesla's rolling buffer is only about an
+hour long. This guard trims that buffer mid-session instead.
+
+Contract pinned here:
+
+1. Clips order by the timestamp in their FILENAME. The car writes FAT
+   timestamps in its own timezone and the kernel reinterprets them, so mtime
+   orders clips wrongly (a 20:12 recording stats as 11:13).
+2. The newest ``KEEP_NEWEST_SECONDS`` are never deleted, even when that means
+   failing to reach the requested figure.
+3. Deletion stops as soon as enough bytes are covered.
+4. Anything that is not a Tesla clip filename is left alone.
+"""
+from __future__ import annotations
+
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'scripts'))
+
+import cam_headroom
+from cam_headroom import KEEP_NEWEST_SECONDS, clip_seconds, clips_to_delete
+
+CAMERAS = ('front', 'back', 'left_pillar')
+
+
+def write_clip(folder, stamp, camera, size):
+    path = folder / f'{stamp}-{camera}.mp4'
+    path.write_bytes(b'\0' * size)
+    return path
+
+
+def test_clip_seconds_orders_by_name_not_mtime(tmp_path):
+    older = write_clip(tmp_path, '2026-08-08_16-50-00', 'front', 10)
+    newer = write_clip(tmp_path, '2026-08-08_20-12-32', 'front', 10)
+    # Backwards on disk: this is exactly what the vfat timestamps do.
+    os.utime(older, (2_000_000_000, 2_000_000_000))
+    os.utime(newer, (1_000_000_000, 1_000_000_000))
+
+    assert clip_seconds(older.name) < clip_seconds(newer.name)
+
+
+def test_clip_seconds_spans_midnight_and_month_end():
+    assert clip_seconds('2026-08-08_23-59-59-front.mp4') < clip_seconds(
+        '2026-08-09_00-00-01-front.mp4'
+    )
+    assert clip_seconds('2026-08-31_23-00-00-front.mp4') < clip_seconds(
+        '2026-09-01_01-00-00-front.mp4'
+    )
+
+
+def test_clip_seconds_ignores_other_files():
+    assert clip_seconds('thumb.png') is None
+    assert clip_seconds('event.json') is None
+    assert clip_seconds('2026-08-08_16-50-00-front.mp4.tmp') is None
+
+
+def test_deletes_oldest_first_and_stops_once_covered(tmp_path):
+    for minute in range(0, 60, 10):
+        for camera in CAMERAS:
+            write_clip(tmp_path, f'2026-08-08_16-{minute:02d}-00', camera, 100)
+
+    paths, freed = clips_to_delete(tmp_path, 250)
+
+    assert freed >= 250
+    # Three 100-byte clips cover 250, and they are the 16:00 group.
+    assert len(paths) == 3
+    assert all('16-00-00' in os.path.basename(path) for path in paths)
+
+
+def test_never_deletes_inside_the_keep_window(tmp_path):
+    newest = 20 * 3600
+    for offset in (0, KEEP_NEWEST_SECONDS // 2, KEEP_NEWEST_SECONDS + 60):
+        at = newest - offset
+        stamp = f'2026-08-08_{at // 3600:02d}-{(at % 3600) // 60:02d}-00'
+        for camera in CAMERAS:
+            write_clip(tmp_path, stamp, camera, 100)
+
+    # Ask for far more than exists, so only the keep window can hold it back.
+    paths, freed = clips_to_delete(tmp_path, 10 ** 9)
+
+    kept = {os.path.basename(p) for p in os.listdir(tmp_path)} - {
+        os.path.basename(p) for p in paths
+    }
+    assert len(paths) == 3, 'only the group outside the keep window is deletable'
+    assert freed == 300
+    assert len(kept) == 6
+
+
+def test_reports_shortfall_rather_than_eating_the_keep_window(tmp_path):
+    for camera in CAMERAS:
+        write_clip(tmp_path, '2026-08-08_16-00-00', camera, 100)
+        write_clip(tmp_path, '2026-08-08_20-00-00', camera, 100)
+
+    paths, freed = clips_to_delete(tmp_path, 10_000)
+
+    assert freed == 300 and len(paths) == 3
+    assert freed < 10_000, 'caller must see the shortfall, not a false success'
+
+
+def test_leaves_non_clip_files_alone(tmp_path):
+    write_clip(tmp_path, '2026-08-08_16-00-00', 'front', 100)
+    (tmp_path / 'thumb.png').write_bytes(b'\0' * 5000)
+    (tmp_path / 'event.json').write_text('{}')
+
+    paths, _ = clips_to_delete(tmp_path, 10 ** 9)
+
+    assert all(path.endswith('.mp4') for path in paths)
+    assert (tmp_path / 'thumb.png').exists()
+
+
+def test_empty_folder_is_not_an_error(tmp_path):
+    assert clips_to_delete(tmp_path, 10 ** 9) == ([], 0)
+
+
+def test_floor_leaves_room_for_an_event_and_the_cars_lagging_fat():
+    # Three things must fit under the floor: a Sentry event folder (1.8 GB
+    # measured 2026-08-08), a timer interval of recording (~650 MB), and the
+    # ~1 GB the attached car's lagging FAT hides from the trigger reading.
+    assert cam_headroom.FLOOR_BYTES < cam_headroom.TARGET_BYTES
+    assert cam_headroom.FLOOR_BYTES >= 3.4 * cam_headroom.GIB

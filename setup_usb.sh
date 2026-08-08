@@ -1514,6 +1514,14 @@ configure_service "$TEMPLATES_DIR/chime_scheduler.service" "$CHIME_SCHEDULER_SER
 CHIME_SCHEDULER_TIMER="/etc/systemd/system/chime_scheduler.timer"
 configure_service "$TEMPLATES_DIR/chime_scheduler.timer" "$CHIME_SCHEDULER_TIMER"
 
+# Cam image headroom guard. A full cam image stops the car recording outright,
+# so this one is availability-critical rather than housekeeping.
+CAM_HEADROOM_SERVICE="/etc/systemd/system/cam_headroom.service"
+configure_service "$TEMPLATES_DIR/cam_headroom.service" "$CAM_HEADROOM_SERVICE"
+
+CAM_HEADROOM_TIMER="/etc/systemd/system/cam_headroom.timer"
+configure_service "$TEMPLATES_DIR/cam_headroom.timer" "$CAM_HEADROOM_TIMER"
+
 # Phase 3b (#99): the cloud_archive_sync.timer / .service one-shot
 # entry point has been removed. The continuous worker started by
 # gadget_web.service replaces both: a long-lived daemon thread that
@@ -1567,6 +1575,9 @@ chmod +x "$SCRIPT_DIR/scripts/boot_deferred_tasks.sh"
 
 # Enable and start chime scheduler timer
 systemctl enable --now chime_scheduler.timer || systemctl restart chime_scheduler.timer
+
+# Enable and start the cam image headroom guard
+systemctl enable --now cam_headroom.timer || systemctl restart cam_headroom.timer
 
 # Phase 3b (#99): cloud_archive_sync.timer is gone — the continuous
 # worker inside gadget_web.service handles all cloud sync triggers
