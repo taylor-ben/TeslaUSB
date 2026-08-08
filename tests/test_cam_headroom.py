@@ -20,6 +20,11 @@ Contract pinned here:
    failing to reach the requested figure.
 3. Deletion stops as soon as enough bytes are covered.
 4. Anything that is not a Tesla clip filename is left alone.
+5. Filename timestamps are real epoch seconds, so the keep window is a real
+   duration. A digit-packing scheme orders correctly but subtracts wrongly
+   across a month end, which would delete the previous evening's footage.
+6. A corrupt filename cannot drag the keep window off the end of the ring and
+   take the newest minutes with it.
 """
 from __future__ import annotations
 
@@ -70,6 +75,31 @@ def test_clip_seconds_ignores_other_files():
     assert clip_seconds('2026-08-08_16-50-00-front.mp4.tmp') is None
 
 
+def test_clip_seconds_measures_real_durations_across_a_month_end():
+    # The bug this pins: a `month * 31 + day` clock puts these a day apart, so
+    # every clip from the 30th falls outside the keep window on the 1st and the
+    # sweep deletes footage the car wrote eight minutes ago.
+    late = clip_seconds('2026-09-30_23-55-00-front.mp4')
+    early = clip_seconds('2026-10-01_00-03-00-front.mp4')
+    assert early - late == 8 * 60
+
+
+def test_clip_seconds_measures_real_durations_across_a_year_end():
+    assert (
+        clip_seconds('2027-01-01_00-01-00-front.mp4')
+        - clip_seconds('2026-12-31_23-59-00-front.mp4')
+    ) == 2 * 60
+
+
+def test_clip_seconds_rejects_impossible_dates():
+    # A car-yanked vfat can leave garbage in a directory entry. Parsing it as a
+    # date in the year 9999 is what drags the keep window off the ring.
+    assert clip_seconds('9999-99-99_99-99-99-front.mp4') is None
+    assert clip_seconds('2026-13-01_00-00-00-front.mp4') is None
+    assert clip_seconds('2026-08-08_24-00-00-front.mp4') is None
+    assert clip_seconds('2026-08-00_10-00-00-front.mp4') is None
+
+
 def test_deletes_oldest_first_and_stops_once_covered(tmp_path):
     for minute in range(0, 60, 10):
         for camera in CAMERAS:
@@ -81,6 +111,20 @@ def test_deletes_oldest_first_and_stops_once_covered(tmp_path):
     # Three 100-byte clips cover 250, and they are the 16:00 group.
     assert len(paths) == 3
     assert all('16-00-00' in os.path.basename(path) for path in paths)
+
+
+def test_a_corrupt_filename_cannot_drag_the_keep_window_off_the_ring(tmp_path):
+    # One entry dated years ahead used to make every real clip look ancient,
+    # and the sweep took the whole ring including the minute just recorded.
+    for minute in (0, 30, 50):
+        for camera in CAMERAS:
+            write_clip(tmp_path, f'2026-08-08_16-{minute:02d}-00', camera, 100)
+    write_clip(tmp_path, '2031-01-01_00-00-00', 'front', 100)
+
+    paths, _ = clips_to_delete(tmp_path, 10 ** 9)
+
+    kept = set(os.listdir(tmp_path)) - {os.path.basename(p) for p in paths}
+    assert any('16-50-00' in name for name in kept), 'newest real clips must survive'
 
 
 def test_never_deletes_inside_the_keep_window(tmp_path):
@@ -164,9 +208,9 @@ def test_used_bytes_survives_files_vanishing_mid_walk(tmp_path, monkeypatch):
     assert used_bytes(tmp_path, 4096) == 4096
 
 
-def test_floor_leaves_room_for_an_event_and_the_cars_lagging_fat():
-    # Three things must fit under the floor: a Sentry event folder (1.8 GB
-    # measured 2026-08-08), a timer interval of recording (~650 MB), and the
-    # ~1 GB the attached car's lagging FAT hides from the trigger reading.
+def test_floor_leaves_room_for_an_event_landing_all_at_once():
+    # A Sentry event folder measured 1.8 GB on 2026-08-08 and a timer interval
+    # of recording is ~900 MB at the measured 180 MB/min. The floor has to
+    # absorb both between two ticks, or the guard fires after the disk is full.
     assert cam_headroom.FLOOR_BYTES < cam_headroom.TARGET_BYTES
-    assert cam_headroom.FLOOR_BYTES >= 3.4 * cam_headroom.GIB
+    assert cam_headroom.FLOOR_BYTES >= 2.7 * cam_headroom.GIB

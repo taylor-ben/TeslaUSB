@@ -3,8 +3,8 @@ Description=TeslaUSB Cam Image Headroom Timer
 Requires=cam_headroom.service
 
 [Timer]
-# Every five minutes. The car burns ~130 MB/min, so this checks in roughly
-# every 650 MB of recording, well under the 3 GB floor the guard defends.
+# Every five minutes. The car burns ~180 MB/min, so this checks in roughly
+# every 900 MB of recording, well under the 4 GB floor the guard defends.
 OnCalendar=*:0/5
 # The check is cheap and the car may have filled the drive while the Pi was
 # off, so do not skip a missed window.

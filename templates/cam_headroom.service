@@ -19,7 +19,15 @@ MemoryMax=100M
 # A sweep detaches the drive from the car, so a failed run must not be retried
 # in a tight loop. The timer comes back in five minutes either way.
 Restart=no
-TimeoutStartSec=300
+
+# Generous, because the deadline lands mid-sweep with the drive detached.
+# present_usb.sh runs fsck.vfat over both images on every switch, and a dirty
+# vfat needing real repair takes far longer than a healthy one. The script
+# catches SIGTERM and hands the drive back, and TimeoutStopSec gives it room to
+# finish before systemd escalates to SIGKILL.
+TimeoutStartSec=1800
+TimeoutStopSec=300
+KillSignal=SIGTERM
 
 [Install]
 WantedBy=multi-user.target
