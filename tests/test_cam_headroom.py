@@ -8,6 +8,11 @@ hour long. This guard trims that buffer mid-session instead.
 
 Contract pinned here:
 
+0. Usage is counted from the files themselves, never from the filesystem's own
+   free-space answer. vfat serves that from the FSINFO hint sector, which the
+   car does not maintain while it holds the drive: it wrote 2.7 GB and statvfs
+   reported an unchanged 8.04 GB free against a true 5.06 GB (2026-08-08). A
+   guard watching that number never fires.
 1. Clips order by the timestamp in their FILENAME. The car writes FAT
    timestamps in its own timezone and the kernel reinterprets them, so mtime
    orders clips wrongly (a 20:12 recording stats as 11:13).
@@ -24,7 +29,12 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'scripts'))
 
 import cam_headroom
-from cam_headroom import KEEP_NEWEST_SECONDS, clip_seconds, clips_to_delete
+from cam_headroom import (
+    KEEP_NEWEST_SECONDS,
+    clip_seconds,
+    clips_to_delete,
+    used_bytes,
+)
 
 CAMERAS = ('front', 'back', 'left_pillar')
 
@@ -116,6 +126,42 @@ def test_leaves_non_clip_files_alone(tmp_path):
 
 def test_empty_folder_is_not_an_error(tmp_path):
     assert clips_to_delete(tmp_path, 10 ** 9) == ([], 0)
+
+
+def test_used_bytes_rounds_up_to_whole_clusters(tmp_path):
+    # A file always costs whole clusters on disk. Rounding down would make the
+    # guard believe in room that is not there.
+    (tmp_path / 'a.mp4').write_bytes(b'\0' * 100)
+    (tmp_path / 'b.mp4').write_bytes(b'\0' * 4097)
+
+    assert used_bytes(tmp_path, 4096) == 4096 + 8192
+
+
+def test_used_bytes_counts_nested_event_folders(tmp_path):
+    (tmp_path / 'TeslaCam' / 'SentryClips' / '2026-08-08_16-21-54').mkdir(parents=True)
+    (tmp_path / 'TeslaCam' / 'RecentClips').mkdir(parents=True)
+    (tmp_path / 'TeslaCam' / 'SentryClips' / '2026-08-08_16-21-54' / 'f.mp4').write_bytes(
+        b'\0' * 4096
+    )
+    (tmp_path / 'TeslaCam' / 'RecentClips' / 'g.mp4').write_bytes(b'\0' * 4096)
+
+    assert used_bytes(tmp_path, 4096) == 8192
+
+
+def test_used_bytes_survives_files_vanishing_mid_walk(tmp_path, monkeypatch):
+    # The car is writing to this filesystem while we walk it.
+    (tmp_path / 'a.mp4').write_bytes(b'\0' * 4096)
+    (tmp_path / 'gone.mp4').write_bytes(b'\0' * 4096)
+
+    real_getsize = os.path.getsize
+
+    def flaky(path):
+        if path.endswith('gone.mp4'):
+            raise OSError('vanished')
+        return real_getsize(path)
+
+    monkeypatch.setattr(os.path, 'getsize', flaky)
+    assert used_bytes(tmp_path, 4096) == 4096
 
 
 def test_floor_leaves_room_for_an_event_and_the_cars_lagging_fat():

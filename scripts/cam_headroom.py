@@ -15,19 +15,21 @@ can never reach the bytes that actually fill the disk.
 
 Two facts learned the hard way on 2026-08-08, both encoded below:
 
-  * Free space must be read from a FRESH mount. The kernel caches a vfat
-    volume's free-cluster count in the in-memory superblock, and the car
-    writes to the image behind the read-only mount's back. The standing mount
-    reported 5.4 GB free while the FAT itself said 475 MB, which is how a full
-    drive went unnoticed for three hours.
-  * Even a fresh mount reads optimistically while the car holds the drive: the
-    car's own FAT updates lag its writes, and a sweep measured 8.5 GB free
-    against a true 7.9 GB. The trigger check therefore only decides WHETHER to
-    act; how much to delete is computed after the drive is detached, when the
-    filesystem has been flushed and finally tells the truth.
-  * Order by FILENAME, never by mtime. The car writes FAT timestamps in its
-    own timezone and the kernel reinterprets them, so a clip recorded at 20:12
-    stats as 11:13. The name carries the truth.
+  * Never ask the filesystem how much room is left. A vfat volume's free-cluster
+    count comes from the FSINFO hint sector, and the car does not maintain it
+    while it holds the drive: measured 2026-08-08, the car wrote 2.7 GB of clips
+    and `statvfs` reported the same 8.04 GB free before and after, against a
+    true 5.06 GB. That number is not merely stale, it is frozen, so a guard
+    watching it would never fire while the disk filled underneath. The standing
+    read-only mount is worse still: it reported 5.4 GB free against a real
+    475 MB, which is how a full drive went unnoticed for three hours.
+    Usage is therefore counted the only way that tracks reality here, by adding
+    up the sizes of the files that are actually there — after dropping the page
+    cache, because a loop device serves the image through it and will otherwise
+    hand back a directory listing from before the car's latest writes.
+  * Order clips by FILENAME, never by mtime. The car writes FAT timestamps in
+    its own timezone and the kernel reinterprets them, so a clip recorded at
+    20:12 stats as 11:13. The name carries the truth.
 
 Only RecentClips is ever touched, and that is hard-coded rather than
 configurable: it is Tesla's own throwaway ring, the car overwrites it anyway,
@@ -52,20 +54,24 @@ from config import GADGET_DIR, IMG_CAM_PATH, MNT_DIR, STATE_FILE, get_script_pat
 
 GIB = 1024 ** 3
 
-# Prune when free space drops below this. It has to cover three things at
-# once: a Sentry event folder (1.8 GB measured), a timer interval of recording
-# (~650 MB), and the roughly 1 GB the attached car's lagging FAT hides from the
-# trigger reading.
+# Prune when free space drops below this. It covers a Sentry event folder
+# (1.8 GB measured) landing all at once plus a timer interval of recording
+# (~800 MB), with room left over for the estimate to be wrong.
 FLOOR_BYTES = 4 * GIB
 
-# Prune down to roughly this much free. Each sweep costs the car a ~15 second
-# gap while the drive is detached, so buy about an hour of recording per gap
-# rather than trimming little and often.
+# Prune down to roughly this much free, which buys about 25 minutes before the
+# next sweep. Each sweep costs the car a ~15 second gap while the drive is
+# detached, so the gap between sweeps wants to be as long as the disk allows.
+#
+# It cannot simply be raised: on a 12 GB image holding one 1.8 GB event, the
+# keep window below is the ceiling, and asking for more than the disk can give
+# just logs a shortfall every time. The real lever is a larger cam image.
 TARGET_BYTES = 8 * GIB
 
-# Never touch the newest quarter hour: the car may still be writing it, and it
-# is the footage most likely to matter.
-KEEP_NEWEST_SECONDS = 15 * 60
+# Never touch the newest ten minutes: the car may still be writing them, and
+# they are the footage most likely to matter. This is also what caps how much a
+# sweep can reclaim, so it trades directly against sweep frequency.
+KEEP_NEWEST_SECONDS = 10 * 60
 
 LOCK_PATH = os.path.join(GADGET_DIR, 'cam_headroom.lock')
 
@@ -88,20 +94,62 @@ def clip_seconds(name):
     return ((((year * 12 + month) * 31 + day) * 24 + hour) * 60 + minute) * 60 + second
 
 
-def free_bytes(image_path):
-    """Free bytes on the cam image, read through a throwaway mount.
+def used_bytes(mount, cluster_bytes):
+    """Bytes occupied by everything under `mount`, rounded up to whole clusters.
 
-    A fresh mount is the whole point: see the module docstring for what the
-    standing read-only mount reports instead.
+    Rounding up matters in the safe direction: a file always costs whole
+    clusters on disk, and under-counting usage would leave the guard thinking
+    it has room it does not have. Unreadable entries are skipped rather than
+    fatal, because the car is writing to this filesystem as we walk it.
     """
+    total = 0
+    for root, _, names in os.walk(mount):
+        for name in names:
+            try:
+                size = os.path.getsize(os.path.join(root, name))
+            except OSError:
+                continue
+            total += -(-size // cluster_bytes) * cluster_bytes
+    return total
+
+
+def drop_page_cache():
+    """Force the next read of the image to come off the disk.
+
+    A loop device serves the image through the page cache, so even a brand new
+    mount can hand back directory blocks from before the car's latest writes.
+    Measured 2026-08-08: a fresh probe mount reported the same 5.06 GB free for
+    thirteen minutes running, byte for byte, while the true figure fell to
+    2.09 GB. Without this the guard is blind twice over.
+    """
+    subprocess.run(['sync'], check=False)
+    try:
+        with open('/proc/sys/vm/drop_caches', 'w') as caches:
+            caches.write('3\n')
+    except OSError as error:
+        logger.error('could not drop page cache, readings may be stale: %s', error)
+
+
+def free_bytes_at(mount):
+    """Free bytes under a mounted cam image, counted from the files themselves.
+
+    See the module docstring for why the filesystem's own answer is not used.
+    """
+    drop_page_cache()
+    stat = os.statvfs(mount)
+    capacity = stat.f_blocks * stat.f_frsize
+    return max(0, capacity - used_bytes(mount, stat.f_frsize or 4096))
+
+
+def free_bytes(image_path):
+    """Free bytes on the cam image, measured through a throwaway mount."""
     probe = tempfile.mkdtemp(prefix='camfree-')
     subprocess.run(
         ['mount', '-o', 'ro,loop,noatime', image_path, probe],
         check=True, capture_output=True,
     )
     try:
-        stat = os.statvfs(probe)
-        return stat.f_bavail * stat.f_frsize
+        return free_bytes_at(probe)
     finally:
         # Loud on failure: this runs every five minutes, and a umount that
         # quietly fails leaks the loop device it created. A few hundred of
@@ -150,14 +198,13 @@ def run_script(name):
 def sweep(target_bytes):
     """Detach the drive, delete the oldest clips, hand it back. Returns bytes freed.
 
-    The amount to delete is decided here rather than by the caller, because the
-    only trustworthy free-space figure is the one taken with the drive detached.
+    The amount to delete is re-measured here rather than passed in, so a sweep
+    acts on what the disk holds at the moment it is detached.
     """
     run_script('edit_usb.sh')
     try:
         mount = Path(MNT_DIR) / 'part1'
-        stat = os.statvfs(mount)
-        free = stat.f_bavail * stat.f_frsize
+        free = free_bytes_at(mount)
         need = target_bytes - free
         logger.info('%.1f GB free with the drive detached', free / GIB)
         if need <= 0:
