@@ -20,12 +20,15 @@ Two facts learned the hard way on 2026-08-08, both encoded below:
     while it holds the drive: the car wrote 2.7 GB of clips and `statvfs`
     reported the same 8.04 GB free at both ends, against a true 5.06 GB. That
     number is not merely stale, it is frozen, so a guard watching it would never
-    fire while the disk filled underneath. The standing read-only mount is worse
-    still: it reported 5.4 GB free against a real 475 MB, which is how a full
-    drive went unnoticed for three hours. Usage is therefore counted by adding
-    up the sizes of the files that are actually there, after dropping the page
-    cache, because a loop device serves the image through it and will otherwise
-    hand back a directory listing from before the car's latest writes.
+    fire while the disk filled underneath. On a long-lived mount it is worse
+    still: the standing read-only mount reported 5.4 GB free against a real
+    475 MB, which is how a full drive went unnoticed for three hours. Usage is
+    therefore counted by adding up the sizes of the files that are actually
+    there, after dropping the page cache, because a loop device serves the image
+    through it and will otherwise hand back a directory listing from before the
+    car's latest writes. The directory listing tells the truth once the cache is
+    dropped; only the free-space figure is unusable, on any mount, however
+    fresh.
   * Order clips by FILENAME, never by mtime. The car writes FAT timestamps in
     its own timezone and the kernel reinterprets them, so a clip recorded at
     20:12 stats as 11:13. The name carries the truth.
@@ -57,7 +60,6 @@ import re
 import signal
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.request
 from pathlib import Path
@@ -67,7 +69,6 @@ sys.path.insert(0, str(SCRIPT_DIR / 'web'))
 
 from config import (
     GADGET_DIR,
-    IMG_CAM_PATH,
     MNT_DIR,
     STATE_FILE,
     WEB_PORT,
@@ -204,31 +205,18 @@ def free_bytes_at(mount):
     return max(0, capacity - used_bytes(mount, stat.f_frsize or 4096))
 
 
-def free_bytes(image_path):
-    """Free bytes on the cam image, measured through a throwaway mount."""
-    probe = tempfile.mkdtemp(prefix='camfree-')
-    try:
-        mounted = subprocess.run(
-            ['mount', '-o', 'ro,loop,noatime', image_path, probe],
-            capture_output=True, text=True,
-        )
-        if mounted.returncode != 0:
-            raise RuntimeError(f'could not mount {image_path}: {mounted.stderr.strip()}')
-    except Exception:
-        os.rmdir(probe)
-        raise
+def free_bytes():
+    """Free bytes on the cam image, read through the standing read-only mount.
 
-    try:
-        return free_bytes_at(probe)
-    finally:
-        # Loud on failure: this runs every five minutes, and a umount that
-        # quietly fails leaks both the probe directory and the loop device it
-        # created. A few hundred of those a day is its own outage.
-        result = subprocess.run(['umount', probe], capture_output=True, text=True)
-        if result.returncode != 0:
-            logger.error('could not unmount probe %s: %s', probe, result.stderr.strip())
-        else:
-            os.rmdir(probe)
+    No private mount of its own: once usage is counted from the files rather
+    than from the FSINFO sector, the mount TeslaUSB already keeps is as good a
+    window onto the image as a fresh one, and asking for another is what breaks.
+    `mount -o loop` reuses any loop device already bound to the same backing
+    file, so a stale one left at the wrong capacity fails the mount outright
+    ("Can't open blockdev"), and every probe risks leaking a loop device and a
+    temp directory 288 times a day.
+    """
+    return free_bytes_at(Path(MNT_DIR) / 'part1-ro')
 
 
 def clips_to_delete(recent_dir, need_bytes):
@@ -438,7 +426,7 @@ def main():
         logger.info('holding off after a sweep that could not reach the floor')
         return 0
 
-    free = free_bytes(IMG_CAM_PATH)
+    free = free_bytes()
     # Logged every run, not just when acting: this trend is what diagnosed both
     # of the measurement bugs above, and it costs one journal line per tick.
     logger.info('%.1f GB free, floor is %.1f GB', free / GIB, FLOOR_BYTES / GIB)
@@ -447,7 +435,7 @@ def main():
 
     logger.info('below the floor, reclaiming toward %.1f GB', TARGET_BYTES / GIB)
     _, fell_short = sweep(TARGET_BYTES)
-    after = free_bytes(IMG_CAM_PATH)
+    after = free_bytes()
     logger.info('%.1f GB free after sweep', after / GIB)
     if fell_short and after < FLOOR_BYTES:
         start_cooldown(now)
