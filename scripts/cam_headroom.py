@@ -95,6 +95,20 @@ FLOOR_BYTES = 4 * GIB
 # usually unreachable. At 48 GiB it governs. The sweep interval is set by the
 # gap down to FLOOR_BYTES, not by this value alone: (16-4) GiB / 180 MB/min is
 # ~72 min between sweeps, against ~24 min at the old 8 GiB.
+#
+# The trade this buys, stated because raising it is not free: each sweep now
+# has to free ~12 GiB instead of ~4 GiB, and all of it comes from RecentClips
+# outside KEEP_NEWEST_SECONDS. If Tesla's ring really is ~1 h (~10.5 GiB at
+# this rate) then 12 GiB is the whole deletable pool, every sweep empties the
+# ring to the keep window, and a driver who taps "save clip" just after one
+# gets ten minutes instead of an hour — the exact cost described above.
+# It rests on an open question: the ring has never been seen to rotate (largest
+# observation 9.9 GiB over 76 min, still growing when the disk filled), and on
+# a 48 GiB image the pool may be far larger than an hour, in which case a
+# 12 GiB need trims only the oldest slice and ring depth is fine.
+# To settle it, watch a sweep on the box: if `fell_short` is true or the sweep
+# deletes the entire pool, the ring does rotate and this wants to come back
+# down to somewhere between 8 and 12 GiB.
 TARGET_BYTES = 16 * GIB
 
 # Never touch the newest ten minutes: the car may still be writing them, and
