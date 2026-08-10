@@ -2,12 +2,16 @@
 """
 Keep free space on the cam image above a floor while the car is recording.
 
-Tesla writes about 180 MB per minute of RecentClips across six cameras, so a
-cam image that starts an evening with 8 GB free is full within the hour. A full
-drive does not degrade gracefully: the car stops recording ENTIRELY, so there is
-no dashcam footage, no SentryClips folder for a Sentry event, and nothing for
-the uploader to send. That is an availability failure, which is why this runs on
-a timer instead of at boot.
+Tesla writes about 180 MB per minute of RecentClips across six cameras, but
+measured 2026-08-10 that rate is rotation, not accumulation. The ring is capped
+by TIME rather than by the space it is given: on a 48 GiB image it held 10.6 GiB
+across 367 files spanning 61 minutes, and over the following 18 minutes the card
+absorbed 3.2 GB of writes while the image grew 19 MB. Driving does not fill this
+disk. Sentry event folders do, at about 1.8 GB each, because the car rotates the
+ring but never those. A full drive does not degrade gracefully: the car stops
+recording ENTIRELY, so there is no dashcam footage, no SentryClips folder for a
+Sentry event, and nothing for the uploader to send. That is an availability
+failure, which is why this runs on a timer instead of at boot.
 
 Boot cleanup cannot do this job. Its policy protects every file younger than one
 hour, and Tesla's rolling buffer is only about an hour long, so the policy can
@@ -89,27 +93,28 @@ FLOOR_BYTES = 4 * GIB
 # On a tight image this is usually unreachable and the sweep empties everything
 # outside the keep window instead, which has a cost worth knowing: a driver who
 # taps "save dashcam clip" just after a sweep gets the keep window rather than
-# Tesla's usual hour. The fix for that is a larger cam image, not a smaller
-# target — trimming less just means sweeping more often.
-# 2026-08-10: was 8 GiB, chosen when the image was 12 GiB and this target was
-# usually unreachable. At 48 GiB it governs. The sweep interval is set by the
-# gap down to FLOOR_BYTES, not by this value alone: (16-4) GiB / 180 MB/min is
-# ~72 min between sweeps, against ~24 min at the old 8 GiB.
+# Tesla's usual hour. A larger cam image does not fix that, which is what
+# measuring the ring overturned: the image bounds how many event folders fit,
+# never how deep the ring is, so the reclaimable pool is the same ~8.9 GiB on a
+# 12 GiB image as on a 48 GiB one. Keeping the target inside that pool is the
+# only fix, and sweeping less often is not a lever this constant controls.
+# Raised to 16 GiB on 2026-08-10, on the theory that a 48 GiB image would hand
+# the ring a far deeper pool, and put back to 8 GiB the same day once the ring
+# was actually measured. It settled the open question the other way: RecentClips
+# on the 48 GiB image is 10.6 GiB spanning 61 minutes, so the ring is capped by
+# time and a bigger image does not deepen it. What a sweep can take is that
+# minus the keep window, about 8.9 GiB, and that is the whole budget.
 #
-# The trade this buys, stated because raising it is not free: each sweep now
-# has to free ~12 GiB instead of ~4 GiB, and all of it comes from RecentClips
-# outside KEEP_NEWEST_SECONDS. If Tesla's ring really is ~1 h (~10.5 GiB at
-# this rate) then 12 GiB is the whole deletable pool, every sweep empties the
-# ring to the keep window, and a driver who taps "save clip" just after one
-# gets ten minutes instead of an hour — the exact cost described above.
-# It rests on an open question: the ring has never been seen to rotate (largest
-# observation 9.9 GiB over 76 min, still growing when the disk filled), and on
-# a 48 GiB image the pool may be far larger than an hour, in which case a
-# 12 GiB need trims only the oldest slice and ring depth is fine.
-# To settle it, watch a sweep on the box: if `fell_short` is true or the sweep
-# deletes the entire pool, the ring does rotate and this wants to come back
-# down to somewhere between 8 and 12 GiB.
-TARGET_BYTES = 16 * GIB
+# Which is what makes 16 GiB wrong rather than merely aggressive: reaching it
+# from the floor means freeing 12 GiB out of a pool of 8.9, so every sweep would
+# fall short, delete the ring down to the newest ten minutes, and still miss the
+# target. At 8 GiB a sweep frees 4 GiB and leaves ~4.9 GiB of ring, roughly 27
+# minutes of dashcam, which is the behaviour the keep window was sized for.
+#
+# Sweep frequency does not follow from this value either. Free space falls only
+# when a Sentry event lands, so the gap between sweeps is set by how often the
+# car is triggered, not by the 180 MB/min recording rate.
+TARGET_BYTES = 8 * GIB
 
 # Never touch the newest ten minutes: the car may still be writing them, and
 # they are the footage most likely to matter. This also caps how much a sweep
