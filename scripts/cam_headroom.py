@@ -91,7 +91,11 @@ FLOOR_BYTES = 4 * GIB
 # taps "save dashcam clip" just after a sweep gets the keep window rather than
 # Tesla's usual hour. The fix for that is a larger cam image, not a smaller
 # target — trimming less just means sweeping more often.
-TARGET_BYTES = 16 * GIB  # 2026-08-10: was 8; the 48 GiB image makes it reachable, halving sweep frequency
+# 2026-08-10: was 8 GiB, chosen when the image was 12 GiB and this target was
+# usually unreachable. At 48 GiB it governs. The sweep interval is set by the
+# gap down to FLOOR_BYTES, not by this value alone: (16-4) GiB / 180 MB/min is
+# ~72 min between sweeps, against ~24 min at the old 8 GiB.
+TARGET_BYTES = 16 * GIB
 
 # Never touch the newest ten minutes: the car may still be writing them, and
 # they are the footage most likely to matter. This also caps how much a sweep
