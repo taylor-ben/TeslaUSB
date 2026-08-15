@@ -25,7 +25,9 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 
-from config import VIDEO_EXTENSIONS
+from config import ARCHIVE_DIR, ARCHIVE_ENABLED, VIDEO_EXTENSIONS
+from services import tesla_clips
+from services.file_safety import has_archive_copy
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -225,7 +227,35 @@ class CleanupService:
             logger.debug(f"Protected (locked): {video_info['path']}")
             return True
 
+        # 4. Not yet copied to the SD archive. Age, size and count are
+        #    all reasons to prefer deleting one file over another; none
+        #    of them is a reason to delete the only copy of one. The
+        #    same check runs again at the delete doorway in
+        #    execute_cleanup — this one exists so the preview the
+        #    operator approves already tells the truth about what will
+        #    actually go.
+        if not self._has_archive_copy(video_info):
+            logger.debug(f"Protected (not archived yet): {video_info['path']}")
+            return True
+
         return False
+
+    def _has_archive_copy(self, video_info: Dict) -> bool:
+        """Whether the SD archive already holds this file.
+
+        True when archiving is switched off: there is no second tier to
+        wait for, so waiting forever would just make cleanup inert.
+
+        A row with no ``teslacam_root`` did not come from
+        ``_get_videos_in_folder`` and has unknown provenance, so it is
+        treated as un-archived — the direction that keeps the file.
+        """
+        if not ARCHIVE_ENABLED:
+            return True
+        teslacam_root = video_info.get('teslacam_root')
+        if not teslacam_root:
+            return False
+        return has_archive_copy(video_info['path'], teslacam_root, ARCHIVE_DIR)
 
     def _get_videos_in_folder(self, folder_path: Path, folder_name: str) -> List[Dict]:
         """
@@ -244,15 +274,36 @@ class CleanupService:
             logger.warning(f"Folder does not exist: {folder_path}")
             return videos
 
+        # ``teslacam_root`` is carried on every row so execute_cleanup can
+        # hand the delete doorway a card-to-archive predicate without
+        # re-deriving the mount path from the file it is deleting.
+        teslacam_root = str(folder_path.parent)
+
         for item in folder_path.rglob('*'):
             if item.is_file() and self._is_video_file(item):
+                # event.mp4 passes the video-extension test but is one of
+                # an event's three evidence files. Those are never
+                # cleanup candidates — ~435 KB per event against 26-53 MB
+                # for a camera clip, and they are the only record of why
+                # the car triggered.
+                if tesla_clips.is_evidence_file(item.name):
+                    continue
                 try:
                     stat = item.stat()
                     videos.append({
                         'path': str(item),
                         'size': stat.st_size,
-                        'date': datetime.fromtimestamp(stat.st_mtime),
-                        'folder': folder_name
+                        # Recording time from the FILENAME, mtime only as
+                        # a fallback. The car writes FAT timestamps in its
+                        # own timezone and the kernel reinterprets them, so
+                        # a 20:12 recording stats as 11:13 — and every
+                        # age cutoff and oldest-first sort below runs off
+                        # this field.
+                        'date': datetime.fromtimestamp(
+                            tesla_clips.recorded_seconds(item.name, stat.st_mtime)
+                        ),
+                        'folder': folder_name,
+                        'teslacam_root': teslacam_root,
                     })
                 except Exception as e:
                     logger.error(f"Error processing {item}: {e}")
@@ -436,19 +487,33 @@ class CleanupService:
                     from services.file_safety import (
                         safe_delete_archive_video, DeleteOutcome,
                     )
-                    result = safe_delete_archive_video(video['path'])
+                    result = safe_delete_archive_video(
+                        video['path'],
+                        archived_check=(
+                            lambda p, v=video: self._has_archive_copy(v)
+                        ),
+                    )
                     if result.outcome is DeleteOutcome.PROTECTED:
                         # Helper already logged the BLOCKED warning;
                         # surface the user-facing reason.
                         errors.append(f"BLOCKED: {video['path']} is a protected file")
                         continue
+                    if result.outcome is DeleteOutcome.UNARCHIVED:
+                        # The plan was calculated earlier; the archive
+                        # copy can have gone away (or never landed)
+                        # since. Explicitly branched rather than left to
+                        # the fall-through, which used to count any
+                        # unrecognised outcome as a successful delete.
+                        errors.append(
+                            f"Skipped (not archived yet): {video['path']}"
+                        )
+                        continue
                     if result.outcome is DeleteOutcome.MISSING:
                         errors.append(f"Skipped (missing): {video['path']}")
                         continue
-                    if result.outcome is DeleteOutcome.ERROR:
+                    if result.outcome is not DeleteOutcome.DELETED:
                         errors.append(f"Skipped (unwritable): {video['path']}")
                         continue
-                    # outcome is DELETED
                     logger.info(f"Deleted: {video['path']}")
                 else:
                     logger.info(f"[DRY RUN] Would delete: {video['path']}")

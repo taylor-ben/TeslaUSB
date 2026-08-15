@@ -50,17 +50,23 @@ and no amount of misconfiguration should let a headroom sweep reach a Sentry
 event. Evicting event folders needs proof they are safe elsewhere, which is a
 separate job.
 
+Within the ring, clips the SD archive already holds go first, and one that
+exists nowhere else is only taken when those run out. That is a preference and
+not a veto, because the archive worker deliberately never copies RecentClips
+with no GPS-bearing SEI, so a parked car's ring is legitimately unarchived
+almost end to end. Refusing to touch it would let the image fill, and a full
+image is the failure this whole file exists to prevent. The fallback says in
+the log how much it took and why.
+
 Getting the drive back to the car outranks everything else here. A sweep that
 dies halfway leaves the car with no USB drive at all, so the marker file makes
 that state recoverable by the next run, and SIGTERM is caught so systemd
 stopping this unit still hands the drive back.
 """
 
-import calendar
 import fcntl
 import logging
 import os
-import re
 import signal
 import subprocess
 import sys
@@ -72,12 +78,23 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR / 'web'))
 
 from config import (
+    ARCHIVE_DIR,
+    ARCHIVE_ENABLED,
     GADGET_DIR,
     MNT_DIR,
     STATE_FILE,
     WEB_PORT,
     get_script_path,
 )
+from services.file_safety import (
+    DeleteOutcome,
+    has_archive_copy,
+    safe_delete_archive_video,
+)
+# Re-exported rather than defined here: the SD-card prunes in
+# archive_watchdog need the same filename clock, and there is no second
+# parser of Tesla's clip names anywhere in the repo.
+from services.tesla_clips import CLIP_NAME, clip_seconds  # noqa: F401
 
 GIB = 1024 ** 3
 
@@ -146,35 +163,7 @@ COOLDOWN_PATH = os.path.join(GADGET_DIR, 'cam_headroom.cooldown')
 SETTINGS_URL = f'http://127.0.0.1:{WEB_PORT}/settings'
 UDC_PATH = '/sys/kernel/config/usb_gadget/teslausb/UDC'
 
-# 2026-08-08_20-12-32-front.mp4
-CLIP_NAME = re.compile(r'^(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})-.+\.mp4$')
-
 logger = logging.getLogger('cam_headroom')
-
-
-def clip_seconds(name):
-    """Seconds since the epoch parsed from a clip's filename, or None.
-
-    A real epoch rather than a digit-packing scheme, because the value is used
-    for durations as well as ordering: a naive `month * 31 + day` clock makes
-    the 1st of October look a day away from the 30th of September, which would
-    put the previous evening's footage outside the keep window and delete it.
-
-    The fields are range-checked so a corrupt directory entry parses as None
-    rather than as a date in the year 9999.
-    """
-    match = CLIP_NAME.match(name)
-    if match is None:
-        return None
-    year, month, day, hour, minute, second = (int(part) for part in match.groups())
-    if not (1 <= month <= 12 and 1 <= day <= 31):
-        return None
-    if not (hour <= 23 and minute <= 59 and second <= 59):
-        return None
-    try:
-        return calendar.timegm((year, month, day, hour, minute, second, 0, 0, 0))
-    except (ValueError, OverflowError):
-        return None
 
 
 def used_bytes(mount, cluster_bytes):
@@ -276,6 +265,61 @@ def clips_to_delete(recent_dir, need_bytes):
     return chosen, freed
 
 
+def split_by_archive_copy(paths, teslacam_dir):
+    """Split clips into (already on the SD card, only on this image).
+
+    Order is preserved inside both lists, so each stays oldest-first.
+
+    The check is `<ARCHIVE_DIR>/<path under TeslaCam>` existing at the
+    same size, which is what the archive worker leaves behind once its
+    `.partial` passed the byte count and was renamed into place.
+
+    A clip landing in the second list is NOT a fault by itself. The
+    archive worker deliberately drops RecentClips with no GPS-bearing
+    SEI message, because a parked car records the same empty driveway
+    for eight hours and none of it is worth the SD card. So on a car
+    that has been sitting, most of the ring legitimately has no archive
+    copy and never will. That is why the caller treats this as an
+    ordering preference rather than a veto: the floor exists so the car
+    keeps recording at all, and a full image stops it dead.
+
+    With archiving switched off entirely there is no second tier to
+    wait for, so everything counts as archived.
+    """
+    if not ARCHIVE_ENABLED:
+        return list(paths), []
+    archived, only_here = [], []
+    for path in paths:
+        if has_archive_copy(path, teslacam_dir, ARCHIVE_DIR):
+            archived.append(path)
+        else:
+            only_here.append(path)
+    return archived, only_here
+
+
+def delete_clips(paths, need_bytes):
+    """Delete from `paths` in order until `need_bytes` is covered.
+
+    Returns (count, bytes_freed).
+
+    Goes through the shared delete doorway rather than `os.unlink` so the
+    protected-file and evidence guards apply here too. RecentClips holds
+    neither, but the guards are cheap and a doorway with an exception is
+    not a doorway.
+    """
+    count, freed = 0, 0
+    for path in paths:
+        if freed >= need_bytes:
+            break
+        result = safe_delete_archive_video(path)
+        if result.outcome is DeleteOutcome.DELETED:
+            count += 1
+            freed += result.bytes_freed
+        else:
+            logger.warning('could not delete %s: %s', path, result.outcome.value)
+    return count, freed
+
+
 def run_script(name):
     result = subprocess.run(
         ['bash', get_script_path(name)], capture_output=True, text=True,
@@ -368,11 +412,28 @@ def sweep(target_bytes):
         if not recent_dir.is_dir():
             logger.warning('no RecentClips at %s, nothing to reclaim', recent_dir)
             return 0, True
-        paths, freed = clips_to_delete(recent_dir, need)
-        for path in paths:
-            os.unlink(path)
+        paths, _planned = clips_to_delete(recent_dir, need)
+        # Prefer clips the SD archive already holds, and only reach for a
+        # clip that exists nowhere else once those run out. Deleting an
+        # unarchived clip is a real loss, but a full image is a bigger
+        # one: the car stops recording ENTIRELY, so there is no dashcam
+        # footage, no SentryClips folder for a Sentry event, and nothing
+        # for the uploader to send. The floor wins, and says so.
+        archived, only_here = split_by_archive_copy(paths, str(mount / 'TeslaCam'))
+        deleted, freed = delete_clips(archived, need)
+        if freed < need and only_here:
+            logger.warning(
+                'freeing %.1f GB more from %d clip(s) the SD archive does not '
+                'hold. Expected on a parked car, where the archive worker skips '
+                'RecentClips with no GPS: keeping them would fill the image and '
+                'stop the car recording.',
+                (need - freed) / GIB, len(only_here),
+            )
+            more, more_bytes = delete_clips(only_here, need - freed)
+            deleted += more
+            freed += more_bytes
         os.sync()
-        logger.info('deleted %d clips, %.1f GB', len(paths), freed / GIB)
+        logger.info('deleted %d clips, %.1f GB', deleted, freed / GIB)
         if freed < need:
             logger.warning(
                 'wanted %.1f GB, reclaimed %.1f GB: RecentClips outside the newest '

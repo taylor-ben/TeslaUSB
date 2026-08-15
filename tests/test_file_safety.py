@@ -219,3 +219,152 @@ class TestSafeRmtree:
 
     def test_missing_dir_returns_false(self, tmp_path, reset_gadget_dir):
         assert file_safety.safe_rmtree(str(tmp_path / "ghost")) is False
+
+
+# ---------------------------------------------------------------------------
+# The two rules the owner stated on 2026-08-15, enforced at the doorway
+# ---------------------------------------------------------------------------
+# 1. An event's evidence files (event.json / event.mp4 / thumb.png) are
+#    never deleted. ~435 KB per event against 26-53 MB for one camera
+#    clip, and they are the only record of WHY the car triggered.
+# 2. Nothing is deleted before it exists on a second tier. Callers that
+#    have one pass ``archived_check``; the doorway answers UNARCHIVED
+#    when the second copy is not there yet.
+# ---------------------------------------------------------------------------
+
+
+class TestEvidenceIsNeverDeleted:
+    @pytest.mark.parametrize(
+        "name", ["event.json", "event.mp4", "thumb.png"],
+    )
+    def test_doorway_refuses_every_evidence_name(
+        self, tmp_path, reset_gadget_dir, name,
+    ):
+        event_dir = tmp_path / "SentryClips" / "2026-08-14_19-18-38"
+        event_dir.mkdir(parents=True)
+        path = event_dir / name
+        path.write_bytes(b"x" * 64)
+
+        result = file_safety.safe_delete_archive_video(str(path))
+
+        assert result.outcome is DeleteOutcome.PROTECTED
+        assert result.bytes_freed == 0
+        assert path.exists(), "evidence file was deleted"
+
+    def test_a_camera_clip_in_the_same_folder_is_still_deletable(
+        self, tmp_path, reset_gadget_dir,
+    ):
+        event_dir = tmp_path / "SentryClips" / "2026-08-14_19-18-38"
+        event_dir.mkdir(parents=True)
+        clip = event_dir / "2026-08-14_19-18-38-front.mp4"
+        clip.write_bytes(b"x" * 64)
+
+        result = file_safety.safe_delete_archive_video(str(clip))
+
+        assert result.outcome is DeleteOutcome.DELETED
+        assert not clip.exists()
+
+    def test_rmtree_still_removes_an_event_folder(
+        self, tmp_path, reset_gadget_dir,
+    ):
+        """The video panel's "delete this event" button must keep working.
+
+        The evidence rule lives in the delete doorway and NOT in
+        ``is_protected_file`` precisely because ``is_protected_file``
+        also gates ``safe_rmtree``; putting it there would make the
+        button fail on every event the owner explicitly asked to remove.
+        """
+        event_dir = tmp_path / "SentryClips" / "2026-08-14_19-18-38"
+        event_dir.mkdir(parents=True)
+        (event_dir / "event.json").write_bytes(b"{}")
+        (event_dir / "thumb.png").write_bytes(b"x")
+        (event_dir / "2026-08-14_19-18-38-front.mp4").write_bytes(b"x")
+
+        assert file_safety.safe_rmtree(str(event_dir)) is True
+        assert not event_dir.exists()
+
+
+class TestArchivedCheckGate:
+    def test_refuses_when_the_predicate_says_no(self, tmp_path, reset_gadget_dir):
+        clip = tmp_path / "2026-08-14_19-18-38-front.mp4"
+        clip.write_bytes(b"x" * 64)
+
+        result = file_safety.safe_delete_archive_video(
+            str(clip), archived_check=lambda _p: False,
+        )
+
+        assert result.outcome is DeleteOutcome.UNARCHIVED
+        assert result.bytes_freed == 0
+        assert clip.exists()
+
+    def test_deletes_when_the_predicate_says_yes(self, tmp_path, reset_gadget_dir):
+        clip = tmp_path / "2026-08-14_19-18-38-front.mp4"
+        clip.write_bytes(b"x" * 64)
+
+        result = file_safety.safe_delete_archive_video(
+            str(clip), archived_check=lambda _p: True,
+        )
+
+        assert result.outcome is DeleteOutcome.DELETED
+        assert not clip.exists()
+
+    def test_no_predicate_keeps_the_old_behaviour(self, tmp_path, reset_gadget_dir):
+        clip = tmp_path / "2026-08-14_19-18-38-front.mp4"
+        clip.write_bytes(b"x" * 64)
+
+        result = file_safety.safe_delete_archive_video(str(clip))
+
+        assert result.outcome is DeleteOutcome.DELETED
+
+    def test_unarchived_is_distinct_from_protected(self):
+        """A prune reporting the two as one number cannot tell an
+        operator whether waiting will help."""
+        assert DeleteOutcome.UNARCHIVED is not DeleteOutcome.PROTECTED
+
+
+class TestHasArchiveCopy:
+    def _tiers(self, tmp_path):
+        source_root = tmp_path / "part1" / "TeslaCam"
+        archive_root = tmp_path / "ArchivedClips"
+        (source_root / "SentryClips" / "2026-08-14_19-18-38").mkdir(parents=True)
+        archive_root.mkdir()
+        return source_root, archive_root
+
+    def test_true_when_the_archive_holds_the_same_size(self, tmp_path):
+        source_root, archive_root = self._tiers(tmp_path)
+        rel = os.path.join("SentryClips", "2026-08-14_19-18-38", "front.mp4")
+        src = source_root / rel
+        src.write_bytes(b"x" * 4096)
+        dest = archive_root / rel
+        dest.parent.mkdir(parents=True)
+        dest.write_bytes(b"x" * 4096)
+
+        assert file_safety.has_archive_copy(
+            str(src), str(source_root), str(archive_root),
+        ) is True
+
+    def test_false_when_the_archive_copy_is_missing(self, tmp_path):
+        source_root, archive_root = self._tiers(tmp_path)
+        src = source_root / "SentryClips" / "2026-08-14_19-18-38" / "front.mp4"
+        src.write_bytes(b"x" * 4096)
+
+        assert file_safety.has_archive_copy(
+            str(src), str(source_root), str(archive_root),
+        ) is False
+
+    def test_false_when_the_sizes_disagree(self, tmp_path):
+        """Size, not mtime: the archive copy inherits the car's FAT
+        timestamp through ``shutil.copystat``, so the mtimes agree even
+        on a half-written copy."""
+        source_root, archive_root = self._tiers(tmp_path)
+        rel = os.path.join("SentryClips", "2026-08-14_19-18-38", "front.mp4")
+        src = source_root / rel
+        src.write_bytes(b"x" * 4096)
+        dest = archive_root / rel
+        dest.parent.mkdir(parents=True)
+        dest.write_bytes(b"x" * 100)
+        os.utime(dest, (os.stat(src).st_atime, os.stat(src).st_mtime))
+
+        assert file_safety.has_archive_copy(
+            str(src), str(source_root), str(archive_root),
+        ) is False

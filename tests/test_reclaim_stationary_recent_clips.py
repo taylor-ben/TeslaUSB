@@ -461,15 +461,17 @@ class TestReclaimSafetyGuards:
         from services import file_safety
         real_delete = file_safety.safe_delete_archive_video
 
-        def _patched_delete(path):
-            # Refuse the protected candidate at the doorway.
+        def _patched_delete(path, **kwargs):
+            # Refuse the protected candidate at the doorway. ``**kwargs``
+            # absorbs ``archived_check``, which the prunes now hand the
+            # doorway as the "not until it exists somewhere else" gate.
             normalized = os.path.normpath(path)
             if normalized.endswith('protected.mp4'):
                 return file_safety.DeleteResult(
                     outcome=file_safety.DeleteOutcome.PROTECTED,
                     bytes_freed=0,
                 )
-            return real_delete(path)
+            return real_delete(path, **kwargs)
 
         # Patch the symbol that ``_delete_one_mp4`` looks up at call time.
         monkeypatch.setattr(

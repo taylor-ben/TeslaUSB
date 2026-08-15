@@ -206,6 +206,19 @@ runs only against files in `~/ArchivedClips/`.
 | File watcher callback            | Every new `.mp4` on the RO USB mount               |
 | Manual trigger                   | UI "Archive Now" button                            |
 
+Inside a SentryClips / SavedClips event folder the producer and the
+watcher also enqueue the event's three **evidence** files —
+`event.json`, `event.mp4`, `thumb.png` (`tesla_clips.EVIDENCE_NAMES`).
+They are ~435 KB per event against 26-53 MB for one camera clip, and
+they are the only record of *why* the car triggered. Before
+2026-08-16 the `.mp4`-only filter dropped two of the three: the box
+had 22 `event.json` on the card and 0 in the archive. `RecentClips`
+stays `.mp4`-only — those names never appear there.
+
+Evidence files are copied and nothing else: the archive worker skips
+the SEI sidecar walk and the indexer enqueue for anything that is not
+an `.mp4`.
+
 ### Worker side: the loop
 
 ```mermaid
@@ -539,6 +552,24 @@ Then it picks a **bucket** and acts:
 | `kept_synced`    | Recently synced to cloud, within retention horizon    | Keep                                                       |
 | `prune_synced_old` | Synced + older than `default_retention_days`        | Delete file                                                |
 | `prune_unsynced_old` | Unsynced + older + `delete_unsynced` allows it    | Delete file                                                |
+
+Two things about "how old" and "is it synced" that are easy to get
+wrong, both corrected 2026-08-16:
+
+- **Age comes from the FILENAME, not `st_mtime`.** The car writes FAT
+  timestamps in its own timezone, the kernel reinterprets them (a
+  20:12 recording stats as 11:13), and the archive copy inherits the
+  wrong value through the `shutil.copystat` in `_atomic_copy`. Both
+  prunes order and cut off by `tesla_clips.recorded_seconds`, falling
+  back to mtime only for a name that carries no timestamp.
+- **The cloud DB is keyed by event FOLDER.** `cloud_archive_service`
+  writes one `cloud_synced_files` row per event directory
+  (`SentryClips/2026-08-11_23-11-15`), never one per clip, so a
+  per-file lookup matched nothing and every clip read as un-synced.
+  Only flat `ArchivedClips/<file>` uploads get a per-file row.
+
+An event's evidence files are never prune candidates — they are left
+out of the walker, and refused again at the delete doorway.
 
 ### The "delete_unsynced" three-state config
 

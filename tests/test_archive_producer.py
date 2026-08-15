@@ -19,7 +19,7 @@ import time
 
 import pytest
 
-from services import archive_producer, archive_queue
+from services import archive_producer, archive_queue, tesla_clips
 from services.mapping_service import _init_db
 
 
@@ -106,7 +106,10 @@ class TestIterArchiveCandidates:
         assert len(out) == 1
 
     def test_ignores_non_mp4_files(self, teslacam):
-        # Drop a stray non-mp4 file in RecentClips and an event folder
+        # Drop a stray non-mp4 file in RecentClips and an event folder.
+        # The stray in RecentClips is ignored; the one in the event
+        # folder is ``event.json``, which IS collected — it is an
+        # evidence file and the only record of why the car triggered.
         recent = os.path.join(teslacam, 'RecentClips')
         with open(os.path.join(recent, 'thumb.jpg'), 'wb') as f:
             f.write(b"not a video")
@@ -114,8 +117,30 @@ class TestIterArchiveCandidates:
                                '2026-05-11_09-30-00', 'event.json'), 'w') as f:
             f.write('{}')
         paths = archive_producer._iter_archive_candidates(teslacam)
-        assert all(p.lower().endswith('.mp4') for p in paths)
-        assert len(paths) == 5
+        assert not any(p.endswith('thumb.jpg') for p in paths)
+        assert any(p.endswith('event.json') for p in paths)
+        assert len(paths) == 6
+
+    def test_collects_evidence_files_only_inside_event_folders(self, teslacam):
+        # All three evidence names are collected from an event folder.
+        # In flat RecentClips only the widened branch is absent, so
+        # ``event.json`` / ``thumb.png`` there stay ignored — Tesla only
+        # writes them inside an event folder, so a file by that name in
+        # the ring is somebody else's. (``event.mp4`` in RecentClips is
+        # still taken: it matches the plain .mp4 rule that has always
+        # applied to the ring.)
+        recent = os.path.join(teslacam, 'RecentClips')
+        event = os.path.join(teslacam, 'SentryClips', '2026-05-11_09-30-00')
+        for name in tesla_clips.EVIDENCE_NAMES:
+            with open(os.path.join(recent, name), 'wb') as f:
+                f.write(b"x")
+            with open(os.path.join(event, name), 'wb') as f:
+                f.write(b"x")
+        paths = set(archive_producer._iter_archive_candidates(teslacam))
+        for name in tesla_clips.EVIDENCE_NAMES:
+            assert os.path.join(event, name) in paths
+        assert os.path.join(recent, 'event.json') not in paths
+        assert os.path.join(recent, 'thumb.png') not in paths
 
     def test_case_insensitive_extension(self, tmp_path):
         root = tmp_path / "TeslaCam"

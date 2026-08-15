@@ -1809,7 +1809,7 @@ def _clip_has_gps_signal(source_path: str) -> Optional[bool]:
         are never silently dropped — the existing copy-then-index
         path will handle them safely.
 
-    Memory and I/O model: re-uses the same ``mmap``-backed
+    Memory and I/O model: re-uses the same bounded-pread
     :func:`sei_parser.extract_sei_messages` generator the indexer
     uses, with an early ``break`` on the first GPS-bearing message
     AND a ``max_walk_bytes`` cap so a parked clip with zero SEI does
@@ -1855,8 +1855,25 @@ def _clip_has_gps_signal(source_path: str) -> Optional[bool]:
         # Tesla rotated the source between the stable-write gate and
         # the peek. Caller will re-stat and mark source_gone.
         return None
+    except sei_parser.ClipReadError as e:
+        # The read itself failed (EIO) — on the USB image that is the
+        # car having rewritten the cluster chain under the walk, not a
+        # malformed clip. It MUST NOT reach the give-up branch below:
+        # that branch answers False ("stationary, never archive this")
+        # for anything old and unparseable, on the reasoning that a
+        # structurally broken file will never become parseable. A bad
+        # cluster read is the opposite — transient by construction,
+        # since the next attempt reads wherever the car put the data.
+        # Answer None so the worker copies the clip instead of
+        # discarding real footage.
+        logger.warning(
+            "_clip_has_gps_signal: read error on %s (%s) — the car is "
+            "rewriting this volume; deferring to copy",
+            source_path, e,
+        )
+        return None
     except Exception as e:  # noqa: BLE001
-        # Any parse error (corrupt MP4, mmap failure, protobuf decode
+        # Any parse error (corrupt MP4, protobuf decode
         # blow-up, "No mdat box found", "MP4 box 'moov' not found")
         # — the original behavior was "fall through to the existing
         # copy path so we never lose data on a parser bug" (None).
@@ -2254,6 +2271,14 @@ def process_one_claim(row: Dict[str, Any], db_path: str,
     # recovered after N < cap defers doesn't leave stale state behind.
     _reset_moov_defer_count(source_path)
     archive_queue.mark_copied(row_id, dest_path, db_path=db_path)
+    # An event folder's ``event.json`` / ``thumb.png`` are archived
+    # rows now (2026-08-16) but they are not videos: the SEI walk has
+    # nothing to parse in them and the indexer would take a row it can
+    # only fail on. Copy them and stop there. ``event.mp4`` IS a real
+    # MP4 (ftyp / free / mdat / moov, verified on the box) so it keeps
+    # the full treatment, moov-verify included.
+    if not dest_path.lower().endswith('.mp4'):
+        return 'copied'
     # Issue #197: while the just-copied file's pages are still hot
     # in the kernel page cache, parse SEI + mvhd inline and write
     # a sidecar JSON. The indexer's later pass reads the sidecar

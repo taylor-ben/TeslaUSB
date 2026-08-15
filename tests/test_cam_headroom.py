@@ -214,3 +214,93 @@ def test_floor_leaves_room_for_an_event_landing_all_at_once():
     # absorb both between two ticks, or the guard fires after the disk is full.
     assert cam_headroom.FLOOR_BYTES < cam_headroom.TARGET_BYTES
     assert cam_headroom.FLOOR_BYTES >= 2.7 * cam_headroom.GIB
+
+
+# ---------------------------------------------------------------------------
+# 7. A clip the SD archive already holds goes before one that exists nowhere
+#    else, but the floor still wins: a full image stops the car recording
+#    entirely, so an unarchived clip IS taken when the archived ones do not
+#    cover the shortfall, and the log says how many and why.
+# ---------------------------------------------------------------------------
+
+
+def _tiers(tmp_path, monkeypatch):
+    """Wire cam_headroom at a tmp card mount + tmp SD archive."""
+    teslacam = tmp_path / 'part1' / 'TeslaCam'
+    recent = teslacam / 'RecentClips'
+    recent.mkdir(parents=True)
+    archive = tmp_path / 'ArchivedClips'
+    archive.mkdir()
+    monkeypatch.setattr(cam_headroom, 'ARCHIVE_ENABLED', True)
+    monkeypatch.setattr(cam_headroom, 'ARCHIVE_DIR', str(archive))
+    return teslacam, recent, archive
+
+
+def test_split_puts_clips_the_archive_holds_first(tmp_path, monkeypatch):
+    teslacam, recent, archive = _tiers(tmp_path, monkeypatch)
+    copied = write_clip(recent, '2026-08-08_16-50-00', 'front', 4096)
+    only_here = write_clip(recent, '2026-08-08_16-51-00', 'front', 4096)
+    (archive / 'RecentClips').mkdir()
+    (archive / 'RecentClips' / copied.name).write_bytes(b'\0' * 4096)
+
+    archived, pending = cam_headroom.split_by_archive_copy(
+        [str(copied), str(only_here)], str(teslacam),
+    )
+
+    assert archived == [str(copied)]
+    assert pending == [str(only_here)]
+
+
+def test_split_treats_a_short_archive_copy_as_missing(tmp_path, monkeypatch):
+    teslacam, recent, archive = _tiers(tmp_path, monkeypatch)
+    clip = write_clip(recent, '2026-08-08_16-50-00', 'front', 4096)
+    (archive / 'RecentClips').mkdir()
+    (archive / 'RecentClips' / clip.name).write_bytes(b'\0' * 100)
+
+    archived, pending = cam_headroom.split_by_archive_copy(
+        [str(clip)], str(teslacam),
+    )
+
+    assert archived == []
+    assert pending == [str(clip)]
+
+
+def test_split_counts_everything_archived_when_archiving_is_off(
+    tmp_path, monkeypatch,
+):
+    # With no second tier there is nothing to wait for, and waiting
+    # forever would let the image fill.
+    teslacam, recent, _archive = _tiers(tmp_path, monkeypatch)
+    monkeypatch.setattr(cam_headroom, 'ARCHIVE_ENABLED', False)
+    clip = write_clip(recent, '2026-08-08_16-50-00', 'front', 4096)
+
+    archived, pending = cam_headroom.split_by_archive_copy(
+        [str(clip)], str(teslacam),
+    )
+
+    assert archived == [str(clip)]
+    assert pending == []
+
+
+def test_delete_clips_stops_once_the_need_is_covered(tmp_path, monkeypatch):
+    _teslacam, recent, _archive = _tiers(tmp_path, monkeypatch)
+    first = write_clip(recent, '2026-08-08_16-50-00', 'front', 4096)
+    second = write_clip(recent, '2026-08-08_16-51-00', 'front', 4096)
+
+    count, freed = cam_headroom.delete_clips([str(first), str(second)], 4096)
+
+    assert (count, freed) == (1, 4096)
+    assert not first.exists()
+    assert second.exists()
+
+
+def test_delete_clips_refuses_an_evidence_file(tmp_path, monkeypatch):
+    # RecentClips holds none, but the doorway is the doorway.
+    _teslacam, recent, _archive = _tiers(tmp_path, monkeypatch)
+    evidence = recent / 'event.json'
+    evidence.write_bytes(b'{}')
+
+    count, freed = cam_headroom.delete_clips([str(evidence)], 1024)
+
+    assert (count, freed) == (0, 0)
+    assert evidence.exists()

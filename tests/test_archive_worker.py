@@ -182,11 +182,12 @@ def _default_clip_has_gps_signal_true(request, monkeypatch):
     monkeypatch this function with their own value AFTER this fixture
     runs, so they keep full control of the peek result.
 
-    Tests that exercise the SEI peek itself (``TestClipHasGpsSignal``)
-    need the real function — they're explicitly opted out via the
+    Tests that exercise the SEI peek itself (any ``TestClipHasGpsSignal*``
+    class) need the real function — they're explicitly opted out via the
     class-name check below.
     """
-    if request.cls is not None and request.cls.__name__ == 'TestClipHasGpsSignal':
+    if (request.cls is not None
+            and request.cls.__name__.startswith('TestClipHasGpsSignal')):
         return
     monkeypatch.setattr(
         archive_worker, '_clip_has_gps_signal',
@@ -4593,3 +4594,56 @@ class TestMoovIncompleteDefer:
         finally:
             archive_worker._MOOV_DEFER_LRU_SIZE = original_size
             archive_worker._moov_defer_counts.clear()
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-15 — a failed READ is not a malformed clip
+# ---------------------------------------------------------------------------
+# The car owns the vfat volume through the USB gadget and rewrites
+# clusters under us. That used to arrive as SIGBUS from an mmap page
+# fault and killed gadget_web outright (32 status=7/BUS kills in two
+# hours, archive 2008 files behind). Reading through os.pread turns it
+# into an EIO the parser raises as ClipReadError — which must NOT be
+# funnelled into the give-up branch, because that branch answers
+# "stationary, never archive this" and would silently drop real footage.
+# ---------------------------------------------------------------------------
+
+
+class TestClipHasGpsSignalReadErrors:
+    def _clip(self, tmp_path):
+        clip = tmp_path / "2026-08-14_19-18-38-front.mp4"
+        clip.write_bytes(b"\0" * 4096)
+        # Older than the give-up threshold, which is where a generic
+        # parse failure would be answered False.
+        old = time.time() - 100000
+        os.utime(clip, (old, old))
+        return str(clip)
+
+    def test_clip_read_error_defers_to_copy(self, tmp_path, monkeypatch):
+        from services import sei_parser
+
+        clip = self._clip(tmp_path)
+
+        def boom(*_args, **_kwargs):
+            raise sei_parser.ClipReadError(5, "Input/output error")
+
+        monkeypatch.setattr(sei_parser, 'extract_sei_messages', boom)
+
+        assert archive_worker._clip_has_gps_signal(clip) is None, (
+            "a transient bad-cluster read must fall through to copying "
+            "the clip, not mark it skipped_stationary"
+        )
+
+    def test_a_structural_parse_failure_still_gives_up(self, tmp_path, monkeypatch):
+        """The give-up branch stays intact for genuinely broken files —
+        it exists so an unparseable row can't cycle the queue forever."""
+        from services import sei_parser
+
+        clip = self._clip(tmp_path)
+
+        def boom(*_args, **_kwargs):
+            raise ValueError("No mdat box found")
+
+        monkeypatch.setattr(sei_parser, 'extract_sei_messages', boom)
+
+        assert archive_worker._clip_has_gps_signal(clip) is False

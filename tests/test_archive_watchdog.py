@@ -2513,3 +2513,142 @@ class TestCapacityPrune:
             "'retention' lock for the entire scan."
         )
 
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-16 — the two things the prunes were getting wrong about the data
+# ---------------------------------------------------------------------------
+# * The cloud DB is keyed by event FOLDER, not by file, so the per-file
+#   lookup could never match and every clip read as "not synced".
+# * mtime is not chronological on this data: the car writes FAT
+#   timestamps in its own timezone and the archive copy inherits them
+#   through shutil.copystat, so "oldest first" ordered by the wrong key.
+# * An event's evidence files must not even appear as candidates.
+# ---------------------------------------------------------------------------
+
+
+class TestCloudFolderKeyLookup:
+    @pytest.fixture
+    def cloud_db(self, tmp_path):
+        return _make_cloud_db(tmp_path)
+
+    def test_event_folder_row_satisfies_a_clip_inside_it(
+        self, archive_root, cloud_db,
+    ):
+        """This is the shape the uploader actually writes.
+
+        Read live off the box 2026-08-16: all 11 rows looked like
+        ``('SentryClips/2026-08-11_23-11-15', 'synced')`` and not one
+        was a file path.
+        """
+        clip = _make_archive_mp4(
+            archive_root,
+            "SentryClips/2026-08-11_23-11-15/2026-08-11_23-11-15-front.mp4",
+            mtime=time.time(),
+        )
+        _record_synced(cloud_db, 'SentryClips/2026-08-11_23-11-15')
+
+        assert archive_watchdog._is_synced_to_cloud(
+            clip, archive_root, cloud_db,
+        ) is True
+
+    def test_a_failed_folder_row_does_not_count_as_synced(
+        self, archive_root, cloud_db,
+    ):
+        clip = _make_archive_mp4(
+            archive_root,
+            "SentryClips/2026-08-09_09-30-57/2026-08-09_09-30-57-front.mp4",
+            mtime=time.time(),
+        )
+        _record_synced(cloud_db, 'SentryClips/2026-08-09_09-30-57',
+                       status='failed')
+
+        assert archive_watchdog._is_synced_to_cloud(
+            clip, archive_root, cloud_db,
+        ) is False
+
+    def test_unrelated_event_folder_does_not_match(
+        self, archive_root, cloud_db,
+    ):
+        clip = _make_archive_mp4(
+            archive_root,
+            "SentryClips/2026-08-12_10-00-00/2026-08-12_10-00-00-front.mp4",
+            mtime=time.time(),
+        )
+        _record_synced(cloud_db, 'SentryClips/2026-08-11_23-11-15')
+
+        assert archive_watchdog._is_synced_to_cloud(
+            clip, archive_root, cloud_db,
+        ) is False
+
+    def test_flat_archived_clip_matches_its_prefixed_row(
+        self, archive_root, cloud_db,
+    ):
+        """Flat uploads out of ARCHIVE_DIR DO get a per-file row, and the
+        uploader prefixes them with the folder it calls them by."""
+        clip = _make_archive_mp4(
+            archive_root, "2026-08-11_23-11-15-front.mp4", mtime=time.time(),
+        )
+        _record_synced(cloud_db, 'ArchivedClips/2026-08-11_23-11-15-front.mp4')
+
+        assert archive_watchdog._is_synced_to_cloud(
+            clip, archive_root, cloud_db,
+        ) is True
+
+
+class TestPruneCandidateSelection:
+    def test_evidence_files_are_not_candidates(self, archive_root):
+        """event.mp4 passes the .mp4 filter but must never be prunable."""
+        event = "SentryClips/2026-08-14_19-18-38"
+        clip = _make_archive_mp4(
+            archive_root, f"{event}/2026-08-14_19-18-38-front.mp4",
+            mtime=time.time(),
+        )
+        evidence = _make_archive_mp4(
+            archive_root, f"{event}/event.mp4", mtime=time.time(),
+        )
+
+        found = [p for p, _t, _s in
+                 archive_watchdog._iter_archive_mp4_files(archive_root)]
+
+        assert clip in found
+        assert evidence not in found, (
+            "event.mp4 is one of an event's three evidence files "
+            "(~435 KB total) and is never a capacity candidate"
+        )
+
+    def test_ordering_uses_the_filename_not_the_mtime(self, archive_root):
+        """The car's FAT timestamps lie; the filename carries the truth.
+
+        Both clips get mtimes in the OPPOSITE order to their names —
+        exactly what the kernel's reinterpretation of the car's
+        timezone produces (a 20:12 recording stats as 11:13).
+        """
+        older_by_name = _make_archive_mp4(
+            archive_root, "RecentClips/2026-08-08_16-50-00-front.mp4",
+            mtime=2_000_000_000,
+        )
+        newer_by_name = _make_archive_mp4(
+            archive_root, "RecentClips/2026-08-08_20-12-32-front.mp4",
+            mtime=1_000_000_000,
+        )
+
+        by_time = sorted(
+            archive_watchdog._iter_archive_mp4_files(archive_root),
+            key=lambda t: t[1],
+        )
+
+        assert [p for p, _t, _s in by_time] == [older_by_name, newer_by_name]
+
+    def test_unparseable_name_falls_back_to_mtime(self, archive_root):
+        """Sidecars and hand-dropped fixtures carry no timestamp in the
+        name, and mtime on a Pi-written file is correct — only the car's
+        own FAT timestamps are the ones that lie."""
+        odd = _make_archive_mp4(
+            archive_root, "RecentClips/hand-dropped.mp4", mtime=1_234_567_890,
+        )
+
+        found = {p: t for p, t, _s in
+                 archive_watchdog._iter_archive_mp4_files(archive_root)}
+
+        assert found[odd] == 1_234_567_890

@@ -25,6 +25,8 @@ import threading
 import time
 from typing import Callable, List, Optional, Set
 
+from services import tesla_clips
+
 logger = logging.getLogger(__name__)
 
 # Polling interval when inotify is not available or mount changes
@@ -484,6 +486,15 @@ def _scan_for_new_files(paths: List[str], known_files: Set[str]) -> List[str]:
     """Scan directories for new .mp4 files not in known_files set.
 
     Uses os.scandir for memory efficiency (generator-based).
+
+    Inside an event folder the filter also admits
+    :data:`services.tesla_clips.EVIDENCE_NAMES` — ``event.json``,
+    ``event.mp4`` and ``thumb.png`` are the only record of why the car
+    triggered, and the ``.mp4``-only filter that used to be here meant
+    the real-time path never enqueued two of the three (0 archived out
+    of 22 on the box, measured 2026-08-16). The flat branches
+    (``RecentClips/*.mp4`` and root-level ``ArchivedClips`` files) stay
+    ``.mp4``-only: those names never occur outside an event folder.
     """
     new_files = []
     now = time.time()
@@ -501,7 +512,8 @@ def _scan_for_new_files(paths: List[str], known_files: Set[str]) -> List[str]:
                                 # Event folders (e.g., SentryClips/2026-01-01_12-00-00/)
                                 try:
                                     for vid in os.scandir(sub.path):
-                                        if (vid.name.lower().endswith('.mp4')
+                                        if ((vid.name.lower().endswith('.mp4')
+                                             or vid.name in tesla_clips.EVIDENCE_NAMES)
                                                 and vid.path not in known_files):
                                             stat = vid.stat(follow_symlinks=False)
                                             if (now - stat.st_mtime) >= _MIN_FILE_AGE_SECONDS:
@@ -734,6 +746,14 @@ def _try_inotify(paths: List[str], known_files: Set[str],
                                 event_json_arrivals.append(full_path)
                                 known_event_json.add(full_path)
                             continue
+                        # Everything below this point is DELETION tracking
+                        # only — new files are enqueued by the periodic
+                        # ``_scan_for_new_files`` further down, not from
+                        # here. So neither this ``.mp4`` filter nor the
+                        # ``continue`` in the event.json branch above can
+                        # keep an evidence file out of the archive queue;
+                        # widening them would only add delete callbacks
+                        # for files nothing downstream has a row for.
                         if not full_path.lower().endswith('.mp4'):
                             continue
                         if mask & (_IN_DELETE | _IN_MOVED_FROM):

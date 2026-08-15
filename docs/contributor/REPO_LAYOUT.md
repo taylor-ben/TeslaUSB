@@ -160,7 +160,12 @@ Grouped by subsystem:
   `archive_watchdog.py`, `video_archive_service.py`
 - `indexing_queue_service.py`, `indexing_worker.py`
 - `mapping_service.py`, `mapping_queries.py`, `mapping_migrations.py`
-- `sei_parser.py` — H.264 SEI extraction (uses `mmap`)
+- `sei_parser.py` — H.264 SEI extraction (bounded `os.pread` through
+  `_ClipBytes`; it used to `mmap` and a page fault on a cluster the car
+  rewrote SIGBUS'd the whole process, 2026-08-15)
+- `tesla_clips.py` — what Tesla names its files and what that means:
+  an event's evidence names, and the clock parsed out of a clip's
+  filename (mtime is not chronological on this data)
 - `dashcam_pb2.py` — protobuf bindings for Tesla's SEI payload
 - `video_service.py` — file-listing for the UI
 - `analytics_service.py` — aggregate stats from the trip DB

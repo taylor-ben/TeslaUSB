@@ -60,6 +60,7 @@ from typing import Any, Dict, Optional
 
 from services import archive_queue
 from services import task_coordinator
+from services import tesla_clips
 
 logger = logging.getLogger(__name__)
 
@@ -498,6 +499,18 @@ def _is_synced_to_cloud(file_path: str, archive_root: str,
     * ``file_path`` as-is (the absolute path the prune walker found)
     * ``file_path`` as relative to ``archive_root``
 
+    **The folder-level key is the one that actually matches** (fixed
+    2026-08-16). The uploader does not write a row per file: for an
+    event it writes ONE row per event FOLDER, keyed
+    ``<Folder>/<event>`` — ``cloud_archive_service`` builds that key
+    with ``canonical_cloud_path(f"{folder}/{entry}")`` where ``entry``
+    is the event directory. Read live off the box that day, all 11
+    rows looked like ``('SentryClips/2026-08-11_23-11-15', 'synced')``
+    and not one was a file path. So the two per-file candidates above
+    could never match anything and this function had been answering
+    "not synced" for every clip since it was written. Only flat
+    ``ArchivedClips/<file>`` uploads get a per-file row.
+
     Returns True only when at least one row matches AND its status is
     'synced'. Returns False on any DB error (fail-safe — when in doubt,
     keep the file).
@@ -512,7 +525,21 @@ def _is_synced_to_cloud(file_path: str, archive_root: str,
             candidates.append(rel)
             # Some legacy rows may be stored with forward slashes on Windows
             # path separators; normalize for cross-platform safety.
-            candidates.append(rel.replace(os.sep, '/'))
+            posix_rel = rel.replace(os.sep, '/')
+            candidates.append(posix_rel)
+            parts = posix_rel.split('/')
+            if len(parts) == 3:
+                # <Folder>/<event>/<clip> — the uploader's row is keyed
+                # by the event folder. Already canonical by
+                # construction (relative, POSIX separators, no leading
+                # or trailing slash), so no canonical_cloud_path call
+                # and no import of the cloud service from here.
+                candidates.append('/'.join(parts[:2]))
+            elif len(parts) == 1:
+                # A flat file at the top of ArchivedClips. Those DO get
+                # a per-file row, prefixed with the folder the uploader
+                # calls them by.
+                candidates.append(f'ArchivedClips/{parts[0]}')
     except ValueError:
         pass
     placeholders = ','.join('?' * len(candidates))
@@ -788,11 +815,25 @@ def get_status() -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def _iter_archive_mp4_files(archive_root: str):
-    """Yield (abs_path, mtime, size_bytes) for every .mp4 under archive_root.
+    """Yield (abs_path, recorded_at, size_bytes) for prunable .mp4 files.
 
     Walks the tree without following symlinks; skips the
     ``.dead_letter`` diagnostic subdirectory entirely so user-visible
     forensic info isn't auto-deleted.
+
+    ``recorded_at`` is epoch seconds parsed from the FILENAME, falling
+    back to ``st_mtime`` only when the name doesn't carry a timestamp.
+    It used to be ``st_mtime`` outright, and that is the wrong key on
+    this data: the car writes FAT timestamps in its own timezone, the
+    kernel reinterprets them (a 20:12 recording stats as 11:13), and
+    the archive copy inherits the same wrong value through the
+    ``shutil.copystat`` in ``archive_worker._atomic_copy``. Both
+    prunes below order and cut off by this value, so "oldest first"
+    has to be chronological or they delete the wrong clips.
+
+    ``event.mp4`` is skipped: an event's evidence files are never
+    prune candidates, and leaving them out of the candidate list is
+    cheaper than having the delete doorway refuse them one at a time.
     """
     if not archive_root or not os.path.isdir(archive_root):
         return
@@ -806,16 +847,29 @@ def _iter_archive_mp4_files(archive_root: str):
         for fn in filenames:
             if not fn.lower().endswith('.mp4'):
                 continue
+            if fn in tesla_clips.EVIDENCE_NAMES:
+                continue
             full = os.path.join(dirpath, fn)
             try:
                 st = os.stat(full)
             except OSError:
                 continue
-            yield full, st.st_mtime, st.st_size
+            yield full, tesla_clips.recorded_seconds(full, st.st_mtime), st.st_size
 
 
-def _delete_one_mp4(path: str, db_path: str) -> int:
+def _delete_one_mp4(path: str, db_path: str,
+                    archived_check=None) -> int:
     """Atomically delete one mp4 + reconcile geodata.
+
+    ``archived_check`` is forwarded to the doorway so the "not until
+    it exists somewhere else" rule is enforced at the point of
+    deletion and not only by the caller's loop. Both prunes DO
+    pre-check the same predicate — they need the verdict anyway to
+    count ``kept_unsynced_count`` and name the file in the journal —
+    so in the normal path this second call only happens for files
+    that already passed, i.e. files about to be deleted. Pass None
+    when the operator has turned the cloud gate off; the doorway then
+    behaves exactly as it did before.
 
     Returns the freed byte count (0 on failure). Uses
     :func:`mapping_service.purge_deleted_videos` to reconcile the
@@ -831,7 +885,7 @@ def _delete_one_mp4(path: str, db_path: str) -> int:
     removed is still reconciled even though ``bytes_freed`` is 0).
     """
     from services.file_safety import safe_delete_archive_video, DeleteOutcome
-    result = safe_delete_archive_video(path)
+    result = safe_delete_archive_video(path, archived_check=archived_check)
     if result.outcome is not DeleteOutcome.DELETED:
         return 0
     # Reconcile geodata (best-effort — failure here doesn't undo the delete).
@@ -950,6 +1004,16 @@ def _run_retention_prune(archive_root: str, db_path: str,
             summary['duration_seconds'] = round(time.time() - started, 3)
             return summary
 
+        # Same predicate the loop below pre-checks, handed to the
+        # delete doorway as the backstop. None when the operator has
+        # set ``cloud_archive.delete_unsynced`` — that toggle means
+        # "the SD archive is copy enough", and honouring it is what
+        # keeps a box with no working cloud from filling up.
+        cloud_gate = (
+            (lambda p: _is_synced_to_cloud(p, archive_root, cloud_db_path))
+            if enforce_cloud_check else None
+        )
+
         # ``lock_held`` tracks whether we still own the 'retention'
         # task slot at any given point in the loop body. It is set
         # to False by the yield-bailout branch so the ``finally`` below
@@ -957,11 +1021,11 @@ def _run_retention_prune(archive_root: str, db_path: str,
         lock_held = True
         try:
             files_since_yield = 0
-            for path, mtime, _size in _iter_archive_mp4_files(archive_root):
+            for path, recorded_at, _size in _iter_archive_mp4_files(archive_root):
                 summary['scanned'] += 1
-                if mtime > cutoff:
+                if recorded_at > cutoff:
                     continue
-                age_days = (time.time() - mtime) / 86400.0
+                age_days = (time.time() - recorded_at) / 86400.0
                 # PR #213 review finding 2 — every iteration past the
                 # cutoff (whether deleted, kept, or skipped) must
                 # count toward the yield budget so an unsynced
@@ -998,7 +1062,7 @@ def _run_retention_prune(archive_root: str, db_path: str,
                                 )
                                 break
                         continue
-                freed = _delete_one_mp4(path, db_path)
+                freed = _delete_one_mp4(path, db_path, cloud_gate)
                 if freed > 0 or not os.path.exists(path):
                     summary['deleted_count'] += 1
                     summary['freed_bytes'] += freed
@@ -1049,6 +1113,19 @@ def _run_retention_prune(archive_root: str, db_path: str,
             "(toggle 'Delete clips even if not backed up' in Settings → "
             "Cloud Sync to override)",
             summary['kept_unsynced_count'],
+        )
+    # A prune that was asked to free space and freed none because every
+    # candidate is still waiting on an upload is a standing failure, not
+    # a quiet no-op: the SD card keeps filling at ~1.8 GB per event while
+    # this repeats every tick. Say so at ERROR so it lands in journalctl
+    # at default verbosity, with the one setting that resolves it.
+    if summary['deleted_count'] == 0 and summary['kept_unsynced_count'] > 0:
+        logger.error(
+            "archive_retention: freed NOTHING — all %d clip(s) past the "
+            "%d-day cutoff are still un-uploaded. The archive will keep "
+            "growing until the cloud catches up or 'Delete clips even if "
+            "not backed up' is turned on in Settings → Cloud Sync",
+            summary['kept_unsynced_count'], int(retention_days),
         )
     return summary
 
@@ -1218,10 +1295,17 @@ def _run_capacity_prune(archive_root: str, db_path: str) -> Dict[str, Any]:
                 free_target, archive_root,
             )
 
+        # Same doorway backstop as the time-based pass. See the
+        # comment on ``cloud_gate`` there.
+        cloud_gate = (
+            (lambda p: _is_synced_to_cloud(p, archive_root, cloud_db_path))
+            if enforce_cloud_check else None
+        )
+
         files: list = []
         total_bytes = 0
-        for path, mtime, size in _iter_archive_mp4_files(archive_root):
-            files.append((path, mtime, size))
+        for path, recorded_at, size in _iter_archive_mp4_files(archive_root):
+            files.append((path, recorded_at, size))
             total_bytes += size
             summary['capacity_scanned'] += 1
         summary['archive_size_bytes_before'] = total_bytes
@@ -1247,7 +1331,9 @@ def _run_capacity_prune(archive_root: str, db_path: str) -> Dict[str, Any]:
             return summary
 
         # Sort oldest-first so we delete the least-valuable footage
-        # first.
+        # first. The key is the recording time parsed out of the
+        # filename, not mtime — see :func:`_iter_archive_mp4_files`
+        # for why mtime is not chronological on this data.
         files.sort(key=lambda t: t[1])
 
         # Acquire our own coordinator slot. The time-based pass
@@ -1283,7 +1369,7 @@ def _run_capacity_prune(archive_root: str, db_path: str) -> Dict[str, Any]:
         lock_held = True
         files_since_yield = 0
         try:
-            for path, _mtime, size in files:
+            for path, _recorded_at, size in files:
                 cap_done = cap_bytes == 0 or current_total <= cap_bytes
                 free_done = (
                     target_free_bytes == 0
@@ -1330,7 +1416,7 @@ def _run_capacity_prune(archive_root: str, db_path: str) -> Dict[str, Any]:
                                 break
                         continue
 
-                freed = _delete_one_mp4(path, db_path)
+                freed = _delete_one_mp4(path, db_path, cloud_gate)
                 if freed > 0 or not os.path.exists(path):
                     summary['capacity_deleted_count'] += 1
                     summary['capacity_freed_bytes'] += freed
@@ -1343,11 +1429,14 @@ def _run_capacity_prune(archive_root: str, db_path: str) -> Dict[str, Any]:
                     )
                 else:
                     # safe_delete_archive_video refused (PROTECTED:
-                    # ``*.img`` guard / path-outside-root) OR raised
-                    # an OSError (ERROR). Both collapse to ``freed=0
-                    # AND file still exists`` here. ``_delete_one_mp4``
-                    # already logged each at WARNING with the outcome
-                    # enum — see comment on
+                    # ``*.img`` guard / path-outside-root / evidence
+                    # file), refused for want of a cloud copy
+                    # (UNARCHIVED — only reachable if the row synced
+                    # between the loop's pre-check and the doorway),
+                    # OR raised an OSError (ERROR). All collapse to
+                    # ``freed=0 AND file still exists`` here.
+                    # ``_delete_one_mp4`` already logged each at
+                    # WARNING with the outcome enum — see comment on
                     # ``capacity_kept_protected_count`` initialiser
                     # above.
                     summary['capacity_kept_protected_count'] += 1
@@ -1384,6 +1473,20 @@ def _run_capacity_prune(archive_root: str, db_path: str) -> Dict[str, Any]:
                 summary['free_space_pct_before']
             )
             summary['archive_size_bytes_after'] = total_bytes
+            # This pass only runs when a threshold was already crossed,
+            # so freeing nothing means the SD card stays over its cap
+            # or under its free-space floor until the next tick finds
+            # the same wall. At ERROR so it is visible in journalctl
+            # without raising verbosity.
+            if summary['capacity_kept_unsynced_count'] > 0:
+                logger.error(
+                    "archive_capacity: freed NOTHING — %d candidate "
+                    "clip(s) are still un-uploaded and none could be "
+                    "deleted. The archive stays over threshold until "
+                    "the cloud catches up or 'Delete clips even if not "
+                    "backed up' is turned on in Settings → Cloud Sync",
+                    summary['capacity_kept_unsynced_count'],
+                )
 
         summary['duration_seconds'] = round(time.time() - started, 3)
         return summary

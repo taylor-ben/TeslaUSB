@@ -595,17 +595,170 @@ class TestGetVideoGpsSummary:
 
 
 # ---------------------------------------------------------------------------
-# Phase 1 item 1.4 — Streaming SEI parser via mmap
+# Bounded-pread clip reader (replaces the mmap parser, 2026-08-15)
 #
-# These tests confirm that the rewrite to mmap-backed parsing keeps full
-# byte-for-byte parity with the previous in-memory `f.read()` path, that the
-# generator releases its file descriptor + mapping on every exit path
-# (including early abandon), and that the parser does not retain the file
-# in resident memory after iteration completes.
+# These tests confirm that reading a clip through ``_ClipBytes`` keeps
+# byte-for-byte parity with a real ``bytes`` buffer, that the walk still
+# finds a ``moov`` box sitting at the END of the file (Tesla writes it
+# there) without reading the whole clip, that a failed read surfaces as a
+# catchable ``ClipReadError`` rather than killing the process the way a
+# SIGBUS from an mmap page fault did, and that the file descriptor is
+# released on every exit path including early generator abandon.
+#
+# Why this replaced mmap: measured 2026-08-15, gadget_web took 32
+# ``status=7/BUS`` kills in two hours, each matching a
+# ``FAT-fs (loop0): error, fat_get_cluster: invalid cluster chain`` in
+# dmesg, and the archive fell 2008 files behind because the worker was
+# killed mid-copy. The car owns the vfat volume through the USB gadget
+# and moves clusters under any mapping we hold; a page fault on a moved
+# cluster is a signal, not an exception, so it cannot be caught.
 # ---------------------------------------------------------------------------
 
-class TestStreamingMmapParser:
-    """Item 1.4 — verify mmap-backed parsing has parity + clean teardown."""
+class TestClipBytesReader:
+    """The pread-backed view must behave exactly like ``bytes``."""
+
+    def _view(self, tmp_path, payload, name="view.bin"):
+        from services import sei_parser
+        path = tmp_path / name
+        path.write_bytes(payload)
+        f = open(path, 'rb')
+        return f, sei_parser._ClipBytes(f.fileno(), len(payload), str(path))
+
+    def test_len_index_and_slice_match_bytes(self, tmp_path):
+        payload = bytes(range(256)) * 40  # 10 240 bytes
+        f, view = self._view(tmp_path, payload)
+        try:
+            assert len(view) == len(payload)
+            for i in (0, 1, 255, 4096, len(payload) - 1, -1, -257):
+                assert view[i] == payload[i], f"index {i}"
+            for a, b in ((0, 8), (5, 5), (100, 4200), (len(payload) - 3, len(payload) + 99)):
+                assert view[a:b] == payload[a:b], f"slice {a}:{b}"
+        finally:
+            f.close()
+
+    def test_index_out_of_range_raises(self, tmp_path):
+        f, view = self._view(tmp_path, b"abcd")
+        try:
+            with pytest.raises(IndexError):
+                _ = view[4]
+            with pytest.raises(IndexError):
+                _ = view[-5]
+        finally:
+            f.close()
+
+    def test_reads_larger_than_the_window_are_served_whole(self, tmp_path, monkeypatch):
+        """A slice bigger than the window must not be silently truncated."""
+        from services import sei_parser
+        monkeypatch.setattr(sei_parser, '_CLIP_WINDOW_BYTES', 64)
+        payload = bytes(range(256)) * 8  # 2 048 bytes
+        f, view = self._view(tmp_path, payload, name="big.bin")
+        try:
+            assert view[10:1500] == payload[10:1500]
+        finally:
+            f.close()
+
+    def test_window_is_reused_across_sequential_reads(self, tmp_path, monkeypatch):
+        """Sequential byte reads must not cost one syscall each."""
+        import os as os_module
+        from services import sei_parser
+
+        calls = [0]
+        real_pread = os_module.pread
+
+        def counting_pread(fd, length, offset):
+            calls[0] += 1
+            return real_pread(fd, length, offset)
+
+        monkeypatch.setattr(sei_parser.os, 'pread', counting_pread)
+        payload = bytes(range(256)) * 40
+        f, view = self._view(tmp_path, payload, name="window.bin")
+        try:
+            for i in range(len(payload)):
+                assert view[i] == payload[i]
+        finally:
+            f.close()
+        assert calls[0] <= 2, (
+            f"10 240 sequential byte reads cost {calls[0]} pread calls — "
+            "the sliding window is not being reused"
+        )
+
+    def test_read_error_becomes_clip_read_error(self, tmp_path, monkeypatch):
+        import errno
+        from services import sei_parser
+
+        def eio_pread(fd, length, offset):
+            raise OSError(errno.EIO, "Input/output error")
+
+        f, view = self._view(tmp_path, b"x" * 100, name="eio.bin")
+        monkeypatch.setattr(sei_parser.os, 'pread', eio_pread)
+        try:
+            with pytest.raises(sei_parser.ClipReadError):
+                _ = view[0:4]
+        finally:
+            f.close()
+
+    def test_clip_read_error_is_an_oserror(self):
+        """Callers with a bare ``except OSError`` must still catch it."""
+        from services import sei_parser
+        assert issubclass(sei_parser.ClipReadError, OSError)
+
+
+class TestTrailingMoov:
+    """Tesla writes ``moov`` at the END. The walk must still find it."""
+
+    def _mp4_with_trailing_moov(self, mdat_bytes=4 * 1024 * 1024,
+                                creation_time=None):
+        """ftyp + free + big mdat + moov/mvhd, in Tesla's own order."""
+        if creation_time is None:
+            # 2026-08-14 19:18:38 UTC expressed in the MP4 1904 epoch.
+            creation_time = 1786821518 + 2082844800
+        ftyp = _make_box('ftyp', b'isom' + b'\x00' * 8)
+        free = _make_box('free', b'')
+        mdat = _make_box('mdat', b'\x00' * mdat_bytes)
+        mvhd = _make_box(
+            'mvhd',
+            b'\x00' * 4 + struct.pack('>I', creation_time) + b'\x00' * 92,
+        )
+        moov = _make_box('moov', mvhd)
+        return ftyp + free + mdat + moov
+
+    def test_mvhd_found_when_moov_is_last(self, tmp_path):
+        from services.sei_parser import extract_mvhd_creation_time
+        path = tmp_path / "trailing.mp4"
+        path.write_bytes(self._mp4_with_trailing_moov())
+        dt = extract_mvhd_creation_time(str(path))
+        assert dt is not None, (
+            "moov at the end of the file was not found — a head-only "
+            "read would turn every peek into a silent parse failure"
+        )
+        assert dt.year == 2026
+
+    def test_trailing_moov_costs_a_handful_of_reads(self, tmp_path, monkeypatch):
+        """Finding a trailing moov must SEEK, not scan the whole file."""
+        import os as os_module
+        from services import sei_parser
+
+        total = [0]
+        real_pread = os_module.pread
+
+        def counting_pread(fd, length, offset):
+            data = real_pread(fd, length, offset)
+            total[0] += len(data)
+            return data
+
+        path = tmp_path / "seek.mp4"
+        payload = self._mp4_with_trailing_moov()
+        path.write_bytes(payload)
+        monkeypatch.setattr(sei_parser.os, 'pread', counting_pread)
+        assert sei_parser.extract_mvhd_creation_time(str(path)) is not None
+        assert total[0] < len(payload) // 4, (
+            f"read {total[0]} of {len(payload)} bytes to find a trailing "
+            "moov — the walk is scanning instead of seeking"
+        )
+
+
+class TestStreamingPreadParser:
+    """Parity + clean teardown for the pread-backed parser."""
 
     def _make_test_mp4(self, n_frames=10):
         """Reuse synthetic MP4 builder for streaming tests."""
@@ -616,120 +769,63 @@ class TestStreamingMmapParser:
             payloads.append(_make_sei_protobuf(lat=lat, lon=lon, speed=20.0 + i))
         return TestExtractSeiMessages()._make_synthetic_mp4(payloads)
 
-    def test_uses_mmap_when_extracting(self, tmp_path, monkeypatch):
-        """Confirm extract_sei_messages calls mmap.mmap (not just f.read)."""
-        import mmap as mmap_module
-        from services import sei_parser
-
-        mmap_calls = []
-        real_mmap = mmap_module.mmap
-
-        def tracking_mmap(fileno, length, **kwargs):
-            mmap_calls.append((fileno, length, kwargs))
-            return real_mmap(fileno, length, **kwargs)
-
-        monkeypatch.setattr(sei_parser.mmap, 'mmap', tracking_mmap)
-
-        mp4_data = self._make_test_mp4(5)
-        video_file = tmp_path / "mmap_check.mp4"
-        video_file.write_bytes(mp4_data)
-
-        list(extract_sei_messages(str(video_file), sample_rate=1))
-
-        assert len(mmap_calls) == 1, (
-            "Expected exactly one mmap.mmap() call per parse"
+    def test_parser_never_mmaps(self, tmp_path):
+        """The whole point: no mapping means no SIGBUS on a card path."""
+        import services.sei_parser as sei_parser_module
+        assert not hasattr(sei_parser_module, 'mmap'), (
+            "sei_parser re-imported mmap — a page fault on a cluster the "
+            "car rewrote kills the process and cannot be caught"
         )
-        # Confirm read-only access mode was requested
-        kwargs = mmap_calls[0][2]
-        assert kwargs.get('access') == mmap_module.ACCESS_READ
 
-    def test_parity_with_read_fallback(self, tmp_path, monkeypatch):
-        """Output from mmap path MUST equal output from f.read() fallback."""
+    def test_parity_across_window_sizes(self, tmp_path, monkeypatch):
+        """A window small enough to refill constantly must not change output."""
         from services import sei_parser
 
         mp4_data = self._make_test_mp4(8)
         video_file = tmp_path / "parity.mp4"
         video_file.write_bytes(mp4_data)
 
-        # Run 1: normal path (mmap)
-        mmap_msgs = list(extract_sei_messages(str(video_file), sample_rate=1))
+        big_window = list(extract_sei_messages(str(video_file), sample_rate=1))
 
-        # Run 2: force fallback by making mmap.mmap raise OSError
-        def failing_mmap(*args, **kwargs):
-            raise OSError("forced fallback for parity test")
+        monkeypatch.setattr(sei_parser, '_CLIP_WINDOW_BYTES', 16)
+        tiny_window = list(extract_sei_messages(str(video_file), sample_rate=1))
 
-        monkeypatch.setattr(sei_parser.mmap, 'mmap', failing_mmap)
-        fallback_msgs = list(
-            extract_sei_messages(str(video_file), sample_rate=1)
+        assert len(big_window) == len(tiny_window) == 8
+        for a, b in zip(big_window, tiny_window):
+            assert a.frame_index == b.frame_index
+            assert a.timestamp_ms == b.timestamp_ms
+            assert a.latitude_deg == b.latitude_deg
+            assert a.longitude_deg == b.longitude_deg
+            assert a.vehicle_speed_mps == b.vehicle_speed_mps
+            assert a.heading_deg == b.heading_deg
+            assert a.frame_seq_no == b.frame_seq_no
+
+    def test_max_walk_bytes_caps_the_bytes_actually_read(self, tmp_path, monkeypatch):
+        """The peek's byte cap must bound real I/O, not just the cursor."""
+        import os as os_module
+        from services import sei_parser
+
+        total = [0]
+        real_pread = os_module.pread
+
+        def counting_pread(fd, length, offset):
+            data = real_pread(fd, length, offset)
+            total[0] += len(data)
+            return data
+
+        mp4_data = self._make_test_mp4(200)
+        video_file = tmp_path / "capped.mp4"
+        video_file.write_bytes(mp4_data)
+
+        monkeypatch.setattr(sei_parser, '_CLIP_WINDOW_BYTES', 1024)
+        monkeypatch.setattr(sei_parser.os, 'pread', counting_pread)
+        list(extract_sei_messages(
+            str(video_file), sample_rate=1, max_walk_bytes=2048,
+        ))
+        assert total[0] < len(mp4_data), (
+            "max_walk_bytes did not bound the I/O — the peek is still "
+            "paying for the whole clip"
         )
-
-        assert len(mmap_msgs) == len(fallback_msgs)
-        for m, f in zip(mmap_msgs, fallback_msgs):
-            assert m.frame_index == f.frame_index
-            assert m.timestamp_ms == f.timestamp_ms
-            assert m.latitude_deg == f.latitude_deg
-            assert m.longitude_deg == f.longitude_deg
-            assert m.vehicle_speed_mps == f.vehicle_speed_mps
-            assert m.heading_deg == f.heading_deg
-            assert m.frame_seq_no == f.frame_seq_no
-
-    def test_closes_mmap_on_full_iteration(self, tmp_path, monkeypatch):
-        """On normal iteration completion, both mmap and file descriptor close."""
-        import mmap as mmap_module
-        from services import sei_parser
-
-        mappings = []
-        real_mmap = mmap_module.mmap
-
-        def tracking_mmap(fileno, length, **kwargs):
-            m = real_mmap(fileno, length, **kwargs)
-            mappings.append(m)
-            return m
-
-        monkeypatch.setattr(sei_parser.mmap, 'mmap', tracking_mmap)
-
-        mp4_data = self._make_test_mp4(3)
-        video_file = tmp_path / "close_check.mp4"
-        video_file.write_bytes(mp4_data)
-
-        list(extract_sei_messages(str(video_file), sample_rate=1))
-
-        assert len(mappings) == 1
-        # A closed mmap raises ValueError on any access
-        with pytest.raises(ValueError):
-            _ = mappings[0][0:4]
-
-    def test_closes_mmap_on_early_generator_abandon(self, tmp_path, monkeypatch):
-        """Early generator close (GC or .close()) must release the mapping."""
-        import gc
-        import mmap as mmap_module
-        from services import sei_parser
-
-        mappings = []
-        real_mmap = mmap_module.mmap
-
-        def tracking_mmap(fileno, length, **kwargs):
-            m = real_mmap(fileno, length, **kwargs)
-            mappings.append(m)
-            return m
-
-        monkeypatch.setattr(sei_parser.mmap, 'mmap', tracking_mmap)
-
-        mp4_data = self._make_test_mp4(20)
-        video_file = tmp_path / "abandon.mp4"
-        video_file.write_bytes(mp4_data)
-
-        gen = extract_sei_messages(str(video_file), sample_rate=1)
-        # Pull just one message, then abandon the generator
-        next(gen)
-        gen.close()
-        del gen
-        gc.collect()
-
-        assert len(mappings) == 1
-        # mapping must be closed after generator abandon
-        with pytest.raises(ValueError):
-            _ = mappings[0][0:4]
 
     def test_file_descriptor_released_after_parse(self, tmp_path):
         """On Windows, an unreleased file handle would block file deletion."""
@@ -740,82 +836,78 @@ class TestStreamingMmapParser:
         # Iterate to completion
         list(extract_sei_messages(str(video_file), sample_rate=1))
 
-        # Deleting the file must succeed — would fail on Windows if mmap or
-        # the file descriptor were still open.
+        # Deleting the file must succeed — would fail on Windows if the
+        # file descriptor were still open.
         video_file.unlink()
         assert not video_file.exists()
 
-    def test_does_not_load_full_file_into_python_bytes(self, tmp_path, monkeypatch):
-        """Verify the parser walks an mmap object, not a plain bytes buffer.
+    def test_file_descriptor_released_on_early_abandon(self, tmp_path):
+        """Early generator close (GC or .close()) must release the fd."""
+        import gc
 
-        The point of item 1.4 is that the parser MUST NOT call f.read() on
-        the happy path. Force mmap to fail loudly if the parser tries to
-        bypass it — proves the streaming code path is the one in use.
-        """
-        import mmap as mmap_module
-        from services import sei_parser
-
-        original_read = None
-
-        class TrackingFile:
-            """Wrap open() result to detect any f.read() call."""
-            read_called = False
-
-        # Sanity check: when mmap is available, f.read() must NOT be called.
-        # We instrument by monkey-patching the open-like function via a
-        # spy on the `data = mmap.mmap(...)` line. If mmap succeeds and
-        # is used, the parse completes without invoking the fallback
-        # f.seek/f.read path.
-        mmap_count = [0]
-        real_mmap = mmap_module.mmap
-
-        def counting_mmap(*args, **kwargs):
-            mmap_count[0] += 1
-            return real_mmap(*args, **kwargs)
-
-        monkeypatch.setattr(sei_parser.mmap, 'mmap', counting_mmap)
-
-        mp4_data = self._make_test_mp4(10)
-        video_file = tmp_path / "no_read.mp4"
+        mp4_data = self._make_test_mp4(20)
+        video_file = tmp_path / "abandon.mp4"
         video_file.write_bytes(mp4_data)
 
-        msgs = list(extract_sei_messages(str(video_file), sample_rate=1))
+        gen = extract_sei_messages(str(video_file), sample_rate=1)
+        next(gen)
+        gen.close()
+        del gen
+        gc.collect()
 
-        assert mmap_count[0] == 1, "mmap should be the primary read path"
-        assert len(msgs) == 10
+        video_file.unlink()
+        assert not video_file.exists()
 
-    def test_unexpected_mmap_exception_propagates_cleanly(self, tmp_path, monkeypatch):
-        """Regression test (PR #96 review): when mmap.mmap() raises a
-        non-OSError/non-ValueError exception (e.g. MemoryError on a Pi
-        Zero 2 W under pressure — exactly the scenario item 1.4 was
-        meant to mitigate), the original exception must propagate AND
-        the file descriptor must close cleanly. Pre-fix the finally
-        block would raise NameError on the unbound ``mmap_obj`` name
-        AND skip ``f.close()``, leaking the fd and masking the original
-        cause.
+    def test_read_error_mid_walk_raises_rather_than_yielding_nothing(
+        self, tmp_path, monkeypatch,
+    ):
+        """A truncated walk MUST NOT look like a clip with no GPS.
+
+        ``archive_producer._peek_clip_for_gps`` reads "generator ended,
+        no GPS seen" as "stationary, do not archive". If a failed read
+        silently ended the walk, a real recording would be dropped.
         """
-        import mmap as mmap_module
+        import errno
+        import os as os_module
         from services import sei_parser
 
-        def boom_mmap(*args, **kwargs):
-            raise MemoryError("simulated low-memory condition")
-
-        monkeypatch.setattr(sei_parser.mmap, 'mmap', boom_mmap)
-
-        mp4_data = self._make_test_mp4(3)
-        video_file = tmp_path / "memory_error.mp4"
+        mp4_data = self._make_test_mp4(20)
+        video_file = tmp_path / "eio_mid_walk.mp4"
         video_file.write_bytes(mp4_data)
 
-        # The MemoryError must propagate — NOT a NameError from a
-        # broken finally clause.
-        with pytest.raises(MemoryError, match="simulated low-memory"):
+        real_pread = os_module.pread
+        calls = [0]
+
+        def failing_pread(fd, length, offset):
+            calls[0] += 1
+            if calls[0] > 3:
+                raise OSError(errno.EIO, "Input/output error")
+            return real_pread(fd, length, offset)
+
+        monkeypatch.setattr(sei_parser, '_CLIP_WINDOW_BYTES', 64)
+        monkeypatch.setattr(sei_parser.os, 'pread', failing_pread)
+
+        with pytest.raises(sei_parser.ClipReadError):
             list(extract_sei_messages(str(video_file), sample_rate=1))
 
-        # On Windows, an unclosed file descriptor would block this
-        # delete with PermissionError. Confirms the fd was released
-        # by the finally block even though mmap failed.
+        # fd still released despite the failure.
         video_file.unlink()
         assert not video_file.exists()
+
+    def test_mvhd_read_error_returns_none_not_raise(self, tmp_path, monkeypatch):
+        """The mvhd path stays best-effort: unreadable means "unknown"."""
+        import errno
+        from services import sei_parser
+
+        video_file = tmp_path / "mvhd_eio.mp4"
+        video_file.write_bytes(self._make_test_mp4(3))
+
+        def eio_pread(fd, length, offset):
+            raise OSError(errno.EIO, "Input/output error")
+
+        monkeypatch.setattr(sei_parser.os, 'pread', eio_pread)
+        assert sei_parser.extract_mvhd_creation_time(str(video_file)) is None
+
 
 
 # ---------------------------------------------------------------------------

@@ -7,21 +7,35 @@ telemetry data embedded as protobuf-encoded SEI NAL units in Tesla dashcam MP4 f
 This is a pure-Python port of the client-side JavaScript parser in dashcam-mp4.js.
 Designed for low-memory operation on Pi Zero 2 W (512MB RAM).
 
-Memory model (Phase 1 item 1.4 — streaming SEI parser):
-    The byte buffer used by the walker is a memory-mapped file
-    (``mmap.mmap`` with ``access=ACCESS_READ``), NOT an in-memory
-    ``bytes`` object from ``f.read()``. The previous implementation
-    loaded the entire 30-80 MB clip into RSS, multiplied by however
-    many concurrent indexer/archive operations were running — a key
-    contributor to documented OOM events. With ``mmap``, the kernel
-    pages individual 4 KB chunks in on demand and evicts them under
-    pressure, so the parser's working set is bounded by the I/O
-    pattern (tight sequential walk → ~200 KB resident) regardless of
-    file size. ``mmap`` slicing returns ``bytes`` and indexing returns
-    ``int`` exactly like a real ``bytes`` object, so the existing
-    helpers (``_find_box``, ``_decode_sei_nal``,
-    ``_get_timescale_and_durations``) work unchanged. Output parity
-    is by construction.
+Memory model (Phase 1 item 1.4 — streaming SEI parser; reworked
+2026-08-15 after SIGBUS, see below):
+    The walker never loads a clip into RAM. It reads through
+    :class:`_ClipBytes`, a bytes-like random-access view backed by
+    ``os.pread`` with one sliding window buffer. ``len(view)``,
+    ``view[i]`` (-> ``int``) and ``view[a:b]`` (-> ``bytes``) behave
+    exactly as they did on ``bytes``, so ``_find_box``,
+    ``_decode_sei_nal`` and ``_get_timescale_and_durations`` work
+    unchanged and output parity is by construction. Resident cost is
+    one window (``_CLIP_WINDOW_BYTES``) per open clip regardless of
+    file size — the original reason this stopped being ``f.read()``,
+    which put 30-80 MB into RSS per concurrent indexer/archive
+    operation and was a key contributor to documented OOM events.
+
+    **It used to be ``mmap.mmap``, and that killed the box.** Measured
+    2026-08-15: ``gadget_web`` had NRestarts=81 with 32 kills at
+    ``status=7/BUS`` in two hours, each one matched second-for-second
+    by ``FAT-fs (loop0): error, fat_get_cluster: invalid cluster
+    chain`` in ``dmesg``, and the archive fell 2008 files behind
+    because the worker was killed every 60-90 s mid-copy. ``fsck.vfat
+    -n`` found no structural corruption — the volume is simply owned
+    by the car through the USB gadget, which rewrites clusters under
+    a mapping we are walking. A page fault onto a cluster chain that
+    moved raises SIGBUS, which is a signal and not a Python exception:
+    it cannot be caught, so it takes the whole process — waitress, the
+    web UI, the archive producer, the worker and the watchdog. The
+    same bad cluster under ``os.pread`` returns EIO, which surfaces as
+    an ``OSError`` the parser turns into :class:`ClipReadError` and
+    the callers already treat as "parse failed, fall through".
 
 Usage:
     from services.sei_parser import extract_sei_messages, parse_video_sei
@@ -36,7 +50,6 @@ Usage:
 
 import json
 import logging
-import mmap
 import os
 import struct
 from dataclasses import dataclass
@@ -153,6 +166,119 @@ _GEAR_NAMES = {0: 'PARK', 1: 'DRIVE', 2: 'REVERSE', 3: 'NEUTRAL'}
 _AUTOPILOT_NAMES = {0: 'NONE', 1: 'SELF_DRIVING', 2: 'AUTOSTEER', 3: 'TACC'}
 
 
+# --- Bounded pread reader (replaces mmap; see the module docstring) ---
+
+# One window per open clip. Sized against how the walkers actually move:
+# finding a trailing ``moov`` is four box headers and four seeks, and the
+# ``mdat`` NAL walk is strictly sequential in 4-byte lengths plus small
+# SEI payloads, so 256 KB serves ~65 000 of those length reads per
+# syscall. Larger buys nothing (the walk is sequential either way) and
+# costs RSS on a 512 MB Pi Zero 2 W; smaller turns the NAL walk back
+# into a syscall storm.
+_CLIP_WINDOW_BYTES = 256 * 1024
+
+
+class ClipReadError(OSError):
+    """A read against a clip failed part-way through a parse.
+
+    Subclasses ``OSError`` deliberately: the EIO this wraps used to
+    arrive as an ``OSError`` from ``f.read()`` on the pre-mmap parser,
+    and every caller of this module already funnels unexpected
+    exceptions into its "could not parse, fall through" branch. The
+    named type exists so a log line can say WHICH file went unreadable
+    mid-walk without matching on message text.
+    """
+
+
+class _ClipBytes:
+    """Random-access bytes-like view over a file, backed by ``os.pread``.
+
+    Implements exactly the three operations the MP4 walkers use —
+    ``len(v)``, ``v[i]`` returning ``int``, and ``v[a:b]`` returning
+    ``bytes`` — so every parsing helper in this module is oblivious to
+    whether it was handed one of these or a real ``bytes``.
+
+    Why not ``mmap``: a page fault on a cluster the car rewrote raises
+    SIGBUS and kills the process outright. ``pread`` on the same
+    cluster returns EIO. See the module docstring for the measurement.
+
+    Why not ``f.read()`` of the whole clip: 30-80 MB of RSS per
+    concurrent parse on a 512 MB box.
+
+    ``len`` is snapshotted at construction. The car can and does grow
+    or truncate the file underneath us; a read past the current end
+    returns short, and short slices are handed back as-is exactly like
+    slicing a ``bytes`` past its end, so the walkers' existing bounds
+    checks handle it.
+    """
+
+    __slots__ = ('_fd', '_size', '_path', '_window', '_window_start')
+
+    def __init__(self, fd: int, size: int, path: str):
+        self._fd = fd
+        self._size = size
+        self._path = path
+        self._window = b''
+        self._window_start = 0
+
+    def __len__(self) -> int:
+        return self._size
+
+    def _pread(self, offset: int, length: int) -> bytes:
+        """Read ``length`` bytes at ``offset``, looping over short reads."""
+        chunks = []
+        got = 0
+        while got < length:
+            try:
+                chunk = os.pread(self._fd, length - got, offset + got)
+            except OSError as e:
+                # EIO here is the car having rewritten the cluster chain
+                # under us — the condition that used to be a SIGBUS.
+                raise ClipReadError(
+                    e.errno,
+                    f"read failed at offset {offset + got} of {self._path}: {e}",
+                ) from e
+            if not chunk:
+                break  # EOF (or the file shrank since we sized it).
+            chunks.append(chunk)
+            got += len(chunk)
+        if len(chunks) == 1:
+            return chunks[0]
+        return b''.join(chunks)
+
+    def _read(self, offset: int, length: int) -> bytes:
+        if length <= 0 or offset >= self._size:
+            return b''
+        length = min(length, self._size - offset)
+        # A request bigger than the window would evict it for a single
+        # use, so serve it directly and leave the window alone.
+        if length > _CLIP_WINDOW_BYTES:
+            return self._pread(offset, length)
+        rel = offset - self._window_start
+        if rel < 0 or rel + length > len(self._window):
+            self._window_start = offset
+            self._window = self._pread(
+                offset, min(_CLIP_WINDOW_BYTES, self._size - offset),
+            )
+            rel = 0
+        return self._window[rel:rel + length]
+
+    def __getitem__(self, key):
+        if isinstance(key, slice):
+            if key.step not in (None, 1):
+                raise TypeError("_ClipBytes supports contiguous slices only")
+            start, stop, _ = key.indices(self._size)
+            return self._read(start, stop - start)
+        if key < 0:
+            key += self._size
+        if not 0 <= key < self._size:
+            raise IndexError("index out of range")
+        byte = self._read(key, 1)
+        if not byte:
+            raise IndexError("index out of range")
+        return byte[0]
+
+
 # --- MP4 Box Parsing ---
 
 def _find_box(data: bytes, start: int, end: int, name: str) -> Optional[dict]:
@@ -252,15 +378,9 @@ def extract_mvhd_creation_time(video_path: str) -> Optional[datetime]:
         return None
 
     f = None
-    mmap_obj = None
     try:
         f = open(video_path, 'rb')
-        try:
-            data = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-            mmap_obj = data
-        except (ValueError, OSError):
-            f.seek(0)
-            data = f.read()
+        data = _ClipBytes(f.fileno(), size, video_path)
 
         moov = _find_box(data, 0, len(data), 'moov')
         if moov is None:
@@ -310,15 +430,12 @@ def extract_mvhd_creation_time(video_path: str) -> Optional[datetime]:
     except Exception as e:
         # Defensive: never let an mvhd read crash the indexer. The
         # caller falls back to filename-derived time, so a None return
-        # here is fully recoverable.
+        # here is fully recoverable. ClipReadError (the car rewrote a
+        # cluster under us mid-walk) lands here too, which is the
+        # whole point of it being an exception rather than a signal.
         logger.debug("mvhd: unexpected error reading %s: %s", video_path, e)
         return None
     finally:
-        if mmap_obj is not None:
-            try:
-                mmap_obj.close()
-            except Exception:
-                pass
         if f is not None:
             try:
                 f.close()
@@ -457,10 +574,10 @@ def extract_sei_messages(
             the cumulative ``cursor`` advance through ``mdat`` exceeds
             this many bytes. Use this for "is this clip stationary?"
             peeks where the caller will break out on the first
-            GPS-bearing message anyway — capping the walk turns a
-            full-file mmap page-in (25-50 MB cold-cache I/O) into a
-            fixed-size read. Default ``None`` preserves the historical
-            walk-to-end behavior used by the indexer.
+            GPS-bearing message anyway — capping the walk turns
+            25-50 MB of cold-cache I/O into a fixed-size read.
+            Default ``None`` preserves the historical walk-to-end
+            behavior used by the indexer.
 
     Yields:
         SeiMessage objects with GPS, speed, acceleration, and control data.
@@ -468,6 +585,16 @@ def extract_sei_messages(
     Raises:
         FileNotFoundError: If video_path doesn't exist.
         ValueError: If the file is not a valid MP4 with H.264 video.
+        ClipReadError: If a read against the clip fails part-way
+            through the walk — on the USB image that means the car
+            rewrote the cluster chain underneath us. Deliberately
+            raised rather than swallowed with a silent ``return``: a
+            truncated walk that yielded nothing is indistinguishable
+            from a genuinely stationary clip, and
+            ``archive_producer._peek_clip_for_gps`` would read that as
+            "no GPS, don't archive" and drop real footage. Every
+            caller funnels it into its parse-failed branch, which
+            falls through to copying the clip.
     """
     if not os.path.isfile(video_path):
         raise FileNotFoundError(f"Video file not found: {video_path}")
@@ -483,42 +610,19 @@ def extract_sei_messages(
             f"max {max_file_size // 1024 // 1024} MB: {video_path}"
         )
 
-    # Phase 1 item 1.4 — memory-map the file instead of reading it into
-    # RAM. mmap supports slicing/indexing identically to bytes
-    # (data[i] -> int, data[a:b] -> bytes), so the byte-walking
-    # helpers below operate unchanged. The kernel pages individual
-    # 4 KB chunks in on demand and evicts under pressure, so a 60 MB
-    # clip never spikes RSS by 60 MB. Both the file descriptor and
-    # the mapping are released in the finally block — covers both
+    # Read through the bounded pread view rather than mmapping the
+    # clip. It slices identically to bytes (data[i] -> int,
+    # data[a:b] -> bytes) so the byte-walking helpers below operate
+    # unchanged, it costs one window of RSS rather than the clip's
+    # size, and — the reason it is not mmap — a cluster the car
+    # rewrote under us comes back as EIO instead of SIGBUS. See the
+    # module docstring for the measurement that forced this. The file
+    # descriptor is released in the finally block, which covers both
     # normal generator exit and early generator close (GC /
-    # ``.close()``), which raise GeneratorExit at the yield point.
+    # ``.close()``), raising GeneratorExit at the yield point.
     f = open(video_path, 'rb')
-    # Initialize mmap_obj BEFORE the try so that if mmap.mmap() raises
-    # an exception we did not anticipate (e.g. ``MemoryError`` — exactly
-    # the Pi Zero 2 W condition this rewrite was meant to mitigate),
-    # the ``finally`` block below still has a defined name to check.
-    # Without this guard the finally would raise ``NameError`` while
-    # also leaking the file descriptor — masking the original
-    # exception. Catching only (ValueError, OSError) is intentional;
-    # anything else (MemoryError, KeyboardInterrupt, etc.) MUST
-    # propagate, but we still need a clean teardown.
-    mmap_obj = None
     try:
-        try:
-            data = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-        except (ValueError, OSError) as e:
-            # Empty file (already guarded above) or platform mmap
-            # limitation — fall back to f.read() so we never hard-fail
-            # on a clip that the old code would have parsed.
-            logger.debug(
-                "sei_parser: mmap unavailable for %s (%s); "
-                "falling back to read()", video_path, e,
-            )
-            f.seek(0)
-            data = f.read()
-            mmap_obj = None
-        else:
-            mmap_obj = data
+        data = _ClipBytes(f.fileno(), file_size, video_path)
 
         # Parse timing information from moov box
         try:
@@ -613,16 +717,8 @@ def extract_sei_messages(
     finally:
         # Explicit close on every path — including GeneratorExit
         # raised when the consumer abandons the generator early.
-        if mmap_obj is not None:
-            try:
-                mmap_obj.close()
-            except (BufferError, ValueError):
-                # BufferError: a previously-yielded slice still has a
-                # live memoryview holding the mapping (uncommon — our
-                # yields produce ``bytes``, not memoryviews, so any
-                # references are decoupled). Safe to ignore — the
-                # mapping is released when the file descriptor closes.
-                pass
+        # ``_ClipBytes`` holds only the fd (borrowed) and its window,
+        # so closing the file is the whole teardown.
         try:
             f.close()
         except OSError:

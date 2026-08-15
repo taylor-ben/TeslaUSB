@@ -3,7 +3,8 @@
 Single daemon thread that periodically walks the TeslaCam RO mount and
 calls :func:`services.archive_queue.enqueue_many_for_archive` for every
 ``.mp4`` it finds under ``RecentClips/``, ``SentryClips/`` (event
-subfolders), and ``SavedClips/`` (event subfolders). Idempotent —
+subfolders), and ``SavedClips/`` (event subfolders), plus each event
+folder's evidence files (``services.tesla_clips.EVIDENCE_NAMES``). Idempotent —
 ``INSERT OR IGNORE`` on the queue's UNIQUE constraint makes re-walks
 cheap.
 
@@ -62,7 +63,7 @@ import threading
 import time
 from typing import Dict, Iterable, List, Optional
 
-from services import archive_queue
+from services import archive_queue, tesla_clips
 
 logger = logging.getLogger(__name__)
 
@@ -469,11 +470,19 @@ def enqueue_with_peek(paths: Iterable[str],
 # ---------------------------------------------------------------------------
 
 def _iter_archive_candidates(teslacam_root: str) -> List[str]:
-    """Return every ``.mp4`` under the watched subdirectories.
+    """Return every ``.mp4`` — plus each event's evidence files — to archive.
 
     Walks one level into ``RecentClips`` (flat files) and two levels
     into ``SentryClips`` / ``SavedClips`` (event-folder per recording).
     Uses ``os.scandir`` for memory efficiency.
+
+    Inside an event folder the filter also admits
+    :data:`services.tesla_clips.EVIDENCE_NAMES`. The pre-2026-08-16
+    ``.mp4``-only filter meant ``event.json`` and ``thumb.png`` never
+    became queue rows at all: the box held 22 of each on the card and
+    0 of them in the archive. They are the only record of WHY the car
+    triggered, and ~215 KB per event buys that back. ``RecentClips``
+    stays ``.mp4``-only because those names never appear there.
 
     Permission errors and missing subdirectories are silently skipped —
     Phase 2a runs against a possibly-unmounted RO bind so any of the
@@ -501,11 +510,14 @@ def _iter_archive_candidates(teslacam_root: str) -> List[str]:
                     if entry.name.lower().endswith('.mp4'):
                         out.append(entry.path)
                 elif entry.is_dir(follow_symlinks=False):
-                    # Event subfolder — walk one more level for clip files.
+                    # Event subfolder — walk one more level for clip files
+                    # and the event's evidence files.
                     try:
                         for clip in os.scandir(entry.path):
-                            if (clip.is_file(follow_symlinks=False)
-                                    and clip.name.lower().endswith('.mp4')):
+                            if not clip.is_file(follow_symlinks=False):
+                                continue
+                            if (clip.name.lower().endswith('.mp4')
+                                    or clip.name in tesla_clips.EVIDENCE_NAMES):
                                 out.append(clip.path)
                     except (PermissionError, OSError):
                         continue
