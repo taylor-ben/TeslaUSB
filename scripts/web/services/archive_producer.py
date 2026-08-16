@@ -2,11 +2,15 @@
 
 Single daemon thread that periodically walks the TeslaCam RO mount and
 calls :func:`services.archive_queue.enqueue_many_for_archive` for every
-``.mp4`` it finds under ``RecentClips/``, ``SentryClips/`` (event
-subfolders), and ``SavedClips/`` (event subfolders), plus each event
-folder's evidence files (``services.tesla_clips.EVIDENCE_NAMES``). Idempotent —
+file :mod:`services.archive_policy` says this box keeps. Idempotent —
 ``INSERT OR IGNORE`` on the queue's UNIQUE constraint makes re-walks
 cheap.
+
+Under the default ``evidence-only`` policy that is each event's
+``event.json``, ``event.mp4`` and ``thumb.png``: no camera clips, and
+nothing from ``RecentClips`` at all. Under ``events`` it is whole event
+folders; under ``everything`` it is every clip the car writes, which is
+what this producer did before 2026-08-16 and what filled the card.
 
 This is the "belt and suspenders" half of the Phase 2a producer set. The
 other half is the inotify file watcher (``file_watcher_service``), which
@@ -63,7 +67,7 @@ import threading
 import time
 from typing import Dict, Iterable, List, Optional
 
-from services import archive_queue, tesla_clips
+from services import archive_policy, archive_queue
 
 logger = logging.getLogger(__name__)
 
@@ -470,19 +474,20 @@ def enqueue_with_peek(paths: Iterable[str],
 # ---------------------------------------------------------------------------
 
 def _iter_archive_candidates(teslacam_root: str) -> List[str]:
-    """Return every ``.mp4`` — plus each event's evidence files — to archive.
+    """Return every file the configured archive policy wants to keep.
 
     Walks one level into ``RecentClips`` (flat files) and two levels
     into ``SentryClips`` / ``SavedClips`` (event-folder per recording).
     Uses ``os.scandir`` for memory efficiency.
 
-    Inside an event folder the filter also admits
-    :data:`services.tesla_clips.EVIDENCE_NAMES`. The pre-2026-08-16
-    ``.mp4``-only filter meant ``event.json`` and ``thumb.png`` never
-    became queue rows at all: the box held 22 of each on the card and
-    0 of them in the archive. They are the only record of WHY the car
-    triggered, and ~215 KB per event buys that back. ``RecentClips``
-    stays ``.mp4``-only because those names never appear there.
+    :mod:`services.archive_policy` decides what survives the walk, and
+    under the default ``evidence-only`` that is each event's
+    ``event.json``, ``event.mp4`` and ``thumb.png`` — no camera clips
+    and nothing at all from ``RecentClips``. The filter is applied HERE,
+    at the producer, rather than in the worker: a rejected file that
+    never becomes a queue row costs no INSERT, no claim, no status
+    write and no SD I/O, which is the same reasoning the Phase B
+    stationary peek is built on.
 
     Permission errors and missing subdirectories are silently skipped —
     Phase 2a runs against a possibly-unmounted RO bind so any of the
@@ -495,6 +500,7 @@ def _iter_archive_candidates(teslacam_root: str) -> List[str]:
     out: List[str] = []
     if not teslacam_root or not os.path.isdir(teslacam_root):
         return out
+    policy = archive_policy.resolve()
 
     for sub in _WATCH_SUBDIRS:
         sub_path = os.path.join(teslacam_root, sub)
@@ -507,7 +513,7 @@ def _iter_archive_candidates(teslacam_root: str) -> List[str]:
         for entry in entries:
             try:
                 if entry.is_file(follow_symlinks=False):
-                    if entry.name.lower().endswith('.mp4'):
+                    if archive_policy.wanted(entry.path, policy):
                         out.append(entry.path)
                 elif entry.is_dir(follow_symlinks=False):
                     # Event subfolder — walk one more level for clip files
@@ -516,8 +522,7 @@ def _iter_archive_candidates(teslacam_root: str) -> List[str]:
                         for clip in os.scandir(entry.path):
                             if not clip.is_file(follow_symlinks=False):
                                 continue
-                            if (clip.name.lower().endswith('.mp4')
-                                    or clip.name in tesla_clips.EVIDENCE_NAMES):
+                            if archive_policy.wanted(clip.path, policy):
                                 out.append(clip.path)
                     except (PermissionError, OSError):
                         continue

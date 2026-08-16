@@ -130,6 +130,13 @@ _KNOWN_STATUSES = (
     'copied',
     'source_gone',
     'skipped_stationary',
+    # Added 2026-08-16 with services/archive_policy.py. Kept distinct
+    # from ``skipped_stationary`` on purpose: that one means "we looked
+    # and there was nothing moving in it", this one means "we don't
+    # keep this KIND of file any more". Folding them together would
+    # have made the Settings badge claim the SEI peek saved the card
+    # from two thousand clips it never even opened.
+    'skipped_policy',
     'error',
     'dead_letter',
 )
@@ -1627,6 +1634,135 @@ def mark_skipped_stationary(row_id: int, *,
             "mark_skipped_stationary failed for id=%s: %s", row_id, e,
         )
         return False
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+
+
+def mark_skipped_policy(row_id: int, reason: str, *,
+                        db_path: Optional[str] = None) -> bool:
+    """Mark a claimed row as ``skipped_policy``. Terminal, no retry.
+
+    The defense-in-depth half of :mod:`services.archive_policy`: the
+    producers stop enqueueing what the policy doesn't want, and this
+    retires anything that got in before the policy changed or through a
+    path that bypasses them (tests, a hand-inserted row).
+
+    ``reason`` lands in ``last_error`` — not because it is an error but
+    because it is the column the Failed/Skipped views already read, and
+    a row that says ``RecentClips is not archived under policy
+    'evidence-only'`` explains itself to whoever finds it in six months.
+    """
+    if not row_id:
+        return False
+    db_path = _resolve_db_path(db_path)
+    completed_at = time.time()
+    conn = None
+    try:
+        conn = _open_archive_conn(db_path)
+        cur = conn.execute(
+            """
+            UPDATE archive_queue
+               SET status = 'skipped_policy',
+                   last_error = ?
+             WHERE id = ?
+               AND status = 'claimed'
+            """,
+            (str(reason or '')[:500], int(row_id)),
+        )
+        ok = cur.rowcount == 1
+        if ok:
+            _dual_write_pipeline_archive_state_by_id(
+                int(row_id),
+                new_stage='archive_done',
+                status='skipped_policy',
+                completed_at=completed_at,
+                last_error=str(reason or '')[:500],
+                db_path=db_path,
+            )
+        return ok
+    except sqlite3.Error as e:
+        logger.warning("mark_skipped_policy failed for id=%s: %s", row_id, e)
+        return False
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+
+
+# How many pending rows one :func:`retire_pending_unwanted` pass will
+# retire. The sweep runs at worker start on a Pi Zero 2 W, so it is
+# bounded rather than unbounded: 5000 rows is well past the 2148 the
+# live box carried when the policy landed, and a bigger backlog than
+# that just takes a second pass on the next start.
+_RETIRE_SWEEP_LIMIT = 5000
+
+
+def retire_pending_unwanted(wanted, reason_for, *,
+                            db_path: Optional[str] = None,
+                            limit: int = _RETIRE_SWEEP_LIMIT) -> int:
+    """Retire every pending row ``wanted(path)`` rejects. Returns the count.
+
+    Exists because a policy change has a backlog behind it. When
+    ``evidence-only`` landed the queue held 2148 pending rows, 2096 of
+    them RecentClips clips the box had just decided not to keep; making
+    the worker claim, evaluate and mark those one at a time would have
+    been ~2000 claims and six SD writes apiece to reach a foregone
+    conclusion. One UPDATE does it instead.
+
+    ``wanted`` and ``reason_for`` are passed in rather than imported so
+    this module stays ignorant of what a policy IS — it only knows how
+    to retire rows something else has judged.
+
+    Rows already ``claimed`` are left alone: another worker may be
+    mid-copy on one, and it will hit the same judgment when it finishes.
+    """
+    db_path = _resolve_db_path(db_path)
+    completed_at = time.time()
+    conn = None
+    try:
+        conn = _open_archive_conn(db_path)
+        rows = conn.execute(
+            "SELECT id, source_path FROM archive_queue "
+            "WHERE status = 'pending' LIMIT ?",
+            (int(limit),),
+        ).fetchall()
+        doomed = [
+            (str(reason_for(path))[:500], int(row_id))
+            for row_id, path in rows
+            if not wanted(path)
+        ]
+        if not doomed:
+            return 0
+        conn.executemany(
+            "UPDATE archive_queue SET status = 'skipped_policy', "
+            "last_error = ? WHERE id = ? AND status = 'pending'",
+            doomed,
+        )
+        conn.commit()
+        # Keep the Wave 4 PR-E shadow table in step. One call per row
+        # here rather than in the loop above, and deliberately AFTER the
+        # commit: the shadow is a validation mirror, so a slow or broken
+        # mirror must not hold the real UPDATE open, and each call
+        # already swallows its own errors.
+        for reason, row_id in doomed:
+            _dual_write_pipeline_archive_state_by_id(
+                row_id,
+                new_stage='archive_done',
+                status='skipped_policy',
+                completed_at=completed_at,
+                last_error=reason,
+                db_path=db_path,
+            )
+        return len(doomed)
+    except sqlite3.Error as e:
+        logger.warning("retire_pending_unwanted failed: %s", e)
+        return 0
     finally:
         if conn is not None:
             try:

@@ -601,6 +601,7 @@ class TestGetQueueStatus:
         assert counts == {
             'pending': 0, 'claimed': 0, 'copied': 0,
             'source_gone': 0, 'skipped_stationary': 0,
+            'skipped_policy': 0,
             'error': 0, 'dead_letter': 0,
             'total': 0,
         }

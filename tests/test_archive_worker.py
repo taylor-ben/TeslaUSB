@@ -133,9 +133,14 @@ def _reset_module_state():
     # doesn't leak into the next test's process_one_claim path.
     archive_worker._disk_space_pause_until = 0.0
     archive_worker._load_pause_until = 0.0
+    # The CPU gate's own two pieces: a stale /proc/stat sample would be
+    # differenced against a fresh one, and a stall clock left running by
+    # an earlier test would trip the forward-progress floor in this one.
+    archive_worker._cpu_sample = None
+    archive_worker._gated_since = 0.0
     with archive_worker._state_lock:
         archive_worker._state['last_load_pause_at'] = None
-        archive_worker._state['last_load_pause_loadavg'] = None
+        archive_worker._state['last_load_pause_cpu_free_pct'] = None
     # Reset task_coordinator too — leftover ownership from an earlier
     # test would block our acquire.
     with task_coordinator._lock:
@@ -148,7 +153,7 @@ def _reset_module_state():
     archive_worker._load_pause_until = 0.0
     with archive_worker._state_lock:
         archive_worker._state['last_load_pause_at'] = None
-        archive_worker._state['last_load_pause_loadavg'] = None
+        archive_worker._state['last_load_pause_cpu_free_pct'] = None
     with task_coordinator._lock:
         task_coordinator._current_task = None
         task_coordinator._task_started = 0.0
@@ -1814,7 +1819,7 @@ class TestArchiveWorkerLoadPauseUX:
         assert state['paused_until_epoch'] == 0.0
         assert state['is_paused_now'] is False
         assert state['last_pause_at'] is None
-        assert state['last_loadavg'] is None
+        assert state['last_cpu_free_pct'] is None
 
     def test_status_includes_load_pause_block(self, db, archive_root):
         # ``get_status()`` must surface a ``load_pause`` block parallel
@@ -1831,7 +1836,7 @@ class TestArchiveWorkerLoadPauseUX:
             lp = status['load_pause']
             assert set(lp.keys()) >= {
                 'paused_until_epoch', 'is_paused_now',
-                'last_pause_at', 'last_loadavg',
+                'last_pause_at', 'last_cpu_free_pct',
             }
         finally:
             archive_worker.stop_worker(timeout=5)
@@ -1841,7 +1846,7 @@ class TestArchiveWorkerLoadPauseUX:
         archive_worker._load_pause_until = time.time() + 100
         with archive_worker._state_lock:
             archive_worker._state['last_load_pause_at'] = time.time()
-            archive_worker._state['last_load_pause_loadavg'] = 5.5
+            archive_worker._state['last_load_pause_cpu_free_pct'] = 5.5
 
         # A fresh start_worker MUST clear it (parity with disk_pause).
         # We don't actually need the worker to drain anything for this
@@ -1853,24 +1858,22 @@ class TestArchiveWorkerLoadPauseUX:
             )
             state = archive_worker.get_load_pause_state()
             assert state['last_pause_at'] is None
-            assert state['last_loadavg'] is None
+            assert state['last_cpu_free_pct'] is None
         finally:
             archive_worker.stop_worker(timeout=5)
 
     def test_load_pause_logs_only_on_transition(
         self, db, archive_root, teslacam_root, make_clip, monkeypatch, caplog,
     ):
-        # Force os.getloadavg() to report sustained high load. The
-        # worker must log the "pausing" INFO line ONCE (entering the
-        # window), NOT on every iteration. Even if the load stays high
-        # for many iterations, each subsequent iteration should be
-        # silent because we're still inside the same pause window.
-        # NB: ``getloadavg`` doesn't exist on Windows, so we install
-        # it (raising=False) for the duration of the test.
-        monkeypatch.setattr(
-            archive_worker.os, 'getloadavg',
-            lambda: (99.0, 99.0, 99.0), raising=False,
-        )
+        # Report a box with 1% idle CPU. The worker must log the
+        # "pausing" INFO line ONCE (entering the window), NOT on every
+        # iteration — even if the starvation lasts many iterations, each
+        # subsequent one should be silent because we're still inside the
+        # same pause window. Patches the gate's reading rather than
+        # ``os.getloadavg``: since 2026-08-16 the loop gate measures CPU
+        # headroom, because loadavg counts I/O-blocked tasks and a
+        # recording car pins it high forever (services/cpu_headroom.py).
+        monkeypatch.setattr(archive_worker, '_sample_cpu_free', lambda: 1.0)
         # Tighten the pause to keep the test snappy.
         def fake_config(*a, **kw):
             return (4096, 3, 0.05, 0.05, 0.5, 0.5, 0.0, 0.0)
@@ -1895,7 +1898,7 @@ class TestArchiveWorkerLoadPauseUX:
         # on every iteration (~20+ times).
         pause_logs = [r for r in caplog.records
                       if 'pausing' in r.getMessage()
-                      and 'relieve SDIO' in r.getMessage()]
+                      and 'watchdog daemon can run' in r.getMessage()]
         # Bound: at most 1 log per (load_pause_seconds + slack). With
         # 0.5s window over 2s + cleanup, 6 is a generous upper bound.
         assert len(pause_logs) <= 6, (
@@ -1913,13 +1916,10 @@ class TestArchiveWorkerLoadPauseUX:
     def test_load_pause_ignores_wake_event(
         self, db, archive_root, teslacam_root, make_clip, monkeypatch,
     ):
-        # Producers calling ``wake()`` MUST NOT shorten the load-pause
-        # back-off. The whole point of the pause is to give the SDIO
-        # bus a clear runway; producer wakes would defeat that.
-        monkeypatch.setattr(
-            archive_worker.os, 'getloadavg',
-            lambda: (99.0, 99.0, 99.0), raising=False,
-        )
+        # Producers calling ``wake()`` MUST NOT shorten the pause
+        # back-off. The whole point of the pause is to give the watchdog
+        # daemon a clear runway; producer wakes would defeat that.
+        monkeypatch.setattr(archive_worker, '_sample_cpu_free', lambda: 1.0)
         # 1.0s pause window so the test can observe that wake() does
         # NOT cut it short.
         def fake_config(*a, **kw):
@@ -1964,10 +1964,7 @@ class TestArchiveWorkerLoadPauseUX:
         # set inside process_one_claim only on first hit) and is the
         # natural reading of the field name. Regression guard for the
         # re-review INFO finding on PR #93.
-        monkeypatch.setattr(
-            archive_worker.os, 'getloadavg',
-            lambda: (99.0, 99.0, 99.0), raising=False,
-        )
+        monkeypatch.setattr(archive_worker, '_sample_cpu_free', lambda: 1.0)
         # Use a long pause window (5s) so the test stays well inside
         # one window across multiple iterations.
         def fake_config(*a, **kw):
@@ -2975,7 +2972,7 @@ class TestPauseStateExtensions:
             archive_worker._state['last_disk_pause_free_mb'] = None
             archive_worker._state['last_disk_pause_total_mb'] = None
             archive_worker._state['last_load_pause_at'] = None
-            archive_worker._state['last_load_pause_loadavg'] = None
+            archive_worker._state['last_load_pause_cpu_free_pct'] = None
         archive_worker._disk_space_pause_until = 0.0
         archive_worker._load_pause_until = 0.0
 
@@ -3024,34 +3021,29 @@ class TestPauseStateExtensions:
                 archive_worker._state['last_disk_pause_total_mb'] = None
 
     def test_get_load_pause_state_includes_threshold(self):
-        # Phase 4.5 added ``threshold`` so the System Health card
-        # can render ``"load 4.2 > 3.5"`` without re-reading config.
+        # Phase 4.5 added ``threshold`` so the System Health card can
+        # render the reason without re-reading config. Since 2026-08-16
+        # it is the idle-CPU floor, so the card reads "CPU 8% idle < 12%".
         state = archive_worker.get_load_pause_state()
         assert 'threshold' in state
         assert isinstance(state['threshold'], (int, float))
         assert state['threshold'] > 0
-        # Threshold value must match what
-        # ``_read_config_or_defaults()`` returns (so config edits flow
-        # through without a service restart). Position [4] is
-        # ``load_pause_threshold``.
-        assert state['threshold'] == \
-            archive_worker._read_config_or_defaults()[4]
+        # Must match the live config value so an edit flows through
+        # without a service restart.
+        assert state['threshold'] == archive_worker._cpu_free_floor_pct()
 
     def test_get_load_pause_state_threshold_falls_back_on_config_error(
         self, monkeypatch,
     ):
-        # If config import fails (e.g. config.yaml missing), the
-        # helper must fall back to the module-level constant rather
-        # than raising — the System Health card poll happens every
-        # 5 s and a single bad poll should never break the page.
-        def boom(*_a, **_kw):
-            raise RuntimeError("config import failed")
+        # If the config import fails (config.yaml missing, half-written
+        # during an upgrade), the helper must fall back to the
+        # module-level constant rather than raising — the System Health
+        # card polls every 5 s and one bad poll must not break the page.
+        import config
 
-        monkeypatch.setattr(
-            archive_worker, '_read_config_or_defaults', boom,
-        )
+        monkeypatch.delattr(config, 'ARCHIVE_QUEUE_CPU_FREE_FLOOR_PCT')
         state = archive_worker.get_load_pause_state()
-        assert state['threshold'] == archive_worker._LOAD_PAUSE_THRESHOLD
+        assert state['threshold'] == archive_worker._CPU_FREE_FLOOR_PCT
 
     def test_start_worker_resets_disk_total_mb(self, db, archive_root):
         # Parity with the Phase 1 reset of ``last_disk_pause_free_mb``.
@@ -3112,45 +3104,13 @@ class TestDiskFullnessHelper:
             archive_worker.shutil, 'disk_usage', lambda p: _Zero(),
         )
         assert archive_worker._disk_fullness_pct(str(tmp_path)) is None
-
-
-class TestAdaptiveLoadThreshold:
-    """Issue #109 mitigation #2 — load_pause_threshold scales DOWN as
-    disk fills."""
-
-    def test_below_80_returns_base_unchanged(self):
-        assert archive_worker._adaptive_load_threshold(3.5, 50.0) == 3.5
-        assert archive_worker._adaptive_load_threshold(3.5, 79.9) == 3.5
-
-    def test_80_to_90_subtracts_half(self):
-        assert archive_worker._adaptive_load_threshold(3.5, 80.0) == 3.0
-        assert archive_worker._adaptive_load_threshold(3.5, 89.9) == 3.0
-
-    def test_90_to_95_subtracts_one(self):
-        assert archive_worker._adaptive_load_threshold(3.5, 90.0) == 2.5
-        assert archive_worker._adaptive_load_threshold(3.5, 94.9) == 2.5
-
-    def test_at_or_above_95_subtracts_one_and_a_half(self):
-        assert archive_worker._adaptive_load_threshold(3.5, 95.0) == 2.0
-        assert archive_worker._adaptive_load_threshold(3.5, 99.0) == 2.0
-        assert archive_worker._adaptive_load_threshold(3.5, 100.0) == 2.0
-
-    def test_floor_at_one_for_low_base(self):
-        # Misconfigured low base must never let the guard fully disable.
-        assert archive_worker._adaptive_load_threshold(1.5, 95.0) == 1.0
-        assert archive_worker._adaptive_load_threshold(2.0, 90.0) == 1.0
-        # base=2.5 at 90%: 2.5 - 1.0 = 1.5, no floor needed
-        assert archive_worker._adaptive_load_threshold(2.5, 90.0) == 1.5
-
-    def test_zero_base_disables_returns_zero(self):
-        assert archive_worker._adaptive_load_threshold(0.0, 95.0) == 0.0
-
-    def test_negative_base_returns_unchanged(self):
-        # Caller treats <=0 as "disabled", helper must not mangle it.
-        assert archive_worker._adaptive_load_threshold(-1.0, 95.0) == -1.0
-
-    def test_unknown_fullness_returns_base_unchanged(self):
-        assert archive_worker._adaptive_load_threshold(3.5, None) == 3.5
+# ``_adaptive_load_threshold`` and its eight tests were deleted
+# 2026-08-16 with the loadavg gate they scaled. Scaling a threshold
+# by disk fullness was a correction applied to the wrong instrument:
+# the reading it corrected counted tasks blocked on I/O, so on a box
+# with a car plugged in the gate never opened at any threshold. What
+# survives is TestAdaptiveChunkPause below, which covers the half of
+# issue #109 that actually relieves the SDIO bus.
 
 
 class TestAdaptiveChunkPause:
@@ -3344,8 +3304,12 @@ class TestProcessOneClaimAdaptiveWiring:
         assert captured['chunk_pause_seconds'] == 0.5, (
             "95% fullness must double the chunk pause"
         )
-        # adaptive load threshold = max(3.5 - 1.5, 1.0) = 2.0
-        assert captured['load_pause_threshold'] == 2.0
+        # ``load_pause_threshold`` is forwarded UNCHANGED since
+        # 2026-08-16: it only picks the mid-copy chunk pause below 80%
+        # fullness, and past 80% the always-apply flag supersedes it
+        # entirely. The fullness correction that used to scale it went
+        # out with the loadavg gate it was correcting for.
+        assert captured['load_pause_threshold'] == 3.5
 
     def test_low_fullness_preserves_pre_109_behavior(
             self, monkeypatch, db, archive_root, tmp_path,

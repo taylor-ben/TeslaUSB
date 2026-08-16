@@ -264,6 +264,20 @@ archive:
 # ============================================================================
 # Archive Queue Configuration (issue #76)
 # ============================================================================
+# What comes off the card at all. The archive shares one SD card with the
+# camera image, so this is the knob that decides whether the box holds a
+# fortnight of six-angle footage or years of evidence. Measured
+# 2026-08-16: one event is ~1.8 GB in full, ~435 KB as evidence.
+#
+#   evidence-only  event.json + event.mp4 + thumb.png, nothing else.
+#                  RecentClips is not archived at all under this.
+#   events         full Sentry/Saved events, no driving ring.
+#   everything     every clip the car writes (pre-2026-08-16 behaviour).
+#
+# See services/archive_policy.py.
+archive_policy: evidence-only
+
+# ============================================================================
 # Persistent SQLite-backed queue (in geodata.db) for the two-queue archive
 # pipeline. Three producers populate the queue: the inotify file watcher,
 # a periodic full-directory rescan, and a one-shot boot catch-up scan.
@@ -283,8 +297,16 @@ archive_queue:
   # archive copies can starve the kernel watchdog daemon and trigger
   # a hardware reset. These knobs let the worker back off under load.
   inter_file_sleep_seconds: 1.0          # Sleep between successful copies (was 0.25)
-  load_pause_threshold: 3.5              # Pause when 1-min loadavg exceeds this
-  load_pause_seconds: 30                 # How long to sleep when load is high
+  load_pause_threshold: 3.5              # Mid-copy chunk-pause trigger only (see cpu_free_floor_pct)
+  load_pause_seconds: 30                 # How long to sleep when the CPU is genuinely starved
+  # The between-files gate measures CPU, not loadavg (2026-08-16).
+  # Loadavg counts tasks blocked on I/O, and a car writing to the USB
+  # gadget keeps file-storage, jbd2 and the writeback kworkers in D
+  # state permanently: the box read 4.5 load at 97% idle CPU, so the
+  # old gate never opened and the queue grew from 1995 to 2148 rows.
+  # See services/cpu_headroom.py for the measurements.
+  cpu_free_floor_pct: 12.0               # Pause only when less than this % of CPU is idle
+  max_stall_seconds: 300.0               # Force one copy through after this long with none
   boot_scan_defer_seconds: 30            # Producer waits this long after start before its first scan
   # Mid-copy SDIO-contention safeguards (issue #104). The
   # between-files load-pause guard above only fires at the iteration

@@ -76,7 +76,9 @@ import time
 import uuid
 from typing import Any, Callable, Deque, Dict, Optional, Tuple
 
+from services import archive_policy
 from services import archive_queue
+from services import cpu_headroom
 from services import task_coordinator
 
 logger = logging.getLogger(__name__)
@@ -231,8 +233,26 @@ _state: Dict[str, Any] = {
     'last_disk_pause_free_mb': None,
     'last_disk_pause_total_mb': None,
     'last_load_pause_at': None,
-    'last_load_pause_loadavg': None,
+    'last_load_pause_cpu_free_pct': None,
 }
+
+# Percent of CPU that must stay idle for the worker to keep draining,
+# and the fallback when config isn't importable (unit-test envs). See
+# services/cpu_headroom.py for why this is not loadavg any more.
+_CPU_FREE_FLOOR_PCT = 12.0
+# However starved the box claims to be, force one copy through after
+# this many seconds of continuous gating. The archive is allowed to
+# crawl; it is not allowed to stop.
+_MAX_STALL_SECONDS = 300.0
+# Previous /proc/stat reading, so each iteration measures the interval
+# since the last one rather than since boot. Written only by the worker
+# thread.
+_cpu_sample: Optional[tuple] = None
+# Epoch at which the CPU gate started holding continuously, or 0.0 when
+# it isn't holding. This is deliberately "how long has the gate been
+# shut", not "how long since a copy" — an empty queue is not a stall,
+# and must not trip the forward-progress floor.
+_gated_since: float = 0.0
 
 # Disk-space self-pause epoch (seconds). When set in the future, the
 # worker loop idles instead of claiming new rows. Set when the disk
@@ -403,7 +423,7 @@ def start_worker(db_path: str, archive_root: str, *,
         _state['last_disk_pause_free_mb'] = None
         _state['last_disk_pause_total_mb'] = None
         _state['last_load_pause_at'] = None
-        _state['last_load_pause_loadavg'] = None
+        _state['last_load_pause_cpu_free_pct'] = None
         # Phase 4.4: drop any rate samples from the previous instance.
         # A worker restart usually means we paused for a transition
         # (mode switch, manual stop) and the old samples are no longer
@@ -412,8 +432,14 @@ def start_worker(db_path: str, archive_root: str, *,
         # Reset the disk-space self-pause; the next iteration will
         # re-arm it if disk space is still critical.
         global _disk_space_pause_until, _load_pause_until
+        global _cpu_sample, _gated_since
         _disk_space_pause_until = 0.0
         _load_pause_until = 0.0
+        # Both halves of the CPU gate start clean: a stale sample from a
+        # previous instance would be differenced against a fresh one and
+        # read as a very long, very idle interval.
+        _cpu_sample = None
+        _gated_since = 0.0
         thread = threading.Thread(
             target=_run_worker_loop,
             args=(db_path, archive_root, teslacam_root, _worker_id),
@@ -421,9 +447,41 @@ def start_worker(db_path: str, archive_root: str, *,
             daemon=True,
         )
         _worker_thread = thread
+    _retire_backlog_the_policy_rejects(db_path)
     thread.start()
     logger.info("Archive worker started (id=%s)", _worker_id)
     return True
+
+
+def _retire_backlog_the_policy_rejects(db_path: str) -> int:
+    """Clear pending rows the current policy doesn't want. Returns count.
+
+    Runs once per worker start, outside the state lock and before the
+    thread, so the loop begins on a queue that reflects today's policy
+    rather than yesterday's. When ``evidence-only`` landed on the live
+    box this retired 2096 RecentClips rows in one UPDATE; leaving them
+    for the worker would have been 2096 claim-and-mark cycles at ~6 SD
+    writes each to reach a decision a string test already knew.
+
+    Never fatal: a failure here leaves the rows pending and the worker's
+    own per-row policy gate retires them one at a time instead.
+    """
+    try:
+        policy = archive_policy.resolve()
+        retired = archive_queue.retire_pending_unwanted(
+            lambda path: archive_policy.wanted(path, policy),
+            lambda path: archive_policy.unwanted_reason(path, policy),
+            db_path=db_path,
+        )
+    except Exception as cause:  # noqa: BLE001
+        logger.warning("archive_worker: policy sweep skipped: %s", cause)
+        return 0
+    if retired:
+        logger.info(
+            "archive_worker: retired %d queued file(s) — %s",
+            retired, archive_policy.describe(policy),
+        )
+    return retired
 
 
 def stop_worker(timeout: float = _DEFAULT_STOP_TIMEOUT) -> bool:
@@ -1391,33 +1449,76 @@ def _disk_fullness_pct(path: str) -> Optional[float]:
     return (usage.used / usage.total) * 100.0
 
 
-def _adaptive_load_threshold(base: float, fullness_pct: Optional[float]) -> float:
-    """Issue #109 mitigation #2 — scale ``load_pause_threshold`` down
-    by disk fullness.
+def _cpu_free_floor_pct() -> float:
+    """Configured idle-CPU floor, or the module default."""
+    try:
+        from config import ARCHIVE_QUEUE_CPU_FREE_FLOOR_PCT
+        return float(ARCHIVE_QUEUE_CPU_FREE_FLOOR_PCT)
+    except Exception:  # noqa: BLE001
+        return float(_CPU_FREE_FLOOR_PCT)
 
-    The same loadavg of 4.0 is a very different situation at 50% disk
-    (healthy ext4, fast writes) vs 98% disk (ext4 thrashing, every
-    write 10–100× slower). At high fullness, pause sooner so a single
-    in-flight copy doesn't starve the watchdog daemon.
 
-    Returns ``base`` unchanged when:
-      * ``base <= 0`` (guard disabled by config),
-      * ``fullness_pct`` is ``None`` (stat failed),
-      * fullness is below 80% (healthy regime).
+def _max_stall_seconds() -> float:
+    """How long the CPU gate may hold before one copy is forced."""
+    try:
+        from config import ARCHIVE_QUEUE_MAX_STALL_SECONDS
+        return float(ARCHIVE_QUEUE_MAX_STALL_SECONDS)
+    except Exception:  # noqa: BLE001
+        return float(_MAX_STALL_SECONDS)
 
-    Otherwise subtracts 0.5 / 1.0 / 1.5 at 80 / 90 / 95% fullness and
-    floors at 1.0 — even a misconfigured low base can never fully
-    disable the guard.
+
+def _sample_cpu_free() -> Optional[float]:
+    """Percent of CPU idle since the previous iteration, or None.
+
+    None on the very first call (there is nothing to difference against)
+    and whenever too few jiffies have passed to mean anything — the
+    worker treats an unknown reading as "not starved", which is the
+    property that keeps a blind instrument from stopping the archive.
     """
-    if base <= 0 or fullness_pct is None:
-        return base
-    if fullness_pct >= 95.0:
-        return max(base - 1.5, 1.0)
-    if fullness_pct >= 90.0:
-        return max(base - 1.0, 1.0)
-    if fullness_pct >= 80.0:
-        return max(base - 0.5, 1.0)
-    return base
+    global _cpu_sample
+    taken = cpu_headroom.sample()
+    free = cpu_headroom.free_pct(_cpu_sample, taken)
+    # Only advance the baseline once the window was wide enough to
+    # yield a reading. Otherwise a fast loop resets the reference every
+    # few milliseconds and never accumulates a measurable interval.
+    if free is not None or _cpu_sample is None:
+        _cpu_sample = taken
+    return free
+
+
+def _note_gated() -> None:
+    """Start the stall clock if the CPU gate isn't already holding."""
+    global _gated_since
+    if _gated_since <= 0.0:
+        _gated_since = time.time()
+
+
+def _clear_gate() -> None:
+    """The gate let work through; the stall clock stops."""
+    global _gated_since
+    _gated_since = 0.0
+
+
+def _seconds_gated() -> float:
+    """How long the CPU gate has held continuously. 0.0 when it isn't."""
+    return 0.0 if _gated_since <= 0.0 else time.time() - _gated_since
+
+
+def _stalled_too_long() -> bool:
+    """Whether the gate has held past the forward-progress floor."""
+    limit = _max_stall_seconds()
+    return limit > 0 and _seconds_gated() > limit
+
+
+# Issue #109 mitigation #2 — ``_adaptive_load_threshold`` used to scale
+# the between-files loadavg threshold DOWN as the disk filled, on the
+# reasoning that the same loadavg means more contention at 98% full than
+# at 50%. Deleted 2026-08-16 with the loadavg gate itself: it was a
+# correction applied to the wrong instrument, and on the live box it
+# only made a gate that already never opened close half a point sooner.
+# ``_adaptive_chunk_pause`` below is the surviving half of #109 and is
+# the one that does the real work — past 80% fullness it yields SDIO
+# time on every single chunk, with no trigger to get wrong.
 
 
 def _adaptive_chunk_pause(
@@ -1511,31 +1612,30 @@ def get_disk_pause_state() -> Dict[str, Any]:
 
 
 def get_load_pause_state() -> Dict[str, Any]:
-    """Return the current load-pause state for status endpoints.
+    """Return the current CPU-pause state for status endpoints.
 
-    ``last_loadavg`` is the most recent reading that triggered the
-    pause (None until the guard fires for the first time). Mirrors
-    :func:`get_disk_pause_state` so the UI can show *why* the worker
-    isn't draining.
+    ``last_cpu_free_pct`` is the reading that triggered the pause (None
+    until the guard fires for the first time) and ``threshold`` is the
+    idle-CPU floor it fell below, so the UI can render "Paused: 8% CPU
+    idle < 12%". Mirrors :func:`get_disk_pause_state` so the UI can show
+    *why* the worker isn't draining.
 
-    Phase 4.5 (#101) — also surfaces the configured
-    ``threshold`` (resolved at call time) so the message can render
-    "Paused: load 4.2 > 3.5".
+    Keeps its name and its ``threshold`` key through the 2026-08-16
+    switch from loadavg to CPU headroom: three callers and a template
+    read this dict, and renaming the endpoint would have been a bigger
+    change than the fix. ``last_loadavg`` is gone — nothing here is a
+    loadavg any more and leaving the name would invite the same
+    confusion that caused the bug.
     """
-    # Threshold is the 5th element of the _read_config_or_defaults
-    # tuple; resolve outside the state lock to keep the critical
-    # section small.
-    try:
-        threshold = float(_read_config_or_defaults()[4])
-    except Exception:  # noqa: BLE001
-        threshold = float(_LOAD_PAUSE_THRESHOLD)
+    threshold = _cpu_free_floor_pct()
     with _state_lock:
         return {
             'paused_until_epoch': float(_load_pause_until),
             'is_paused_now': _load_pause_until > time.time(),
             'last_pause_at': _state.get('last_load_pause_at'),
-            'last_loadavg': _state.get('last_load_pause_loadavg'),
+            'last_cpu_free_pct': _state.get('last_load_pause_cpu_free_pct'),
             'threshold': threshold,
+            'gated_seconds': _seconds_gated(),
         }
 
 
@@ -2002,6 +2102,8 @@ def process_one_claim(row: Dict[str, Any], db_path: str,
                              RecentClips clip with no GPS-bearing SEI
                              message; the worker always skips parked-no-event
                              RecentClips at source (no retry, terminal)
+      * ``'skipped_policy'`` — the configured archive policy does not
+                             keep this kind of file (no retry, terminal)
       * ``'pending'``      — released back to pending (stable-write
                              gate, disk pause, time-budget abort,
                              transient error with attempts left)
@@ -2013,18 +2115,34 @@ def process_one_claim(row: Dict[str, Any], db_path: str,
     safeguards. Defaults are conservative (off / 0.25 s / off) so
     callers that don't opt in get pre-#104 behavior.
 
-    Issue #109: the ``load_pause_threshold`` and ``chunk_pause_seconds``
-    actually forwarded to ``_atomic_copy`` are derived from the BASE
-    values via :func:`_adaptive_load_threshold` and
-    :func:`_adaptive_chunk_pause` so the throttling becomes more
-    aggressive as the SD card fills (less load tolerance, longer
-    always-applied chunk pauses at 80%+ fullness).
+    Issue #109: the ``chunk_pause_seconds`` actually forwarded to
+    ``_atomic_copy`` is derived from the base value via
+    :func:`_adaptive_chunk_pause`, so past 80% fullness every chunk
+    yields SDIO time and past 95% it yields twice as much.
+    ``load_pause_threshold`` is forwarded unchanged: it now only picks
+    the mid-copy chunk pause on a disk under 80% full, and the loadavg
+    correction that used to scale it went out with the loadavg gate
+    (2026-08-16 — see the note above :func:`_adaptive_chunk_pause`).
 
     Pure dispatch logic kept separate from the loop so tests can drive
     it directly without a thread or task_coordinator.
     """
     row_id = int(row['id'])
     source_path = row['source_path']
+
+    # Archive-policy gate, BEFORE the stat. The producers already
+    # decline to enqueue what the policy doesn't want; this catches
+    # rows that predate a policy change and rows inserted by anything
+    # that bypasses the producers. First because it is the cheapest
+    # verdict available — a string test against a path, no I/O — and
+    # because copying a file the box has decided not to keep spends SD
+    # bandwidth that the prune then spends again deleting it.
+    policy = archive_policy.resolve()
+    if not archive_policy.wanted(source_path, policy):
+        reason = archive_policy.unwanted_reason(source_path, policy)
+        archive_queue.mark_skipped_policy(row_id, reason, db_path=db_path)
+        logger.info("archive_worker: skipped %s — %s", source_path, reason)
+        return 'skipped_policy'
 
     # Stable-write gate. If the file is too fresh AND its size or mtime
     # have shifted since enqueue, requeue with refreshed metadata.
@@ -2142,21 +2260,17 @@ def process_one_claim(row: Dict[str, Any], db_path: str,
         # Issue #109 — derive adaptive throttling values from current
         # SD-card fullness. ``shutil.disk_usage`` is one syscall; cheap
         # to do once per file. At 80%+ we raise the always-apply flag;
-        # at 95%+ we both raise the flag AND double the chunk pause.
-        # The forwarded ``load_pause_threshold`` is also lowered so
-        # later iterations of the worker loop (which re-reads it
-        # per iteration) pause sooner — but inside _atomic_copy the
-        # always-apply chunk pause supersedes the load-gated path.
+        # at 95%+ we both raise the flag AND double the chunk pause,
+        # which is where the real SDIO relief comes from — past 80% the
+        # always-apply pause supersedes the loadavg-gated path below it
+        # entirely, and this box lives past 80%.
         _fullness = _disk_fullness_pct(archive_root)
-        _adaptive_load = _adaptive_load_threshold(
-            load_pause_threshold, _fullness,
-        )
         _adaptive_pause, _pause_always = _adaptive_chunk_pause(
             chunk_pause_seconds, _fullness,
         )
         _atomic_copy(
             source_path, dest_path, chunk_size,
-            load_pause_threshold=_adaptive_load,
+            load_pause_threshold=load_pause_threshold,
             chunk_pause_seconds=_adaptive_pause,
             chunk_pause_always=_pause_always,
             time_budget_seconds=time_budget_seconds,
@@ -2789,75 +2903,91 @@ def _run_worker_loop(db_path: str, archive_root: str,
                 break
             continue
 
-        # SDIO-contention guard. The Pi Zero 2 W shares one SDIO
-        # controller between SD card and WiFi; sustained heavy archive
-        # I/O can starve the watchdog daemon and trigger a hardware
-        # reset. When the system is already under load (typically the
-        # combination of archive + indexer + Tesla concurrent writes),
-        # back off so other tasks can drain. Threshold and pause length
-        # are configurable; ``getloadavg`` is a cheap O(1) syscall.
+        # CPU-starvation guard. The Pi Zero 2 W shares one SDIO
+        # controller between SD card and WiFi, and a copy that hogs the
+        # machine can keep the userspace ``watchdog`` daemon from
+        # pinging /dev/watchdog inside the BCM2835's 90 s timeout —
+        # which reboots the box. Back off when the CPU is genuinely
+        # unavailable so that daemon can run.
+        #
+        # WHAT THIS MEASURES, AND WHAT IT USED TO (2026-08-16). The gate
+        # was ``os.getloadavg()[0] > threshold``, and it had the worker
+        # asleep for 3.5 of every 6 hours while the queue GREW from 1995
+        # to 2148 rows. Loadavg counts tasks in uninterruptible sleep,
+        # so a car writing into the USB gadget pins it above 4 through
+        # ``file-storage``, ``jbd2`` and the writeback kworkers — while
+        # the CPU sat 89-99% idle with one task runnable out of 150. It
+        # was measuring "the SD card is busy", which with a car plugged
+        # in is permanently true, and calling that a reason not to work.
+        # The gate now asks about the CPU directly (cpu_headroom.py).
+        # SDIO relief is the per-chunk pause inside ``_atomic_copy``,
+        # which always-applies past 80% fullness and needs no trigger.
         #
         # Two UX rules apply here:
         #
         #   1. Log INFO once on entering the pause and once on resume,
         #      NOT on every iteration. Producers calling ``wake()``
-        #      under sustained high load would otherwise spam
-        #      ``journalctl`` every few seconds (see PR #93 review).
+        #      under sustained load would otherwise spam ``journalctl``
+        #      every few seconds (see PR #93 review).
         #   2. Use ``_stop_event.wait`` (NOT ``_wait_with_wake``) so
         #      a producer's wake() can't shorten the back-off — the
-        #      whole point of the pause is to give the SDIO bus and
-        #      watchdog daemon a clear runway. Producers will get
-        #      their files drained on the next iteration anyway.
-        if load_pause_threshold > 0:
-            try:
-                load1 = os.getloadavg()[0]
-            except (AttributeError, OSError):
-                load1 = 0.0
-            # Issue #109 — adapt the trigger threshold to current SD
-            # fullness BEFORE comparing. At 95%+ disk the same loadavg
-            # of 4.0 represents far more SDIO contention than at 50%.
-            _adaptive_threshold = _adaptive_load_threshold(
-                load_pause_threshold, _disk_fullness_pct(archive_root),
-            )
-            if load1 > _adaptive_threshold:
-                # Only log INFO on the leading edge of the pause
-                # window so back-to-back high-load iterations don't
-                # spam the journal. ``_load_pause_until`` is the
-                # epoch the current pause window expires; if it's
-                # already in the future we're still inside the same
-                # window and stay quiet.
-                already_paused = _load_pause_until > time.time()
-                _load_pause_until = time.time() + load_pause_seconds
-                if not already_paused:
-                    # Pin ``last_pause_at`` to the moment the pause
-                    # actually started — within a sustained pause
-                    # window the field must NOT tick forward on
-                    # every iteration (parity with disk-pause, which
-                    # arms ``last_disk_pause_at`` only on first hit).
-                    with _state_lock:
-                        _state['last_load_pause_at'] = time.time()
-                        _state['last_load_pause_loadavg'] = float(load1)
-                    logger.info(
-                        "archive_worker: 1-min loadavg %.2f > %.2f "
-                        "(adaptive; base=%.2f) — pausing %.0fs to "
-                        "relieve SDIO/CPU contention",
-                        load1, _adaptive_threshold, load_pause_threshold,
-                        load_pause_seconds,
-                    )
-                _idle_event.set()
-                # Stop-only wait. Producers' wake() must NOT cut this
-                # short — we are deliberately giving the SDIO bus
-                # and the watchdog daemon a clear runway.
-                if _stop_event.wait(timeout=load_pause_seconds):
-                    break
-                continue
-            elif _load_pause_until > 0 and _load_pause_until <= time.time():
-                # Trailing edge: log once when we leave the pause
-                # window so the user can see "back to normal".
+        #      whole point of the pause is to give the watchdog daemon
+        #      a clear runway. Producers will get their files drained
+        #      on the next iteration anyway.
+        cpu_free = _sample_cpu_free()
+        forced = _stalled_too_long()
+        if cpu_headroom.starved(cpu_free, _cpu_free_floor_pct()) and not forced:
+            _note_gated()
+            # Only log INFO on the leading edge of the pause window so
+            # back-to-back busy iterations don't spam the journal.
+            # ``_load_pause_until`` is the epoch the current pause
+            # window expires; if it's already in the future we're still
+            # inside the same window and stay quiet.
+            already_paused = _load_pause_until > time.time()
+            _load_pause_until = time.time() + load_pause_seconds
+            if not already_paused:
+                # Pin ``last_pause_at`` to the moment the pause actually
+                # started — within a sustained pause window the field
+                # must NOT tick forward on every iteration (parity with
+                # disk-pause, which arms ``last_disk_pause_at`` only on
+                # the first hit).
+                with _state_lock:
+                    _state['last_load_pause_at'] = time.time()
+                    _state['last_load_pause_cpu_free_pct'] = float(cpu_free)
                 logger.info(
-                    "archive_worker: 1-min loadavg %.2f back below %.2f "
-                    "(adaptive; base=%.2f) — resuming archive drain",
-                    load1, _adaptive_threshold, load_pause_threshold,
+                    "archive_worker: only %.1f%% CPU idle (floor %.1f%%) "
+                    "— pausing %.0fs so the watchdog daemon can run",
+                    cpu_free, _cpu_free_floor_pct(), load_pause_seconds,
+                )
+            _idle_event.set()
+            # Stop-only wait. Producers' wake() must NOT cut this short —
+            # we are deliberately giving the watchdog daemon a runway.
+            if _stop_event.wait(timeout=load_pause_seconds):
+                break
+            continue
+        if forced:
+            # Forward-progress floor. Whatever the instrument says, the
+            # archive does not get to stop dead: the bug this rewrite
+            # came from was a gate that could latch shut and did, for
+            # days. One file goes through, then the gate applies again —
+            # so a box that really is starved still crawls rather than
+            # stops, and the WARNING says which of the two is happening.
+            logger.warning(
+                "archive_worker: forcing one copy through — the CPU gate "
+                "has held for %.1fs (idle %s, floor %.1f%%)",
+                _seconds_gated(),
+                "unknown" if cpu_free is None else f"{cpu_free:.1f}%",
+                _cpu_free_floor_pct(),
+            )
+            _clear_gate()
+        else:
+            _clear_gate()
+            if _load_pause_until > 0 and _load_pause_until <= time.time():
+                # Trailing edge: log once when we leave the pause window
+                # so the user can see "back to normal".
+                logger.info(
+                    "archive_worker: %.1f%% CPU idle — resuming archive drain",
+                    -1.0 if cpu_free is None else cpu_free,
                 )
                 _load_pause_until = 0.0
 

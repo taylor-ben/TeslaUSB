@@ -768,17 +768,22 @@ def test_format_eta_human_boundaries():
 # ---------------------------------------------------------------------------
 
 def test_format_pause_reason_load_only():
-    """Spec quote: 'Archive paused: load 4.2 > 3.5 threshold'."""
+    """'Archive paused: CPU 8% idle < 12%'.
+
+    Read loadavg before 2026-08-16; the worker's gate now measures idle
+    CPU because loadavg counts I/O-blocked tasks and a recording car
+    pins it high forever (services/cpu_headroom.py).
+    """
     import blueprints.system_health as sh
     out = sh._format_pause_reason(
         load_pause={
             'is_paused_now': True,
-            'last_loadavg': 4.2,
-            'threshold': 3.5,
+            'last_cpu_free_pct': 8.0,
+            'threshold': 12.0,
         },
         disk_pause={'is_paused_now': False},
     )
-    assert out == 'load 4.2 > 3.5'
+    assert out == 'CPU 8% idle < 12%'
 
 
 def test_format_pause_reason_disk_only_with_total():
@@ -835,8 +840,8 @@ def test_format_pause_reason_both_armed():
     out = sh._format_pause_reason(
         load_pause={
             'is_paused_now': True,
-            'last_loadavg': 5.1,
-            'threshold': 3.5,
+            'last_cpu_free_pct': 5.0,
+            'threshold': 12.0,
         },
         disk_pause={
             'is_paused_now': True,
@@ -845,7 +850,7 @@ def test_format_pause_reason_both_armed():
             'critical_threshold_mb': 100,
         },
     )
-    assert out == 'load 5.1 > 3.5; SD card 96% full'
+    assert out == 'CPU 5% idle < 12%; SD card 96% full'
 
 
 def test_format_pause_reason_neither_armed_returns_background():
@@ -860,16 +865,16 @@ def test_format_pause_reason_neither_armed_returns_background():
     ) == 'background'
 
 
-def test_format_pause_reason_load_armed_but_no_loadavg_yet():
-    """Defensive: if the worker reports paused but ``last_loadavg``
-    is None (cold-start race), don't synthesize a fake number — fall
-    through to ``'background'``."""
+def test_format_pause_reason_load_armed_but_no_reading_yet():
+    """Defensive: if the worker reports paused but
+    ``last_cpu_free_pct`` is None (cold-start race), don't synthesize a
+    fake number — fall through to ``'background'``."""
     import blueprints.system_health as sh
     out = sh._format_pause_reason(
         load_pause={
             'is_paused_now': True,
-            'last_loadavg': None,
-            'threshold': 3.5,
+            'last_cpu_free_pct': None,
+            'threshold': 12.0,
         },
         disk_pause={'is_paused_now': False},
     )
@@ -906,7 +911,8 @@ def test_archive_block_paused_load_message(monkeypatch):
     monkeypatch.setattr(archive_worker, 'get_status', lambda: {
         'worker_running': True, 'paused': True,
         'load_pause': {
-            'is_paused_now': True, 'last_loadavg': 4.2, 'threshold': 3.5,
+            'is_paused_now': True, 'last_cpu_free_pct': 4.0,
+            'threshold': 12.0,
         },
         'disk_pause': {'is_paused_now': False},
     })
@@ -916,9 +922,9 @@ def test_archive_block_paused_load_message(monkeypatch):
     # whenever there's pending work, so the operator sees consistent
     # info even as the headline severity branch swaps. Pause-reason
     # is the canonical prefix.
-    assert block['message'].startswith('Paused: load 4.2 > 3.5')
+    assert block['message'].startswith('Paused: CPU 4% idle < 12%')
     assert '10 queued' in block['message']
-    assert block['pause_reason'] == 'load 4.2 > 3.5'
+    assert block['pause_reason'] == 'CPU 4% idle < 12%'
 
 
 def test_archive_block_load_auto_paused_without_manual_flag(monkeypatch):
@@ -944,7 +950,8 @@ def test_archive_block_load_auto_paused_without_manual_flag(monkeypatch):
     monkeypatch.setattr(archive_worker, 'get_status', lambda: {
         'worker_running': True, 'paused': False,
         'load_pause': {
-            'is_paused_now': True, 'last_loadavg': 3.9, 'threshold': 3.5,
+            'is_paused_now': True, 'last_cpu_free_pct': 3.0,
+            'threshold': 12.0,
         },
         'disk_pause': {'is_paused_now': False},
     })
@@ -953,9 +960,9 @@ def test_archive_block_load_auto_paused_without_manual_flag(monkeypatch):
     # auto-pause, not the narrower manual flag.
     assert block['paused'] is True
     assert block['severity'] == 'warn'
-    assert block['message'].startswith('Paused: load 3.9 > 3.5')
+    assert block['message'].startswith('Paused: CPU 3% idle < 12%')
     assert '442 queued' in block['message']
-    assert block['pause_reason'] == 'load 3.9 > 3.5'
+    assert block['pause_reason'] == 'CPU 3% idle < 12%'
 
 
 def test_archive_block_disk_auto_paused_without_manual_flag(monkeypatch):

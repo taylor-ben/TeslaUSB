@@ -25,6 +25,7 @@ import threading
 import time
 from typing import Callable, List, Optional, Set
 
+from services import archive_policy
 from services import tesla_clips
 
 logger = logging.getLogger(__name__)
@@ -360,6 +361,19 @@ def _notify_callbacks(new_files: List[str], my_generation: int):
         return
 
     archive_paths, indexing_paths, dropped = _classify_paths(new_files)
+    # The archive policy applies HERE and only to ``archive_paths``,
+    # which _classify_paths has just guaranteed are card paths. Doing it
+    # at discovery would also have judged ArchivedClips, whose layout
+    # repeats the card's ``SentryClips/<event>/`` shape — the indexer
+    # would have gone blind to every event clip already archived.
+    policy = archive_policy.resolve()
+    declined = [p for p in archive_paths if not archive_policy.wanted(p, policy)]
+    if declined:
+        archive_paths = [p for p in archive_paths if p not in set(declined)]
+        logger.debug(
+            "Watcher: %d file(s) not archived — %s",
+            len(declined), archive_policy.describe(policy),
+        )
     if dropped:
         logger.debug(
             "Watcher: %d files dropped — outside RO mount and ArchivedClips: %s",
@@ -495,6 +509,15 @@ def _scan_for_new_files(paths: List[str], known_files: Set[str]) -> List[str]:
     of 22 on the box, measured 2026-08-16). The flat branches
     (``RecentClips/*.mp4`` and root-level ``ArchivedClips`` files) stay
     ``.mp4``-only: those names never occur outside an event folder.
+
+    DISCOVERY IS DELIBERATELY UNFILTERED BY ARCHIVE POLICY. This scan
+    feeds ``known_files``, delete detection AND the indexer's view of
+    ``ArchivedClips``; the archive policy is applied downstream in
+    :func:`_notify_callbacks`, to the card-bound half only. Filtering
+    here instead — which is where it went first — would have stopped
+    the indexer seeing already-archived event clips, because an archive
+    path repeats the card's ``SentryClips/<event>/`` shape and the
+    policy would have judged it as though it were still on the card.
     """
     new_files = []
     now = time.time()
@@ -513,7 +536,7 @@ def _scan_for_new_files(paths: List[str], known_files: Set[str]) -> List[str]:
                                 try:
                                     for vid in os.scandir(sub.path):
                                         if ((vid.name.lower().endswith('.mp4')
-                                             or vid.name in tesla_clips.EVIDENCE_NAMES)
+                                             or tesla_clips.is_evidence_file(vid.name))
                                                 and vid.path not in known_files):
                                             stat = vid.stat(follow_symlinks=False)
                                             if (now - stat.st_mtime) >= _MIN_FILE_AGE_SECONDS:

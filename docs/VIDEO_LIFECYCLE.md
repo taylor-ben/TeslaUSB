@@ -267,8 +267,10 @@ from saturating and starving the watchdog daemon:
 | `inter_file_sleep_seconds`           | 1.0 s   | Pause between files                                                      |
 | `chunk_pause_seconds`                | 0.25 s  | Pause every chunk **inside** a single copy                                |
 | `per_file_time_budget_seconds`       | 60.0 s  | Hard ceiling on a single copy; raises `_CopyTimeBudgetExceeded`          |
-| `load_pause_threshold`               | 3.5     | If `loadavg[0] >= 3.5` between files, sleep `load_pause_seconds`         |
-| `load_pause_seconds`                 | 30 s    | How long to sleep when load is high                                       |
+| `cpu_free_floor_pct`                 | 12%     | If less than 12% of CPU was idle since the last iteration, sleep `load_pause_seconds` |
+| `max_stall_seconds`                  | 300 s   | Force one copy through after this long of continuous gating — no throttle may stop the archive |
+| `load_pause_threshold`               | 3.5     | Mid-copy chunk-pause trigger **only**, on a disk under 80% full            |
+| `load_pause_seconds`                 | 30 s    | How long to sleep when the CPU is genuinely starved                       |
 | `boot_scan_defer_seconds`            | 30 s    | Don't run boot catch-up scan for the first 30 s after gadget_web start    |
 | `nice` priority                      | -19 (low) | Process scheduled at lowest CPU priority                                |
 | `ionice` class                       | idle    | Block-I/O priority is "idle" — only runs when nothing else needs the disk |
@@ -317,7 +319,8 @@ purely from load.
 | Copy raises `_CopyTimeBudgetExceeded` (≥60 s)      | Release claim back to `pending`, don't increment `attempts`           |
 | Copy raises any other exception                    | `error` → retry with backoff                                          |
 | `attempts >= retry_max_attempts`                   | `dead_letter`                                                         |
-| `loadavg[0] >= 3.5` between files                  | Sleep 30 s, then retry from queue                                     |
+| Less than 12% CPU idle between files               | Sleep 30 s, then retry from queue                                     |
+| Archive policy declines the file                   | `skipped_policy` (terminal) — this box doesn't keep this kind          |
 | LES has a pending row                              | Yield: release lock, sleep briefly, re-acquire                        |
 
 ---

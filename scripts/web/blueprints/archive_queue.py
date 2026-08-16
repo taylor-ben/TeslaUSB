@@ -145,7 +145,7 @@ def archive_status():
                 'is_paused_now': False,
                 'paused_until_epoch': 0.0,
                 'last_pause_at': None,
-                'last_loadavg': None,
+                'last_cpu_free_pct': None,
             },
         ),
 

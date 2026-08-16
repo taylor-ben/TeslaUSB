@@ -22,7 +22,34 @@ Closes #84.
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'scripts', 'web'))
+
+
+@pytest.fixture(autouse=True)
+def archive_policy_everything(monkeypatch):
+    """Run every test under ``everything`` unless it says otherwise.
+
+    ``services/archive_policy.py`` arrived on 2026-08-16 and its default
+    is ``evidence-only``, which declines to archive RecentClips at all.
+    Several hundred existing tests use ``RecentClips/x-front.mp4`` as a
+    convenient fixture path while testing something else entirely —
+    dead-lettering, moov verification, disk guards, claim mechanics —
+    and under the real default they stop at the policy gate before
+    reaching the thing they assert on.
+
+    Pinning the OLD behaviour here keeps those tests honest about their
+    own subject. Anything that means to test the policy sets it
+    explicitly (``monkeypatch.setattr(config, 'ARCHIVE_POLICY', ...)``),
+    which is also what makes those tests readable: the policy under test
+    is written down in the test rather than inherited from config.yaml.
+    """
+    try:
+        import config
+    except Exception:  # noqa: BLE001 — tests that never load the app
+        return
+    monkeypatch.setattr(config, 'ARCHIVE_POLICY', 'everything', raising=False)
 
 # Eagerly compile the protobuf module before any test imports it.
 # Wrapped in try/except so a missing protoc surfaces a single clear

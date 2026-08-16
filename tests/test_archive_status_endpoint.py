@@ -176,7 +176,7 @@ class TestArchiveStatusShape:
         lp = body['load_pause']
         assert set(lp.keys()) >= {
             'paused_until_epoch', 'is_paused_now',
-            'last_pause_at', 'last_loadavg',
+            'last_pause_at', 'last_cpu_free_pct',
         }, f"load_pause block missing required keys: {set(lp.keys())}"
 
     def test_status_includes_per_priority_queue_depths(

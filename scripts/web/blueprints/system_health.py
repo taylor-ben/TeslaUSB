@@ -206,10 +206,12 @@ def _format_pause_reason(load_pause: Dict[str, Any],
 
     The archive worker auto-pauses for two reasons:
 
-    * **load** — 1-min loadavg crossed
-      ``archive_queue.load_pause_threshold`` (default 3.5). The pause
-      relieves the SDIO bus and keeps the hardware watchdog daemon
-      from missing its kick. Reason string: ``"load 4.2 > 3.5"``.
+    * **CPU** — idle CPU fell below
+      ``archive_queue.cpu_free_floor_pct`` (default 12%). The pause
+      keeps the hardware watchdog daemon from missing its kick. Reason
+      string: ``"CPU 8% idle < 12%"``. Read 1-min loadavg until
+      2026-08-16, which counted tasks blocked on I/O and so never
+      dropped on a box with a car writing to it.
     * **disk** — free space at ``archive_root`` fell below the
       configured critical threshold (default 100 MB). The pause stops
       new copies until retention or manual cleanup frees space.
@@ -225,12 +227,15 @@ def _format_pause_reason(load_pause: Dict[str, Any],
     """
     parts = []
 
+    # 2026-08-16: this reads idle CPU, not loadavg. The worker's gate
+    # changed because loadavg counts I/O-blocked tasks and a recording
+    # car keeps it pinned — see services/cpu_headroom.py.
     load_now = bool(load_pause.get('is_paused_now'))
-    load_avg = load_pause.get('last_loadavg')
+    cpu_free = load_pause.get('last_cpu_free_pct')
     load_thresh = load_pause.get('threshold')
-    if load_now and isinstance(load_avg, (int, float)) and \
+    if load_now and isinstance(cpu_free, (int, float)) and \
             isinstance(load_thresh, (int, float)) and load_thresh > 0:
-        parts.append(f'load {load_avg:.1f} > {load_thresh:.1f}')
+        parts.append(f'CPU {cpu_free:.0f}% idle < {load_thresh:.0f}%')
 
     disk_now = bool(disk_pause.get('is_paused_now'))
     free_mb = disk_pause.get('last_free_mb')

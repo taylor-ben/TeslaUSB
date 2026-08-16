@@ -93,13 +93,46 @@ def _build_tunables() -> List[Dict[str, Any]]:
             'cast': _bounded_float(0.0, 30.0),
         },
         {
+            'key': 'archive_queue.cpu_free_floor_pct',
+            'form_name': 'archive_cpu_free_floor_pct',
+            'label': 'Archive: pause below this much idle CPU',
+            'description': (
+                'The archive worker pauses when less than this share of '
+                'the CPU was idle. Default 12% leaves the watchdog daemon '
+                'an eighth of the machine. This used to read 1-min '
+                'loadavg, which counts tasks blocked on I/O — with a car '
+                'writing to the card it never dropped, and the worker '
+                'stopped draining altogether (fixed 2026-08-16).'
+            ),
+            'current': float(config.ARCHIVE_QUEUE_CPU_FREE_FLOOR_PCT),
+            'default': 12.0,
+            'unit': '% idle',
+            'min': 0.0, 'max': 90.0, 'step': 1.0,
+            'cast': _bounded_float(0.0, 90.0),
+        },
+        {
+            'key': 'archive_queue.max_stall_seconds',
+            'form_name': 'archive_max_stall_seconds',
+            'label': 'Archive: force a copy through after',
+            'description': (
+                'However starved the box reports itself, one file is '
+                'copied after this long of continuous throttling. The '
+                'archive is allowed to crawl; it is not allowed to stop.'
+            ),
+            'current': float(config.ARCHIVE_QUEUE_MAX_STALL_SECONDS),
+            'default': 300.0,
+            'unit': 'seconds',
+            'min': 0.0, 'max': 3600.0, 'step': 30.0,
+            'cast': _bounded_float(0.0, 3600.0),
+        },
+        {
             'key': 'archive_queue.load_pause_threshold',
             'form_name': 'archive_load_pause_threshold',
-            'label': 'Archive: load-pause threshold',
+            'label': 'Archive: mid-copy chunk-pause threshold',
             'description': (
-                '1-min loadavg above which the archive worker pauses. '
-                'Default 3.5 keeps the Pi Zero 2 W from starving the '
-                'watchdog daemon under SDIO load.'
+                '1-min loadavg above which a copy pauses between chunks. '
+                'Only consulted on a disk under 80% full — past that, '
+                'every chunk yields SDIO time regardless.'
             ),
             'current': float(config.ARCHIVE_QUEUE_LOAD_PAUSE_THRESHOLD),
             'default': 3.5,
@@ -110,10 +143,10 @@ def _build_tunables() -> List[Dict[str, Any]]:
         {
             'key': 'archive_queue.load_pause_seconds',
             'form_name': 'archive_load_pause_seconds',
-            'label': 'Archive: load-pause duration',
+            'label': 'Archive: pause duration',
             'description': (
-                'How long the archive worker sleeps when load is above '
-                'the threshold above.'
+                'How long the archive worker sleeps when the CPU is below '
+                'the idle floor above.'
             ),
             'current': float(config.ARCHIVE_QUEUE_LOAD_PAUSE_SECONDS),
             'default': 30.0,

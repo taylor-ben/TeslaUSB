@@ -291,6 +291,11 @@ ARCHIVE_DIR = _archive_path if _archive_path else os.path.join(
 # ``archive_queue.enabled`` and ``archive_queue.boot_catchup_enabled``
 # kill-switches were removed.
 _archive_queue = config.get('archive_queue', {})
+
+# What the box takes off the card: 'evidence-only', 'events' or
+# 'everything'. Validated (and defaulted) in services/archive_policy.py,
+# which is the one module that knows what the values mean.
+ARCHIVE_POLICY = str(config.get('archive_policy', 'evidence-only'))
 ARCHIVE_QUEUE_RESCAN_INTERVAL_SECONDS = float(
     _archive_queue.get('rescan_interval_seconds', 60)
 )
@@ -317,6 +322,24 @@ ARCHIVE_QUEUE_LOAD_PAUSE_THRESHOLD = float(
 )
 ARCHIVE_QUEUE_LOAD_PAUSE_SECONDS = float(
     _archive_queue.get('load_pause_seconds', 30)
+)
+# Percent of CPU that must stay idle for the worker to keep draining.
+# This REPLACED loadavg as the between-files trigger on 2026-08-16 —
+# loadavg counts tasks blocked on I/O, which on a Pi with a car plugged
+# into the USB gadget is permanently true, so the old gate latched shut
+# and the queue grew instead of drained (see services/cpu_headroom.py).
+# 12% leaves the watchdog daemon an eighth of the machine, which is
+# multiple orders of magnitude more than one write to /dev/watchdog
+# needs. load_pause_threshold above still governs the mid-copy chunk
+# pause, where a false positive costs 0.25 s and cannot latch.
+ARCHIVE_QUEUE_CPU_FREE_FLOOR_PCT = float(
+    _archive_queue.get('cpu_free_floor_pct', 12.0)
+)
+# Hard forward-progress floor. However loud the throttle is, the worker
+# forces one file through after this long without a copy. No gate on
+# this box gets to stop the archive indefinitely again.
+ARCHIVE_QUEUE_MAX_STALL_SECONDS = float(
+    _archive_queue.get('max_stall_seconds', 300.0)
 )
 ARCHIVE_QUEUE_BOOT_SCAN_DEFER_SECONDS = float(
     _archive_queue.get('boot_scan_defer_seconds', 30)
