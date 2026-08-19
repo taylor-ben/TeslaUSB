@@ -127,6 +127,33 @@ def test_a_corrupt_filename_cannot_drag_the_keep_window_off_the_ring(tmp_path):
     assert any('16-50-00' in name for name in kept), 'newest real clips must survive'
 
 
+def test_an_orphan_batch_behind_a_gap_cannot_brick_the_sweep(tmp_path):
+    # The 2026-08-19 deadlock: a few clips survived the 08-17 SD repair, the
+    # car came back nine days later, and with the horizon anchored on the
+    # OLDEST clip everything the car wrote since looked corrupt. The sweep
+    # deleted nothing, forever, while the drive filled. The orphans must be
+    # the first thing reclaimed and the live ring must stay deletable.
+    for minute in (27, 30, 33):
+        for camera in CAMERAS:
+            write_clip(tmp_path, f'2026-08-09_19-{minute:02d}-00', camera, 100)
+    for minute in (0, 30, 50):
+        for camera in CAMERAS:
+            write_clip(tmp_path, f'2026-08-19_16-{minute:02d}-00', camera, 100)
+
+    paths, freed = clips_to_delete(tmp_path, 10 ** 9)
+
+    names = [os.path.basename(p) for p in paths]
+    assert all(name.startswith('2026-08-09') for name in names[:9]), (
+        'orphans go first'
+    )
+    assert any(name.startswith('2026-08-19_16-00') for name in names), (
+        'the live ring outside the keep window must be deletable too'
+    )
+    assert freed == 1500
+    kept = set(os.listdir(tmp_path)) - set(names)
+    assert all('16-50-00' in name for name in kept), 'keep window survives'
+
+
 def test_never_deletes_inside_the_keep_window(tmp_path):
     newest = 20 * 3600
     for offset in (0, KEEP_NEWEST_SECONDS // 2, KEEP_NEWEST_SECONDS + 60):

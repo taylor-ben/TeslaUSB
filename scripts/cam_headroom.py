@@ -245,15 +245,21 @@ def clips_to_delete(recent_dir, need_bytes):
     if not clips:
         return [], 0
 
-    # Anything dated more than a ring's span after the oldest clip is a corrupt
-    # entry, not footage. Such a clip is neither trusted to place the keep
-    # window nor deleted: both directions of nonsense then fail safe, because a
-    # date far in the past leaves the anchor behind every real clip and nothing
-    # is deleted at all.
-    horizon = min(at for at, _, _ in clips) + MAX_RING_SPAN_SECONDS
+    # Anything dated more than a ring's span after the MEDIAN clip is a corrupt
+    # entry, not footage: it is neither trusted to place the keep window nor
+    # deleted. The median, because the ring is always the bulk of the folder,
+    # so it sits inside the ring however the outliers lean. The anchor used to
+    # be the OLDEST clip, and a recording gap longer than the span turned that
+    # into a deadlock (2026-08-19): a handful of clips survived the 08-17 SD
+    # repair, the car came back nine days later, and every clip it wrote since
+    # sat past the orphans' horizon — so the sweep found nothing it would
+    # delete, forever, while the car complained the drive was full.
+    #
+    # Clips far BEHIND the anchor are the opposite of corrupt: a leftover from
+    # a session the car never got to overwrite, and the first thing to reclaim.
+    times = sorted(at for at, _, _ in clips)
+    horizon = times[len(times) // 2] + MAX_RING_SPAN_SECONDS
     datable = [clip for clip in clips if clip[0] <= horizon]
-    if not datable:
-        return [], 0
     cutoff = max(at for at, _, _ in datable) - KEEP_NEWEST_SECONDS
 
     chosen, freed = [], 0
