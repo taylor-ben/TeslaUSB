@@ -29,11 +29,15 @@ LOG_FILE="$GADGET_DIR/boot_cleanup.log"
 # ============================================================================
 # Task 1: Auto-cleanup (if enabled)
 # ============================================================================
+# Policies live in the legacy JSON until the Phase 3a.2 startup migration
+# renames it to .migrated, then in config.yaml's `cleanup:` block. Check both,
+# or migrated boxes never clean (found 2026-08-20).
 needs_cleanup() {
-    if [ ! -f "$CLEANUP_CONFIG" ]; then
-        return 1
-    fi
     if grep -q '"enabled": true' "$CLEANUP_CONFIG" 2>/dev/null; then
+        return 0
+    fi
+    if sed -n '/^cleanup:/,/^[a-zA-Z_]/p' "$GADGET_DIR/config.yaml" 2>/dev/null \
+            | grep -q 'enabled: true'; then
         return 0
     fi
     return 1

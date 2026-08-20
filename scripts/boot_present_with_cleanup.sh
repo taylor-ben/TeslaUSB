@@ -32,25 +32,27 @@ echo "===== Boot-time USB presentation with optional cleanup ====="
 echo "$(date)"
 log_timing "Variables initialized"
 
-# Function to check if any folder has cleanup enabled
+# Function to check if any folder has cleanup enabled.
+# Two homes for the policies: the legacy cleanup_config.json, and — after the
+# Phase 3a.2 startup migration renames that file to .migrated — the `cleanup:`
+# block of config.yaml. Gating on the JSON alone silently disabled boot
+# cleanup forever on any box the migration had visited (found 2026-08-20).
 needs_cleanup() {
     log_timing "Checking cleanup config"
-    if [ ! -f "$CLEANUP_CONFIG" ]; then
-        echo "No cleanup config found, skipping cleanup"
-        log_timing "No cleanup config found"
-        return 1
-    fi
-
-    # Check if any folder has "enabled": true
     if grep -q '"enabled": true' "$CLEANUP_CONFIG" 2>/dev/null; then
-        echo "Cleanup enabled for at least one folder"
+        echo "Cleanup enabled for at least one folder (legacy config)"
         log_timing "Cleanup enabled detected"
         return 0
-    else
-        echo "No folders have cleanup enabled, skipping cleanup"
-        log_timing "Cleanup not enabled"
-        return 1
     fi
+    if sed -n '/^cleanup:/,/^[a-zA-Z_]/p' "$GADGET_DIR/config.yaml" 2>/dev/null \
+            | grep -q 'enabled: true'; then
+        echo "Cleanup enabled for at least one folder (config.yaml)"
+        log_timing "Cleanup enabled detected"
+        return 0
+    fi
+    echo "No folders have cleanup enabled, skipping cleanup"
+    log_timing "Cleanup not enabled"
+    return 1
 }
 
 # Function to run cleanup with minimal filesystem setup

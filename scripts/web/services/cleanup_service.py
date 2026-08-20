@@ -109,8 +109,67 @@ class CleanupService:
                 logger.error(f"Error loading cleanup policies: {e}")
                 # Return empty dict - will be populated from detected folders
                 return {}
-        else:
-            logger.info("No config file found, will use defaults for detected folders")
+        unified = self._policies_from_unified_config()
+        if unified:
+            logger.info(
+                "Loaded cleanup policies from config.yaml cleanup.policies: %s",
+                sorted(unified.keys()),
+            )
+            return unified
+        logger.info("No config file found, will use defaults for detected folders")
+        return {}
+
+    def _policies_from_unified_config(self) -> Dict:
+        """Card-side policies from ``config.yaml``'s ``cleanup.policies``.
+
+        The startup migration (Phase 3a.2, #98) imports the legacy
+        ``cleanup_config.json`` into config.yaml and renames the JSON to
+        ``.migrated`` — but this service kept reading only the JSON, so
+        on-image retention silently died the moment the migration ran
+        (found 2026-08-20: the box's ``.migrated`` was dated the same day
+        the policies were first configured, and SentryClips had been
+        accumulating unbounded ever since). This fallback closes that
+        gap: when the legacy file is gone, the migrated policies still
+        drive the card-side cleanup.
+
+        Only the age dimension survives the round-trip because only it
+        exists in the unified schema (``retention_days``). ArchivedClips
+        is excluded — that folder lives on the SD card and belongs to
+        ``archive_watchdog``, never to this service (see the module
+        docstring's scope boundary).
+        """
+        try:
+            try:
+                from config import CONFIG_YAML  # type: ignore
+                yaml_path = Path(CONFIG_YAML)
+            except Exception:  # noqa: BLE001
+                yaml_path = self.gadget_dir / 'config.yaml'
+            if not yaml_path.exists():
+                return {}
+            import yaml
+            with open(yaml_path, 'r') as f:
+                cfg = yaml.safe_load(f) or {}
+            cleanup = cfg.get('cleanup') if isinstance(cfg.get('cleanup'), dict) else {}
+            raw = cleanup.get('policies') if isinstance(cleanup.get('policies'), dict) else {}
+            policies: Dict[str, Any] = {}
+            for folder, policy in raw.items():
+                if folder == 'ArchivedClips' or not isinstance(policy, dict):
+                    continue
+                try:
+                    days = int(policy.get('retention_days') or 0)
+                except (TypeError, ValueError):
+                    days = 0
+                if days < 1:
+                    continue
+                policies[folder] = {
+                    'enabled': bool(policy.get('enabled', False)),
+                    'age_based': {'days': days, 'enabled': True},
+                    'size_based': {'max_gb': 50, 'enabled': False},
+                    'count_based': {'max_videos': 500, 'enabled': False},
+                }
+            return policies
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Could not read cleanup.policies from config.yaml: %s", e)
             return {}
 
     def save_policies(self, policies: Dict) -> bool:
@@ -246,11 +305,23 @@ class CleanupService:
         True when archiving is switched off: there is no second tier to
         wait for, so waiting forever would just make cleanup inert.
 
+        Also true when the archive POLICY refuses the file. Under
+        ``evidence-only`` no camera clip ever gains an archive copy, so
+        "wait until it is archived" means "never delete anything" and the
+        image fills with event folders until the car stops recording
+        (found 2026-08-20). A policy-refused file has no second tier
+        coming, same as archiving being off — the owner chose to let it
+        age off the card. Evidence files stay safe regardless: the
+        delete doorway's own evidence guard refuses them by name.
+
         A row with no ``teslacam_root`` did not come from
         ``_get_videos_in_folder`` and has unknown provenance, so it is
         treated as un-archived — the direction that keeps the file.
         """
         if not ARCHIVE_ENABLED:
+            return True
+        from services import archive_policy
+        if not archive_policy.wanted(video_info['path'], archive_policy.resolve()):
             return True
         teslacam_root = video_info.get('teslacam_root')
         if not teslacam_root:
@@ -553,17 +624,6 @@ class CleanupService:
             'dry_run': dry_run,
             'timestamp': datetime.now().isoformat()
         }
-
-        # Purge geodata.db entries for deleted files
-        if not dry_run and deleted_files:
-            try:
-                from config import MAPPING_ENABLED, MAPPING_DB_PATH
-                if MAPPING_ENABLED:
-                    from services.mapping_service import purge_deleted_videos
-                    paths = [f['path'] for f in deleted_files]
-                    purge_deleted_videos(MAPPING_DB_PATH, deleted_paths=paths)
-            except Exception as e:
-                logger.warning("Failed to purge geodata for cleaned-up videos: %s", e)
 
     def run_automatic_cleanup(self, partition_path: Path, dry_run: bool = False) -> Dict:
         """
